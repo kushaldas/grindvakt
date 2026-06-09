@@ -1,0 +1,41 @@
+[package]
+name = "grindvakt"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+rust-version = "1.83"
+description = "Reusable, runtime-agnostic OAuth2 / OpenID Connect / OpenID Federation protocol library built on jose-rs."
+repository = "https://github.com/kushaldas/grindvakt"
+keywords = ["oauth2", "openid-connect", "oidc", "jose", "dpop"]
+categories = ["authentication", "web-programming"]
+
+[dependencies]
+jose-rs = { version = "0.3.1", default-features = false }
+kryptering = { version = "0.3", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+
+base64 = "0.22"
+url = "2"
+form_urlencoded = "1"
+percent-encoding = "2"
+sha2 = "0.10"
+hkdf = "0.12"
+
+# PEM/DER/JWK signing-key loading (PEM -> kryptering SoftwareKey -> jose Jwk).
+rsa = "0.9"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ed25519-dalek = { version = "2.1", features = ["pkcs8"] }
+pkcs8 = "0.10"
+pem = "3"
+sec1 = "0.7"
+
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
