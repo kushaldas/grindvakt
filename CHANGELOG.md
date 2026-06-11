@@ -2,6 +2,17 @@
 
 ## unreleased
 
+## 0.3.0 [2026-06-11]
+
+- `federation::ResolvedEntity` gained a public `exp` field carrying the
+  resolve response's expiry (seconds since epoch, tolerant of fractional
+  values some implementations emit) so callers can bound caching of resolved
+  metadata. Breaking for code constructing `ResolvedEntity` literally.
+- Added `discovery::self_published_rp` returning the full metadata claims
+  object and statement `exp` of a verified self-published entity
+  configuration; `discovery::self_published_initiate_login_uri` is now a thin
+  wrapper over it.
+
 ## 0.2.0 [2026-06-11]
 
 - Added the opt-in `discovery` module (not re-exported at the crate root) with

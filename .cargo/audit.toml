@@ -1,0 +1,26 @@
+# cargo-audit configuration for grindvakt
+#
+# Advisories listed here are tracked and intentionally allowed. Every
+# entry must have a justification; if the underlying situation changes
+# (upstream release, mitigation landed) the entry should be removed and
+# the advisory re-checked.
+
+[advisories]
+ignore = [
+    # RSA timing side-channel, a.k.a. the "Marvin" attack. Affects the
+    # `rsa` crate's PKCS#1 v1.5 and OAEP decryption paths. There is no
+    # patched 0.9.x release as of 2026-06; the advisory remains open
+    # upstream. grindvakt uses `rsa` both directly for PEM/DER RSA key
+    # loading in src/keys.rs and transitively through jose-rs/kryptering
+    # for JOSE RSA operations.
+    #
+    # Current local exposure and mitigations:
+    # - This crate parses RSA private keys but does not implement raw RSA
+    #   decryption logic itself.
+    # - The transitive JOSE usage is inherited from jose-rs/kryptering,
+    #   which also document this advisory as temporarily unavoidable.
+    # - Operators should prefer EC/Ed25519 where possible and rate-limit
+    #   RSA-backed authentication or decryption failures at the caller
+    #   boundary until an upstream fixed release is available.
+    "RUSTSEC-2023-0071",
+]

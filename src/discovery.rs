@@ -158,18 +158,29 @@ pub fn initiate_login_uri_from_resolved(entity: &ResolvedEntity) -> Result<Strin
     initiate_login_uri(&entity.metadata)
 }
 
+/// A verified self-published relying party: the full `metadata` claims object
+/// from its entity configuration plus the statement's lifetime.
+#[derive(Debug, Clone)]
+pub struct SelfPublishedRp {
+    /// The `metadata` claims object (contains `openid_relying_party`, …).
+    pub metadata: Value,
+    /// The entity configuration's `exp` (seconds since epoch); callers can
+    /// use it to bound caching.
+    pub exp: Option<u64>,
+}
+
 /// Fetch and verify an RP's *self-published* entity configuration
-/// (`<entity_id>/.well-known/openid-federation`, self-signed) and extract the
-/// `initiate_login_uri` it advertises.
+/// (`<entity_id>/.well-known/openid-federation`, self-signed) and return its
+/// metadata and lifetime.
 ///
 /// For discovery services running in an open mode: the RP is not required to
-/// chain up to a trust anchor, but the redirect target is still limited to
-/// what the entity itself publishes under its own identifier — never a
-/// caller-supplied URL.
-pub async fn self_published_initiate_login_uri(
+/// chain up to a trust anchor, but anything taken from the result is still
+/// limited to what the entity itself publishes under its own identifier -
+/// never caller-supplied data.
+pub async fn self_published_rp(
     http: &Arc<dyn HttpClient>,
     rp_entity_id: &str,
-) -> Result<String> {
+) -> Result<SelfPublishedRp> {
     validate_entity_id(rp_entity_id)?;
     let jwt = crate::federation::fetch_entity_configuration(http, rp_entity_id).await?;
     let stmt = crate::federation::verify_self_signed(&jwt)?;
@@ -178,8 +189,22 @@ pub async fn self_published_initiate_login_uri(
             "entity configuration is not issued by the requested entity".into(),
         ));
     }
-    let metadata = stmt.claims.get("metadata").cloned().unwrap_or(Value::Null);
-    initiate_login_uri(&metadata)
+    Ok(SelfPublishedRp {
+        metadata: stmt.claims.get("metadata").cloned().unwrap_or(Value::Null),
+        exp: stmt
+            .claims
+            .get("exp")
+            .and_then(crate::federation::claim_secs),
+    })
+}
+
+/// [`self_published_rp`] reduced to the validated `initiate_login_uri`.
+pub async fn self_published_initiate_login_uri(
+    http: &Arc<dyn HttpClient>,
+    rp_entity_id: &str,
+) -> Result<String> {
+    let rp = self_published_rp(http, rp_entity_id).await?;
+    initiate_login_uri(&rp.metadata)
 }
 
 /// Build the third-party initiated login URL the user is sent to after
@@ -456,6 +481,18 @@ mod tests {
                 .unwrap(),
             "https://rp.example.com/initiate"
         );
+
+        // The richer form exposes the full metadata and the statement exp.
+        let rp = self_published_rp(&http, "https://rp.example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            rp.metadata["openid_relying_party"]["initiate_login_uri"],
+            "https://rp.example.com/initiate"
+        );
+        let now = crate::util::now_secs();
+        let exp = rp.exp.expect("entity configuration has exp");
+        assert!(exp > now && exp <= now + 3600);
 
         // The statement must be issued by the requested entity id.
         assert!(
