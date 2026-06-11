@@ -290,8 +290,7 @@ fn extract_resolved_entity(
     let ta_ec = verify(last, ta_keys)?;
     if ta_ec.iss() != Some(ta_id) || ta_ec.sub() != Some(ta_id) {
         return Err(Error::Authn(
-            "resolve response trust_chain does not end with the selected trust anchor"
-                .into(),
+            "resolve response trust_chain does not end with the selected trust anchor".into(),
         ));
     }
 
@@ -326,7 +325,10 @@ pub async fn entity_metadata_jwks(
     if let Some(uri) = metadata.get("jwks_uri").and_then(|v| v.as_str()) {
         let resp = http.get(uri).await?;
         if resp.status != 200 {
-            return Err(Error::Internal(format!("jwks fetch failed ({})", resp.status)));
+            return Err(Error::Internal(format!(
+                "jwks fetch failed ({})",
+                resp.status
+            )));
         }
         return JwkSet::from_json(&resp.text()).map_err(Error::from);
     }
@@ -736,7 +738,9 @@ mod tests {
     #[test]
     fn parse_collection_handles_missing_entities() {
         assert!(parse_collection(&serde_json::json!({}), "openid_provider").is_empty());
-        assert!(parse_collection(&serde_json::json!({ "entities": [] }), "openid_provider").is_empty());
+        assert!(
+            parse_collection(&serde_json::json!({ "entities": [] }), "openid_provider").is_empty()
+        );
     }
 
     #[test]

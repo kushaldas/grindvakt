@@ -15,6 +15,8 @@
 //! - RP (client) side: [`rp`] — discovery, auth request, code exchange,
 //!   id_token verification, userinfo.
 //! - Sender-constrained tokens: [`dpop`] (RFC 9449).
+//! - Home-organization discovery / third-party initiated login: [`discovery`]
+//!   (opt-in by module path, not re-exported at the root).
 //!
 //! ## Foundational primitives
 //!
@@ -41,6 +43,7 @@ pub mod util;
 
 // --- OAuth2 / OIDC / Federation protocol ---
 pub mod client;
+pub mod discovery;
 pub mod dpop;
 pub mod federation;
 pub mod jwt;
@@ -51,6 +54,10 @@ pub mod provider;
 pub mod request;
 pub mod rp;
 pub mod tokens;
+
+// Re-export the JOSE library so downstream crates can name its types (e.g.
+// `JwkSet` in `federation::TrustAnchors`) without pinning their own version.
+pub use jose_rs;
 
 // Convenient root re-exports — primitives.
 pub use error::{Error, Result};
