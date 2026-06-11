@@ -41,6 +41,16 @@ pub struct ResolvedEntity {
     /// Federation Entity signing keys from the subject's Entity Configuration at
     /// the start of the returned trust chain.
     pub subject_jwks: JwkSet,
+    /// The resolve response's `exp` (seconds since epoch) - how long the trust
+    /// anchor vouches for the resolved metadata. Callers can use it to bound
+    /// caching.
+    pub exp: Option<u64>,
+}
+
+/// Read a seconds-since-epoch claim that may be an integer or (as some
+/// implementations emit) a fractional float.
+pub(crate) fn claim_secs(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))
 }
 
 /// Build and sign a self-issued Entity Configuration JWT
@@ -305,6 +315,7 @@ fn extract_resolved_entity(
         subject: sub.to_string(),
         metadata,
         subject_jwks: subject_ec.jwks()?,
+        exp: resolved.claims.get("exp").and_then(claim_secs),
     })
 }
 
@@ -733,6 +744,21 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn claim_secs_handles_integer_and_fractional_values() {
+        // Some federation software (e.g. realta) emits fractional exp/iat.
+        assert_eq!(
+            claim_secs(&serde_json::json!(1812696063u64)),
+            Some(1812696063)
+        );
+        assert_eq!(
+            claim_secs(&serde_json::json!(1812696063.17286)),
+            Some(1812696063)
+        );
+        assert_eq!(claim_secs(&serde_json::json!("not a number")), None);
+        assert_eq!(claim_secs(&serde_json::json!(null)), None);
     }
 
     #[test]
