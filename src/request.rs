@@ -29,8 +29,8 @@ impl AuthorizationRequest {
     pub fn from_params(params: &BTreeMap<String, String>) -> Result<Self, OAuthError> {
         let get = |k: &str| params.get(k).cloned();
 
-        let client_id = get("client_id")
-            .ok_or_else(|| OAuthError::invalid_request("missing client_id"))?;
+        let client_id =
+            get("client_id").ok_or_else(|| OAuthError::invalid_request("missing client_id"))?;
         let response_type = get("response_type")
             .ok_or_else(|| OAuthError::invalid_request("missing response_type"))?;
         let redirect_uri = get("redirect_uri")
@@ -96,9 +96,7 @@ impl AuthorizationRequest {
 
     /// True if the response_type requests an authorization code.
     pub fn wants_code(&self) -> bool {
-        self.response_type
-            .split_whitespace()
-            .any(|t| t == "code")
+        self.response_type.split_whitespace().any(|t| t == "code")
     }
 
     /// True if the response_type requests an id_token directly (implicit/hybrid).

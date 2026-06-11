@@ -6,23 +6,22 @@
 
 use crate::client::{Client, ClientStore, AUTH_NONE, AUTH_PRIVATE_KEY_JWT};
 use crate::jwt;
+use crate::keys::SigningKey;
 use crate::metadata::ProviderMetadata;
 use crate::oauth_error::{OAuthError, OAuthErrorCode};
 use crate::pkce;
 use crate::request::AuthorizationRequest;
 use crate::tokens::{AccessTokenPayload, AuthCodePayload, TokenCodec};
+use crate::util::now_secs;
 use base64::Engine;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use crate::keys::SigningKey;
-use crate::util::now_secs;
 
 /// The JWT-bearer client assertion type (RFC 7523).
-pub const CLIENT_ASSERTION_TYPE: &str =
-    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+pub const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
 /// Configuration knobs for token lifetimes.
 #[derive(Debug, Clone)]
@@ -155,7 +154,13 @@ impl Provider {
         if req.wants_id_token() {
             // Implicit / hybrid: mint an id_token directly.
             let id_token = self
-                .build_id_token(&req.client_id, sub, req.nonce.as_deref(), &claims, acr.as_deref())
+                .build_id_token(
+                    &req.client_id,
+                    sub,
+                    req.nonce.as_deref(),
+                    &claims,
+                    acr.as_deref(),
+                )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
             out.push(("id_token".to_string(), id_token));
         }
@@ -221,7 +226,9 @@ impl Provider {
         token_url: &str,
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
-        let client = self.authenticate_client(form, auth_header, token_url).await?;
+        let client = self
+            .authenticate_client(form, auth_header, token_url)
+            .await?;
 
         let code = form
             .get("code")
@@ -233,7 +240,9 @@ impl Provider {
 
         // The code is bound to the authenticating client.
         if payload.client_id != client.client_id {
-            return Err(OAuthError::invalid_grant("code was issued to another client"));
+            return Err(OAuthError::invalid_grant(
+                "code was issued to another client",
+            ));
         }
 
         // redirect_uri must match the one used at the authorization endpoint.
@@ -248,7 +257,11 @@ impl Provider {
             let verifier = form
                 .get("code_verifier")
                 .ok_or_else(|| OAuthError::invalid_grant("missing code_verifier"))?;
-            if !pkce::verify(verifier, challenge, payload.code_challenge_method.as_deref()) {
+            if !pkce::verify(
+                verifier,
+                challenge,
+                payload.code_challenge_method.as_deref(),
+            ) {
                 return Err(OAuthError::invalid_grant("PKCE verification failed"));
             }
         }
@@ -297,7 +310,9 @@ impl Provider {
         token_url: &str,
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
-        let client = self.authenticate_client(form, auth_header, token_url).await?;
+        let client = self
+            .authenticate_client(form, auth_header, token_url)
+            .await?;
 
         // RFC 6749 §4.4: client_credentials is for confidential clients only. A
         // public ("none"-auth) client proves no possession of a secret, so issuing
@@ -309,11 +324,7 @@ impl Provider {
             ));
         }
 
-        if !client
-            .grant_types
-            .iter()
-            .any(|g| g == "client_credentials")
-        {
+        if !client.grant_types.iter().any(|g| g == "client_credentials") {
             return Err(OAuthError::invalid_grant(
                 "client_credentials grant not allowed for client",
             ));
@@ -403,10 +414,12 @@ impl Provider {
         }
 
         let mut map = serde_json::Map::new();
-        map.insert("sub".to_string(), serde_json::Value::String(payload.sub));
         for (k, v) in payload.claims {
             map.insert(k, v);
         }
+        // The canonical subject is authoritative: a released claim named `sub`
+        // (e.g. mapped from eduPersonPrincipalName) must not override it.
+        map.insert("sub".to_string(), serde_json::Value::String(payload.sub));
         Ok(serde_json::Value::Object(map))
     }
 
@@ -425,7 +438,9 @@ impl Provider {
             if atype != Some(CLIENT_ASSERTION_TYPE) {
                 return Err(OAuthError::invalid_client("invalid client_assertion_type"));
             }
-            return self.verify_private_key_jwt(assertion, form, token_url).await;
+            return self
+                .verify_private_key_jwt(assertion, form, token_url)
+                .await;
         }
 
         // client_secret_basic.
@@ -519,7 +534,9 @@ impl Provider {
             None => false,
         };
         if !aud_ok {
-            return Err(OAuthError::invalid_client("client_assertion audience mismatch"));
+            return Err(OAuthError::invalid_client(
+                "client_assertion audience mismatch",
+            ));
         }
 
         Ok(client)
@@ -543,13 +560,22 @@ impl Provider {
         c.iat = Some(now);
         c.exp = Some(now + self.lifetimes.id_token_ttl);
         if let Some(n) = nonce {
-            c.extra.insert("nonce".into(), serde_json::Value::String(n.to_string()));
+            c.extra
+                .insert("nonce".into(), serde_json::Value::String(n.to_string()));
         }
         if let Some(a) = acr {
-            c.extra.insert("acr".into(), serde_json::Value::String(a.to_string()));
+            c.extra
+                .insert("acr".into(), serde_json::Value::String(a.to_string()));
         }
         c.extra.insert("auth_time".into(), serde_json::json!(now));
         for (k, v) in claims {
+            // Released claims must never shadow the registered claims set as
+            // typed fields: serde flattens `extra`, so a released `sub`
+            // (e.g. an attribute map that emits `sub` from eduPersonPrincipalName)
+            // would serialize a second `sub` key and break strict JWT parsers.
+            if is_reserved_id_token_claim(k) {
+                continue;
+            }
             c.extra.insert(k.clone(), v.clone());
         }
         jwt::sign(&self.signing_key, &c, None)
@@ -558,6 +584,16 @@ impl Provider {
 
 /// Flatten a multi-valued external claim map into JSON values: single-element
 /// lists become scalars, multi-element lists become arrays.
+/// Registered claims that `build_id_token` sets as typed [`Claims`] fields (or
+/// inserts itself). Released attribute claims carrying these names are dropped
+/// so the flattened `extra` map cannot emit a duplicate JSON key.
+fn is_reserved_id_token_claim(name: &str) -> bool {
+    matches!(
+        name,
+        "iss" | "sub" | "aud" | "exp" | "iat" | "nbf" | "jti" | "nonce" | "auth_time"
+    )
+}
+
 pub fn flatten_claims(
     external: &BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, serde_json::Value> {
@@ -568,7 +604,9 @@ pub fn flatten_claims(
                 serde_json::Value::String(v[0].clone())
             } else {
                 serde_json::Value::Array(
-                    v.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                    v.iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
                 )
             };
             (k.clone(), value)
@@ -577,7 +615,11 @@ pub fn flatten_claims(
 }
 
 /// Build a redirect response appending params to the URI's query or fragment.
-fn redirect_with(redirect_uri: &str, params: &[(String, String)], fragment: bool) -> crate::http::Response {
+fn redirect_with(
+    redirect_uri: &str,
+    params: &[(String, String)],
+    fragment: bool,
+) -> crate::http::Response {
     let encoded: String = params
         .iter()
         .map(|(k, v)| {
@@ -603,10 +645,7 @@ fn decode_basic(b64: &str) -> Option<(String, String)> {
     let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let s = String::from_utf8(decoded).ok()?;
     let (id, secret) = s.split_once(':')?;
-    Some((
-        percent_decode(id),
-        percent_decode(secret),
-    ))
+    Some((percent_decode(id), percent_decode(secret)))
 }
 
 fn percent_decode(s: &str) -> String {

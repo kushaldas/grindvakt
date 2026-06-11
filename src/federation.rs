@@ -5,16 +5,16 @@
 //! Signing/verification all go through `jose-rs`; outbound fetches go through the
 //! injected [`crate::HttpClient`].
 
+use crate::error::{Error, Result};
+use crate::http::HttpClient;
+use crate::keys::SigningKey;
+use crate::util::now_secs;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
 use jose_rs::JoseHeader;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::error::{Error, Result};
-use crate::http::HttpClient;
-use crate::keys::SigningKey;
-use crate::util::now_secs;
 
 /// The JWT `typ` for federation entity statements.
 pub const ENTITY_STATEMENT_TYP: &str = "entity-statement+jwt";
@@ -25,8 +25,23 @@ pub const ENTITY_STATEMENT_TYP: &str = "entity-statement+jwt";
 /// included.
 pub const RESOLVE_RESPONSE_TYP: &str = "resolve-response+jwt";
 
+/// The JWT `typ` for a signed JWK Set document published at `signed_jwks_uri`
+/// (OpenID Federation 1.1 §5.2.1).
+pub const JWK_SET_TYP: &str = "jwk-set+jwt";
+
 /// Pre-distributed trust anchors: entity_id -> trusted JWKS.
 pub type TrustAnchors = HashMap<String, JwkSet>;
+
+/// A successful resolve response, bound to a configured trust anchor.
+#[derive(Debug, Clone)]
+pub struct ResolvedEntity {
+    pub issuer: String,
+    pub subject: String,
+    pub metadata: Value,
+    /// Federation Entity signing keys from the subject's Entity Configuration at
+    /// the start of the returned trust chain.
+    pub subject_jwks: JwkSet,
+}
 
 /// Build and sign a self-issued Entity Configuration JWT
 /// (`iss == sub == entity_id`).
@@ -49,13 +64,17 @@ pub fn build_entity_configuration(
     c.extra
         .insert("jwks".to_string(), serde_json::to_value(public_jwks)?);
     if !authority_hints.is_empty() {
-        c.extra
-            .insert("authority_hints".to_string(), serde_json::to_value(authority_hints)?);
+        c.extra.insert(
+            "authority_hints".to_string(),
+            serde_json::to_value(authority_hints)?,
+        );
     }
     c.extra.insert("metadata".to_string(), metadata);
     if !trust_marks.is_empty() {
-        c.extra
-            .insert("trust_marks".to_string(), Value::Array(trust_marks.to_vec()));
+        c.extra.insert(
+            "trust_marks".to_string(),
+            Value::Array(trust_marks.to_vec()),
+        );
     }
 
     let mut header = JoseHeader::for_alg(key.alg);
@@ -93,7 +112,11 @@ impl EntityStatement {
         self.claims
             .get("authority_hints")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -160,7 +183,7 @@ pub async fn resolve_via_trust_anchors(
     http: &Arc<dyn HttpClient>,
     sub: &str,
     trust_anchors: &TrustAnchors,
-) -> Result<Value> {
+) -> Result<ResolvedEntity> {
     let mut last_err: Option<Error> = None;
 
     for (ta_id, ta_keys) in trust_anchors {
@@ -180,10 +203,21 @@ async fn resolve_one(
     sub: &str,
     ta_id: &str,
     ta_keys: &JwkSet,
-) -> Result<Value> {
+) -> Result<ResolvedEntity> {
     // 1. Fetch + verify the trust anchor's own entity configuration.
     let ec_jwt = fetch_entity_configuration(http, ta_id).await?;
     let ec = verify(&ec_jwt, ta_keys)?;
+    let self_issued = verify_self_signed(&ec_jwt)?;
+    if ec.iss() != Some(ta_id) || ec.sub() != Some(ta_id) {
+        return Err(Error::Authn(format!(
+            "trust anchor {ta_id} entity configuration is not issued for the configured entity id"
+        )));
+    }
+    if self_issued.iss() != Some(ta_id) || self_issued.sub() != Some(ta_id) {
+        return Err(Error::Authn(format!(
+            "trust anchor {ta_id} entity configuration is not self-issued"
+        )));
+    }
 
     // 2. Find the trust anchor's resolve endpoint.
     let resolve_ep = ec
@@ -191,7 +225,9 @@ async fn resolve_one(
         .and_then(|m| m.get("federation_resolve_endpoint").cloned())
         .and_then(|v| v.as_str().map(String::from))
         .ok_or_else(|| {
-            Error::Internal(format!("trust anchor {ta_id} has no federation_resolve_endpoint"))
+            Error::Internal(format!(
+                "trust anchor {ta_id} has no federation_resolve_endpoint"
+            ))
         })?;
 
     // 3. Call the resolve endpoint.
@@ -213,14 +249,239 @@ async fn resolve_one(
     // 4. Verify the resolve response (signed by the trust anchor). A resolve
     //    response carries typ=resolve-response+jwt, not entity-statement+jwt.
     let resolved = verify_typed(&resp.text(), ta_keys, RESOLVE_RESPONSE_TYP)?;
+    extract_resolved_entity(&resolved, ta_id, sub, ta_keys)
+}
+
+fn extract_resolved_entity(
+    resolved: &EntityStatement,
+    ta_id: &str,
+    sub: &str,
+    ta_keys: &JwkSet,
+) -> Result<ResolvedEntity> {
+    if resolved.iss() != Some(ta_id) {
+        return Err(Error::Authn("resolve response issuer mismatch".into()));
+    }
     if resolved.sub() != Some(sub) {
         return Err(Error::Authn("resolve response sub mismatch".into()));
     }
-    resolved
+
+    let chain = resolved
+        .claims
+        .get("trust_chain")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::Authn("resolve response has no trust_chain".into()))?;
+    let first = chain
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Authn("resolve response trust_chain is empty".into()))?;
+    let last = chain
+        .last()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Authn("resolve response trust_chain is empty".into()))?;
+
+    let subject_ec = verify_self_signed(first)?;
+    if subject_ec.iss() != Some(sub) || subject_ec.sub() != Some(sub) {
+        return Err(Error::Authn(
+            "resolve response trust_chain does not start with the subject entity configuration"
+                .into(),
+        ));
+    }
+
+    let ta_ec = verify(last, ta_keys)?;
+    if ta_ec.iss() != Some(ta_id) || ta_ec.sub() != Some(ta_id) {
+        return Err(Error::Authn(
+            "resolve response trust_chain does not end with the selected trust anchor"
+                .into(),
+        ));
+    }
+
+    let metadata = resolved
         .claims
         .get("metadata")
         .cloned()
-        .ok_or_else(|| Error::Authn("resolve response has no metadata".into()))
+        .ok_or_else(|| Error::Authn("resolve response has no metadata".into()))?;
+
+    Ok(ResolvedEntity {
+        issuer: ta_id.to_string(),
+        subject: sub.to_string(),
+        metadata,
+        subject_jwks: subject_ec.jwks()?,
+    })
+}
+
+/// Resolve an Entity Type key set using the representations from OpenID
+/// Federation 1.1 §5.2.1.
+pub async fn entity_metadata_jwks(
+    http: &Arc<dyn HttpClient>,
+    metadata: &Value,
+    subject_entity_id: &str,
+    subject_fed_jwks: &JwkSet,
+) -> Result<JwkSet> {
+    if let Some(jwks) = metadata.get("jwks") {
+        return serde_json::from_value(jwks.clone()).map_err(Error::from);
+    }
+    if let Some(uri) = metadata.get("signed_jwks_uri").and_then(|v| v.as_str()) {
+        return fetch_signed_jwks(http, uri, subject_entity_id, subject_fed_jwks).await;
+    }
+    if let Some(uri) = metadata.get("jwks_uri").and_then(|v| v.as_str()) {
+        let resp = http.get(uri).await?;
+        if resp.status != 200 {
+            return Err(Error::Internal(format!("jwks fetch failed ({})", resp.status)));
+        }
+        return JwkSet::from_json(&resp.text()).map_err(Error::from);
+    }
+    Err(Error::Authn(
+        "metadata has neither jwks, signed_jwks_uri, nor jwks_uri".into(),
+    ))
+}
+
+/// Fetch and verify a signed JWK Set document referenced by `signed_jwks_uri`.
+pub async fn fetch_signed_jwks(
+    http: &Arc<dyn HttpClient>,
+    signed_jwks_uri: &str,
+    subject_entity_id: &str,
+    subject_fed_jwks: &JwkSet,
+) -> Result<JwkSet> {
+    let resp = http.get(signed_jwks_uri).await?;
+    if resp.status != 200 {
+        return Err(Error::Internal(format!(
+            "signed_jwks_uri fetch failed ({})",
+            resp.status
+        )));
+    }
+    if let Some(content_type) = resp.content_type.as_deref() {
+        if !content_type.starts_with("application/jwk-set+jwt") {
+            return Err(Error::Authn(format!(
+                "signed_jwks_uri returned unexpected content type {content_type}"
+            )));
+        }
+    }
+
+    let claims = crate::jwt::verify_with_jwks(
+        subject_fed_jwks,
+        &resp.text(),
+        &Validation::new().with_typ(JWK_SET_TYP),
+    )?;
+    if claims.sub.as_deref() != Some(subject_entity_id) {
+        return Err(Error::Authn("signed_jwks_uri sub mismatch".into()));
+    }
+    if claims.iss.as_deref().is_none() {
+        return Err(Error::Authn("signed_jwks_uri response missing iss".into()));
+    }
+
+    let keys = claims
+        .extra
+        .get("keys")
+        .cloned()
+        .ok_or_else(|| Error::Authn("signed_jwks_uri response has no keys".into()))?;
+    Ok(JwkSet {
+        keys: serde_json::from_value(keys)?,
+    })
+}
+
+// ── Collection / listing endpoint (OP discovery) ────────────────────────────
+
+/// One entity returned by a trust anchor's collection (listing) endpoint, with
+/// its UI presentation already flattened for a discovery page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionEntity {
+    /// The entity identifier (used as the OP/IdP to authenticate against).
+    pub entity_id: String,
+    /// A human-friendly name: the entity's `openid_provider` display name,
+    /// else its `federation_entity` display name, else the entity id.
+    pub display_name: String,
+    /// An optional logo URL for the discovery page.
+    pub logo_uri: Option<String>,
+}
+
+/// Fetch a list of federation entities of a given type from a trust anchor's
+/// collection endpoint (e.g. a SUNET/inmor `…/collection`), flattening their
+/// UI info for a discovery page. `entity_type` is the federation entity-type
+/// filter, e.g. `"openid_provider"`.
+///
+/// The endpoint is expected to answer with
+/// `{"entities": [{"entity_id": "...", "ui_infos": {"openid_provider": {...},
+/// "federation_entity": {...}}}, ...]}`.
+pub async fn fetch_collection(
+    http: &Arc<dyn HttpClient>,
+    collection_endpoint: &str,
+    entity_type: &str,
+) -> Result<Vec<CollectionEntity>> {
+    let url = format!(
+        "{}{}entity_type={}",
+        collection_endpoint,
+        if collection_endpoint.contains('?') {
+            '&'
+        } else {
+            '?'
+        },
+        urlenc(entity_type),
+    );
+    let resp = http.get(&url).await?;
+    if resp.status != 200 {
+        return Err(Error::Internal(format!(
+            "collection endpoint {url} returned {}",
+            resp.status
+        )));
+    }
+    let body: Value = resp.json()?;
+    Ok(parse_collection(&body, entity_type))
+}
+
+/// Parse a collection-endpoint response body into [`CollectionEntity`] list.
+/// Separated from the fetch so it can be unit-tested without HTTP. Entries
+/// without an `entity_id`, or that do not advertise `entity_type`, are skipped.
+pub fn parse_collection(body: &Value, entity_type: &str) -> Vec<CollectionEntity> {
+    let Some(entities) = body.get("entities").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let ui_name = |entity: &Value, kind: &str| -> Option<String> {
+        entity
+            .get("ui_infos")
+            .and_then(|u| u.get(kind))
+            .and_then(|m| m.get("display_name"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let ui_logo = |entity: &Value, kind: &str| -> Option<String> {
+        entity
+            .get("ui_infos")
+            .and_then(|u| u.get(kind))
+            .and_then(|m| m.get("logo_uri"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+
+    entities
+        .iter()
+        .filter(|entity| {
+            // Per the entity collection spec, an entity_type-filtered response
+            // must include only entities that explicitly advertise one of the
+            // requested entity types.
+            match entity.get("entity_types").and_then(|v| v.as_array()) {
+                Some(types) => types.iter().any(|t| t.as_str() == Some(entity_type)),
+                None => false,
+            }
+        })
+        .filter_map(|entity| {
+            let entity_id = entity.get("entity_id").and_then(|v| v.as_str())?;
+            if entity_id.is_empty() {
+                return None;
+            }
+            let display_name = ui_name(entity, entity_type)
+                .or_else(|| ui_name(entity, "federation_entity"))
+                .unwrap_or_else(|| entity_id.to_string());
+            let logo_uri =
+                ui_logo(entity, entity_type).or_else(|| ui_logo(entity, "federation_entity"));
+            Some(CollectionEntity {
+                entity_id: entity_id.to_string(),
+                display_name,
+                logo_uri,
+            })
+        })
+        .collect()
 }
 
 // ── Metadata policy (OpenID Federation 1.0 §6) ──────────────────────────────
@@ -394,7 +655,10 @@ mod tests {
         .clone();
 
         apply_policy(&mut metadata, &policy).unwrap();
-        assert_eq!(metadata["client_registration_types"], serde_json::json!(["automatic"]));
+        assert_eq!(
+            metadata["client_registration_types"],
+            serde_json::json!(["automatic"])
+        );
         assert_eq!(metadata["id_token_signed_response_alg"], "ES256");
 
         // subset violation.
@@ -407,5 +671,93 @@ mod tests {
             .unwrap()
             .clone();
         assert!(apply_policy(&mut bad, &p).is_err());
+    }
+
+    #[test]
+    fn parse_collection_flattens_ui_with_fallbacks() {
+        // Mirrors a SUNET/inmor `…/collection?entity_type=openid_provider`
+        // response: per-type UI with display_name/logo fallbacks.
+        let body = serde_json::json!({
+            "entities": [
+                {
+                    // openid_provider UI is empty -> fall back to federation_entity.
+                    "entity_id": "https://op-a.example",
+                    "entity_types": ["openid_provider", "federation_entity"],
+                    "ui_infos": {
+                        "federation_entity": { "display_name": "OP A Org", "logo_uri": "https://op-a.example/logo.svg" },
+                        "openid_provider": { "display_name": null, "logo_uri": null }
+                    }
+                },
+                {
+                    // openid_provider UI wins when present.
+                    "entity_id": "https://op-b.example",
+                    "entity_types": ["openid_provider"],
+                    "ui_infos": {
+                        "openid_provider": { "display_name": "OP B", "logo_uri": "https://op-b.example/b.png" }
+                    }
+                },
+                {
+                    // No UI at all -> display_name defaults to the entity id.
+                    "entity_id": "https://op-c.example",
+                    "entity_types": ["openid_provider"]
+                },
+                {
+                    // Wrong entity type -> filtered out.
+                    "entity_id": "https://rp.example",
+                    "entity_types": ["openid_relying_party"],
+                    "ui_infos": { "openid_relying_party": { "display_name": "An RP" } }
+                }
+            ]
+        });
+
+        let ops = parse_collection(&body, "openid_provider");
+        assert_eq!(
+            ops,
+            vec![
+                CollectionEntity {
+                    entity_id: "https://op-a.example".into(),
+                    display_name: "OP A Org".into(),
+                    logo_uri: Some("https://op-a.example/logo.svg".into()),
+                },
+                CollectionEntity {
+                    entity_id: "https://op-b.example".into(),
+                    display_name: "OP B".into(),
+                    logo_uri: Some("https://op-b.example/b.png".into()),
+                },
+                CollectionEntity {
+                    entity_id: "https://op-c.example".into(),
+                    display_name: "https://op-c.example".into(),
+                    logo_uri: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_collection_handles_missing_entities() {
+        assert!(parse_collection(&serde_json::json!({}), "openid_provider").is_empty());
+        assert!(parse_collection(&serde_json::json!({ "entities": [] }), "openid_provider").is_empty());
+    }
+
+    #[test]
+    fn parse_collection_requires_explicit_entity_type_membership() {
+        let body = serde_json::json!({
+            "entities": [
+                {
+                    "entity_id": "https://typed.example",
+                    "entity_types": ["openid_provider"]
+                },
+                {
+                    "entity_id": "https://untyped.example",
+                    "ui_infos": {
+                        "openid_provider": { "display_name": "Untyped OP" }
+                    }
+                }
+            ]
+        });
+
+        let ops = parse_collection(&body, "openid_provider");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].entity_id, "https://typed.example");
     }
 }

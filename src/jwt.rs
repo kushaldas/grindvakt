@@ -1,10 +1,10 @@
 //! Thin helpers over jose-rs for the OIDC/federation flows.
 
+use crate::error::{Error, Result};
+use crate::keys::SigningKey;
 use jose_rs::jwk::{Jwk, JwkSet};
 use jose_rs::jwt::{Claims, Validation};
 use jose_rs::JoseHeader;
-use crate::error::{Error, Result};
-use crate::keys::SigningKey;
 
 /// Sign a set of claims into a compact JWS using a [`SigningKey`], setting the
 /// `alg`, `kid` and (optionally) a custom `typ` header.

@@ -1,7 +1,7 @@
 //! OAuth 2.0 / OIDC standard error responses (RFC 6749 §5.2, §4.1.2.1).
 
-use serde::Serialize;
 use crate::http::Response;
+use serde::Serialize;
 
 /// A standard OAuth2 error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,10 +130,7 @@ impl OAuthError {
             self.code.as_str()
         );
         if let Some(desc) = &self.description {
-            url.push_str(&format!(
-                "&error_description={}",
-                urlencode(desc)
-            ));
+            url.push_str(&format!("&error_description={}", urlencode(desc)));
         }
         if let Some(state) = &self.state {
             url.push_str(&format!("&state={}", urlencode(state)));

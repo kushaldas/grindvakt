@@ -3,18 +3,18 @@
 //! Runtime-agnostic: outbound HTTP goes through the injected
 //! [`crate::HttpClient`].
 
+use crate::error::{Error, Result};
+use crate::http::HttpClient;
 use crate::jwt;
+use crate::keys::SigningKey;
 use crate::metadata::ProviderMetadata;
 use crate::oauth_error::urlencode;
 use crate::provider::CLIENT_ASSERTION_TYPE;
+use crate::util::now_secs;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Audience, Claims, Validation};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use crate::error::{Error, Result};
-use crate::http::HttpClient;
-use crate::keys::SigningKey;
-use crate::util::now_secs;
 
 /// Minimal upstream provider info the RP needs.
 #[derive(Debug, Clone)]
@@ -122,7 +122,10 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
 pub async fn fetch_jwks(http: &Arc<dyn HttpClient>, jwks_uri: &str) -> Result<JwkSet> {
     let resp = http.get(jwks_uri).await?;
     if resp.status != 200 {
-        return Err(Error::Internal(format!("jwks fetch failed ({})", resp.status)));
+        return Err(Error::Internal(format!(
+            "jwks fetch failed ({})",
+            resp.status
+        )));
     }
     JwkSet::from_json(&resp.text()).map_err(Error::from)
 }
@@ -164,7 +167,10 @@ pub async fn exchange_code(
             .get("access_token")
             .and_then(|v| v.as_str())
             .map(String::from),
-        id_token: raw.get("id_token").and_then(|v| v.as_str()).map(String::from),
+        id_token: raw
+            .get("id_token")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         token_type: raw
             .get("token_type")
             .and_then(|v| v.as_str())
@@ -204,7 +210,10 @@ pub async fn fetch_userinfo(
     // The injected client has no per-request header API on GET, so userinfo is
     // fetched via post_form with an empty body carrying the Authorization
     // header. (Most OPs accept GET or POST at userinfo.)
-    let headers = vec![("authorization".to_string(), format!("Bearer {access_token}"))];
+    let headers = vec![(
+        "authorization".to_string(),
+        format!("Bearer {access_token}"),
+    )];
     let resp = http.post_form(userinfo_endpoint, &[], &headers).await?;
     if resp.status != 200 {
         return Err(Error::Authn(format!("userinfo returned {}", resp.status)));
@@ -213,11 +222,7 @@ pub async fn fetch_userinfo(
 }
 
 /// Build a `private_key_jwt` client assertion (RFC 7523) for token-endpoint auth.
-pub fn build_client_assertion(
-    key: &SigningKey,
-    client_id: &str,
-    audience: &str,
-) -> Result<String> {
+pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str) -> Result<String> {
     let now = now_secs();
     let mut c = Claims::default();
     c.iss = Some(client_id.to_string());

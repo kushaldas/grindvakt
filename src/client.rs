@@ -1,10 +1,10 @@
 //! OIDC client (relying party) model and storage.
 
+use crate::util::now_secs;
 use jose_rs::jwk::JwkSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
-use crate::util::now_secs;
 
 /// Token-endpoint client authentication method.
 pub const AUTH_NONE: &str = "none";

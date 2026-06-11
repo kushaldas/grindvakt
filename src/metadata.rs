@@ -60,11 +60,7 @@ impl ProviderMetadata {
             userinfo_endpoint: format!("{base}/userinfo"),
             jwks_uri: format!("{base}/jwks"),
             registration_endpoint: None,
-            scopes_supported: vec![
-                "openid".into(),
-                "profile".into(),
-                "email".into(),
-            ],
+            scopes_supported: vec!["openid".into(), "profile".into(), "email".into()],
             response_types_supported: vec!["code".into()],
             response_modes_supported: vec!["query".into(), "fragment".into()],
             grant_types_supported: vec!["authorization_code".into(), "client_credentials".into()],

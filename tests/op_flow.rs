@@ -4,10 +4,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use grindvakt::keys::{signing_key_from_jwk_json, SigningKey};
 use grindvakt::client::{
     Client, InMemoryClientStore, AUTH_CLIENT_SECRET_POST, AUTH_NONE, AUTH_PRIVATE_KEY_JWT,
 };
+use grindvakt::keys::{signing_key_from_jwk_json, SigningKey};
 use grindvakt::metadata::ProviderMetadata;
 use grindvakt::pkce;
 use grindvakt::provider::{Provider, TokenLifetimes, CLIENT_ASSERTION_TYPE};
@@ -104,7 +104,10 @@ async fn authorization_code_pkce_flow() {
         .map(|(_, v)| v.clone())
         .unwrap();
     assert!(location.starts_with("https://rp.example.com/cb?"));
-    assert_eq!(extract_param(&location, "state").as_deref(), Some("state-xyz"));
+    assert_eq!(
+        extract_param(&location, "state").as_deref(),
+        Some("state-xyz")
+    );
     let code = extract_param(&location, "code").unwrap();
 
     // Token exchange with PKCE verifier.
@@ -183,7 +186,12 @@ async fn pkce_mismatch_rejected() {
     let redirect = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
         .unwrap();
-    let location = &redirect.headers.iter().find(|(k, _)| k == "location").unwrap().1;
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1;
     let code = extract_param(location, "code").unwrap();
 
     let err = op
@@ -233,7 +241,12 @@ async fn private_key_jwt_client_auth() {
     let redirect = op
         .authorization_redirect(&req, "sub-fed", &BTreeMap::new(), None)
         .unwrap();
-    let location = &redirect.headers.iter().find(|(k, _)| k == "location").unwrap().1;
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1;
     let code = extract_param(location, "code").unwrap();
 
     // Build a client assertion (RFC 7523) addressed to the token endpoint.
@@ -315,7 +328,10 @@ async fn client_credentials_flow() {
         .expect("client_credentials token");
 
     assert_eq!(resp.token_type, "Bearer");
-    assert!(resp.id_token.is_none(), "no id_token for client_credentials");
+    assert!(
+        resp.id_token.is_none(),
+        "no id_token for client_credentials"
+    );
     assert_eq!(resp.scope.as_deref(), Some("read admin"));
 
     // The sealed access token carries client_id as subject and the granted scope.
@@ -471,4 +487,99 @@ async fn client_credentials_dpop_bound() {
     assert_eq!(resp.token_type, "DPoP");
     let opened = op.codec.open_access_token(&resp.access_token).unwrap();
     assert_eq!(opened.cnf_jkt.as_deref(), Some("the-proof-key-thumbprint"));
+}
+
+/// Regression: an attribute map that releases a claim named `sub` (e.g.
+/// `eduPersonPrincipalName -> sub` on the OpenID profile) must not produce an
+/// id_token with two `sub` keys, and userinfo's `sub` must stay the canonical
+/// subject. A federation RP parsing the id_token strictly would otherwise fail
+/// with "duplicate field `sub`".
+#[tokio::test]
+async fn released_sub_claim_does_not_duplicate_id_token_subject() {
+    let client = Client {
+        client_id: "rp-sub".into(),
+        client_secret: None,
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_NONE.into(),
+        jwks: None,
+        scope: None,
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let challenge = pkce::s256_challenge(verifier);
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-sub"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("nonce", "nonce-1"),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&req).await.unwrap();
+
+    // The released attribute set carries `sub` (mapped from eppn) alongside the
+    // real subject identifier the OP passes positionally.
+    let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    claims.insert("sub".into(), vec!["anna@scope.example".into()]);
+    claims.insert("email".into(), vec!["anna@example.com".into()]);
+    let redirect = op
+        .authorization_redirect(&req, "canonical-subject-id", &claims, None)
+        .unwrap();
+    let location = redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let code = extract_param(&location, "code").unwrap();
+
+    let token_resp = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-sub"),
+                ("code_verifier", verifier),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .expect("token exchange");
+    let id_token = token_resp.id_token.clone().unwrap();
+
+    // The raw JWT payload must contain exactly one `sub` key.
+    let payload_b64 = id_token.split('.').nth(1).unwrap();
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .unwrap();
+    let sub_keys = String::from_utf8(payload)
+        .unwrap()
+        .matches("\"sub\"")
+        .count();
+    assert_eq!(sub_keys, 1, "id_token payload must carry exactly one sub");
+
+    // Strict verification (serde rejects duplicate keys) succeeds and the
+    // subject is the canonical one, not the released eppn.
+    let jwks = op.jwks_document();
+    let validation = jose_rs::jwt::Validation::new()
+        .with_issuer("https://op.example.com")
+        .with_audience("rp-sub");
+    let id_claims = jose_rs::jwt::decode_with_jwkset(&jwks, &id_token, &validation).unwrap();
+    assert_eq!(id_claims.sub.as_deref(), Some("canonical-subject-id"));
+
+    // UserInfo keeps the canonical subject too.
+    let userinfo = op.userinfo(&token_resp.access_token, None).await.unwrap();
+    assert_eq!(userinfo["sub"], "canonical-subject-id");
+    assert_eq!(userinfo["email"], "anna@example.com");
 }

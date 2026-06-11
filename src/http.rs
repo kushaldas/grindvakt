@@ -102,10 +102,7 @@ impl Response {
     }
 
     /// An `application/json` response with an explicit status.
-    pub fn json_status<T: serde::Serialize>(
-        status: u16,
-        value: &T,
-    ) -> crate::error::Result<Self> {
+    pub fn json_status<T: serde::Serialize>(status: u16, value: &T) -> crate::error::Result<Self> {
         let mut r = Response::json(value)?;
         r.status = status;
         Ok(r)

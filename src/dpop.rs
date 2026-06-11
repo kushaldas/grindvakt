@@ -16,13 +16,13 @@
 //! nonces are stateless: a base64url HMAC over a timestamp, so no nonce store is
 //! needed either.
 
+use crate::mac::{constant_time_eq, hmac_sha256, sha256};
+use crate::util::now_secs;
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use jose_rs::jwk::{thumbprint::thumbprint_sha256, Jwk};
 use serde::Deserialize;
-use crate::mac::{constant_time_eq, hmac_sha256, sha256};
-use crate::util::now_secs;
 
 /// Small allowance (seconds) for clock skew when checking a proof's `iat`.
 const IAT_FUTURE_SKEW_SECS: i64 = 30;
@@ -241,7 +241,9 @@ fn validate_proof_inner(
     // A DPoP proof key must be public — reject anything carrying private
     // material so a leaked private JWK can't sneak in.
     if jwk.d.is_some() || jwk.priv_.is_some() {
-        return Err(DpopError::Invalid("jwk must not contain private key".into()));
+        return Err(DpopError::Invalid(
+            "jwk must not contain private key".into(),
+        ));
     }
 
     // 5. Verify the JWS signature against the proof's own key. `verify_with_jwk`
@@ -450,9 +452,11 @@ mod tests {
 
         // Correct ath → accepted.
         let (proof, _) = make_proof_ath("GET", htu, now, None, Some(&ath_of(token)));
-        assert!(validate_resource_proof(&NoReplayStore, &cfg, &proof, "GET", htu, token)
-            .await
-            .is_ok());
+        assert!(
+            validate_resource_proof(&NoReplayStore, &cfg, &proof, "GET", htu, token)
+                .await
+                .is_ok()
+        );
 
         // No ath at all → rejected (resource requests require it).
         let (no_ath, _) = make_proof_ath("GET", htu, now, None, None);
@@ -502,9 +506,14 @@ mod tests {
             now_secs() as i64,
             None,
         );
-        let err =
-            validate_proof_inner(&cfg, &proof, "POST", "https://evil.example/oauth2/token", None)
-                .unwrap_err();
+        let err = validate_proof_inner(
+            &cfg,
+            &proof,
+            "POST",
+            "https://evil.example/oauth2/token",
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, DpopError::Invalid(_)));
     }
 
@@ -517,9 +526,14 @@ mod tests {
             now_secs() as i64,
             None,
         );
-        let err =
-            validate_proof_inner(&cfg, &proof, "POST", "https://as.example/oauth2/token", None)
-                .unwrap_err();
+        let err = validate_proof_inner(
+            &cfg,
+            &proof,
+            "POST",
+            "https://as.example/oauth2/token",
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, DpopError::Invalid(_)));
     }
 

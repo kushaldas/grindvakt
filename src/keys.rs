@@ -104,8 +104,7 @@ fn finalize_signing_key(
 fn parse_private_key(bytes: &[u8]) -> Result<SoftwareKey> {
     // If it looks like PEM, decode to DER first; otherwise treat as DER.
     let der: Vec<u8> = if bytes.starts_with(b"-----BEGIN") {
-        let parsed = pem::parse(bytes)
-            .map_err(|e| Error::Crypto(format!("invalid PEM: {e}")))?;
+        let parsed = pem::parse(bytes).map_err(|e| Error::Crypto(format!("invalid PEM: {e}")))?;
         parsed.into_contents()
     } else {
         bytes.to_vec()
@@ -124,7 +123,8 @@ fn parse_private_key(bytes: &[u8]) -> Result<SoftwareKey> {
         return Ok(k);
     }
     Err(Error::Crypto(
-        "could not parse private key (tried RSA/EC P-256/P-384/Ed25519 in PKCS#8/PKCS#1/SEC1)".into(),
+        "could not parse private key (tried RSA/EC P-256/P-384/Ed25519 in PKCS#8/PKCS#1/SEC1)"
+            .into(),
     ))
 }
 

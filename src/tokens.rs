@@ -6,14 +6,14 @@
 //! token endpoint nor the userinfo endpoint needs a server-side lookup — the
 //! whole OP is horizontally scalable with no shared store.
 
+use crate::error::{Error, Result};
+use crate::util::now_secs;
 use hkdf::Hkdf;
 use jose_rs::algorithm::{JweAlgorithm, JweEncryption};
 use jose_rs::jwe::JweDecryptOptions;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::BTreeMap;
-use crate::error::{Error, Result};
-use crate::util::now_secs;
 
 /// HKDF salt and info for token-key derivation. Domain-separated from the state
 /// cookie key (different salt/info) so the same configured secret yields an
@@ -112,10 +112,7 @@ impl TokenCodec {
     fn open<T: for<'de> Deserialize<'de>>(&self, token: &str) -> Result<T> {
         // Pin the accepted algorithms — reject anything but dir + A256GCM before
         // touching key material (defence against algorithm substitution).
-        let opts = JweDecryptOptions::new(
-            vec![JweAlgorithm::Dir],
-            vec![JweEncryption::A256GCM],
-        );
+        let opts = JweDecryptOptions::new(vec![JweAlgorithm::Dir], vec![JweEncryption::A256GCM]);
         let mut last_err = None;
         for key in &self.keys {
             match jose_rs::jwe::decrypt_with_options(key, token, &opts) {
