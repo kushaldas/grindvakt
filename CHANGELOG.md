@@ -2,6 +2,18 @@
 
 ## unreleased
 
+## 0.3.1 [2026-06-11]
+
+- Added `rp::signed_request_object` building an RFC 9101 signed request
+  object (JAR) for the authorization request, as OpenID Federation automatic
+  registration requires: the OP authenticates the RP at the authorization
+  endpoint against the keys in its resolved `openid_relying_party` metadata
+  (and Shibboleth's OIDC OP plugin uses the request object as the trigger to
+  resolve the RP's trust chain). Claims carry `client_id`, `redirect_uri`,
+  `scope`, `response_type`, `state`, `nonce`, optional PKCE challenge, plus
+  `iss`/`aud`/`iat`/`exp`/`jti`; the JWS header is plain `alg`+`kid` (no
+  `typ`) for interoperability.
+
 ## 0.3.0 [2026-06-11]
 
 - `federation::ResolvedEntity` gained a public `exp` field carrying the

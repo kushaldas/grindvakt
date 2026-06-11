@@ -102,6 +102,50 @@ pub fn authorization_url(
     format!("{}{}{}", provider.authorization_endpoint, sep, qs)
 }
 
+/// Build a signed request object (RFC 9101, "JAR") carrying the
+/// authorization-request parameters as JWT claims.
+///
+/// OpenID Federation **automatic registration** needs this: a federation OP
+/// authenticates the RP at the authorization endpoint by verifying the
+/// request object against the keys published in the RP's resolved
+/// `openid_relying_party` metadata, and implementations (e.g. the Shibboleth
+/// OIDC OP plugin) use its presence as the trigger to resolve the RP's trust
+/// chain on the fly. Pass the result as the `request` parameter — typically
+/// via [`authorization_url`]'s `extra` — alongside the plain parameters so
+/// OPs that ignore request objects keep working.
+///
+/// `key` must be (one of) the RP's published client keys; for a federation
+/// RP that is the `private_key_jwt` key from its entity configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn signed_request_object(
+    provider: &ProviderInfo,
+    client: &RpClient,
+    key: &SigningKey,
+    state: &str,
+    nonce: &str,
+    code_challenge: Option<&str>,
+) -> Result<String> {
+    let now = now_secs();
+    let mut c = Claims::default();
+    c.iss = Some(client.client_id.clone());
+    c.aud = Some(Audience::Single(provider.issuer.clone()));
+    c.iat = Some(now);
+    c.exp = Some(now + 300);
+    c.jti = Some(crate::util::random_token(16));
+    let extra = &mut c.extra;
+    extra.insert("client_id".into(), client.client_id.clone().into());
+    extra.insert("redirect_uri".into(), client.redirect_uri.clone().into());
+    extra.insert("scope".into(), client.scope.clone().into());
+    extra.insert("response_type".into(), "code".into());
+    extra.insert("state".into(), state.into());
+    extra.insert("nonce".into(), nonce.into());
+    if let Some(cc) = code_challenge {
+        extra.insert("code_challenge".into(), cc.into());
+        extra.insert("code_challenge_method".into(), "S256".into());
+    }
+    jwt::sign(key, &c, None)
+}
+
 /// Discover provider metadata from an issuer.
 pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<ProviderMetadata> {
     let url = format!(
@@ -286,4 +330,71 @@ pub fn claims_to_attributes(claims: &serde_json::Value) -> BTreeMap<String, Vec<
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::signing_key_from_jwk_json;
+
+    fn client_and_provider() -> (RpClient, ProviderInfo, SigningKey) {
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let key = signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), Some("rp-1"))
+            .unwrap();
+        let client = RpClient {
+            client_id: "https://rp.example.com".into(),
+            redirect_uri: "https://rp.example.com/callback".into(),
+            auth: ClientAuth::PrivateKeyJwt(key.clone()),
+            scope: "openid email".into(),
+        };
+        let provider = ProviderInfo {
+            issuer: "https://op.example.org".into(),
+            authorization_endpoint: "https://op.example.org/authorize".into(),
+            token_endpoint: "https://op.example.org/token".into(),
+            userinfo_endpoint: None,
+            jwks_uri: None,
+        };
+        (client, provider, key)
+    }
+
+    #[test]
+    fn signed_request_object_carries_request_params_and_verifies() {
+        let (client, provider, key) = client_and_provider();
+        let jar =
+            signed_request_object(&provider, &client, &key, "st-1", "n-1", Some("chal")).unwrap();
+
+        // Verifies against the RP's published public keys, audience = OP issuer.
+        let validation = Validation::new()
+            .with_issuer(&client.client_id)
+            .with_audience(&provider.issuer);
+        let claims = jwt::verify_with_jwks(&key.to_public_jwks(), &jar, &validation).unwrap();
+
+        assert_eq!(claims.extra["client_id"], client.client_id);
+        assert_eq!(claims.extra["redirect_uri"], client.redirect_uri);
+        assert_eq!(claims.extra["response_type"], "code");
+        assert_eq!(claims.extra["scope"], "openid email");
+        assert_eq!(claims.extra["state"], "st-1");
+        assert_eq!(claims.extra["nonce"], "n-1");
+        assert_eq!(claims.extra["code_challenge"], "chal");
+        assert_eq!(claims.extra["code_challenge_method"], "S256");
+        assert!(claims.jti.is_some(), "jti for replay detection");
+        let (iat, exp) = (claims.iat.unwrap(), claims.exp.unwrap());
+        assert!(exp > iat && exp <= iat + 300);
+
+        // Header: alg + kid, no typ (interop with Shibboleth's OIDC plugin,
+        // which expects a plain JWT request object).
+        let header = jwt::peek_header(&jar).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("rp-1"));
+        assert!(header.typ.is_none());
+    }
+
+    #[test]
+    fn signed_request_object_omits_pkce_when_absent() {
+        let (client, provider, key) = client_and_provider();
+        let jar = signed_request_object(&provider, &client, &key, "st", "n", None).unwrap();
+        let claims = jwt::peek_claims_unverified(&jar).unwrap();
+        assert!(!claims.extra.contains_key("code_challenge"));
+        assert!(!claims.extra.contains_key("code_challenge_method"));
+    }
 }
