@@ -4,6 +4,14 @@
 
 ## 0.4.0 [2026-06-23]
 
+- The OP now emits standard OIDC claims with their correct JSON type instead of
+  always stringifying released attributes (OIDC Core §5.1): `email_verified`
+  and `phone_number_verified` serialize as JSON booleans, and `updated_at` as a
+  number. Applies to both the id_token and the userinfo response (they share
+  `flatten_claims`). A value that cannot be parsed as the expected type is left
+  as a string rather than dropped or fabricated. This lets RPs that strictly
+  type `email_verified` as a boolean (e.g. Vaultwarden/OIDCWarden) consume it.
+
 - Added the `refresh_token` grant (RFC 6749 §6). The OP now issues a refresh
   token from the authorization-code exchange for clients registered with
   `refresh_token` in `grant_types`, and the token endpoint handles
