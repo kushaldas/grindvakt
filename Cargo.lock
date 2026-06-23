@@ -183,9 +183,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a0d26b245348befa0c121944541476763dcc46ede886c88f9d12e1697d27c3"
+checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "grindvakt"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -662,7 +662,7 @@ dependencies = [
  "aes-gcm",
  "aes-kw",
  "cbc",
- "crypto-bigint 0.7.3",
+ "crypto-bigint 0.7.5",
  "digest",
  "dsa",
  "ecdsa",

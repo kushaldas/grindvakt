@@ -11,7 +11,7 @@ use crate::metadata::ProviderMetadata;
 use crate::oauth_error::{OAuthError, OAuthErrorCode};
 use crate::pkce;
 use crate::request::AuthorizationRequest;
-use crate::tokens::{AccessTokenPayload, AuthCodePayload, TokenCodec};
+use crate::tokens::{AccessTokenPayload, AuthCodePayload, RefreshTokenPayload, TokenCodec};
 use crate::util::now_secs;
 use base64::Engine;
 use jose_rs::jwk::JwkSet;
@@ -29,6 +29,9 @@ pub struct TokenLifetimes {
     pub code_ttl: u64,
     pub access_token_ttl: u64,
     pub id_token_ttl: u64,
+    /// Lifetime of an issued refresh token (RFC 6749 §6). Refresh tokens are
+    /// rotated on each use, so this is a sliding window from the last refresh.
+    pub refresh_token_ttl: u64,
 }
 
 impl Default for TokenLifetimes {
@@ -37,6 +40,7 @@ impl Default for TokenLifetimes {
             code_ttl: 600,
             access_token_ttl: 3600,
             id_token_ttl: 3600,
+            refresh_token_ttl: 2_592_000, // 30 days
         }
     }
 }
@@ -60,6 +64,8 @@ pub struct TokenResponse {
     pub id_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
 impl Provider {
@@ -160,6 +166,7 @@ impl Provider {
                     req.nonce.as_deref(),
                     &claims,
                     acr.as_deref(),
+                    auth_time,
                 )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
             out.push(("id_token".to_string(), id_token));
@@ -201,6 +208,10 @@ impl Provider {
             }
             "client_credentials" => {
                 self.handle_client_credentials(form, auth_header, token_url, dpop)
+                    .await
+            }
+            "refresh_token" => {
+                self.handle_refresh_token(form, auth_header, token_url, dpop)
                     .await
             }
             other => Err(OAuthError::new(
@@ -287,8 +298,33 @@ impl Provider {
                 payload.nonce.as_deref(),
                 &payload.claims,
                 payload.acr.as_deref(),
+                payload.auth_time,
             )
             .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
+
+        // Issue a refresh token only when the client is registered for the grant
+        // (RFC 6749 §6). It carries the original auth_time/nonce/acr so refreshed
+        // id_tokens stay faithful to the initial authentication.
+        let refresh_token = if client_allows_refresh(&client) {
+            let rt = RefreshTokenPayload {
+                client_id: client.client_id.clone(),
+                sub: payload.sub.clone(),
+                scope: payload.scope.clone(),
+                nonce: payload.nonce.clone(),
+                claims: payload.claims.clone(),
+                auth_time: payload.auth_time,
+                exp: now_secs() + self.lifetimes.refresh_token_ttl,
+                acr: payload.acr.clone(),
+                cnf_jkt: dpop.map(|d| d.jkt.clone()),
+            };
+            Some(
+                self.codec
+                    .seal_refresh_token(&rt)
+                    .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         Ok(TokenResponse {
             access_token,
@@ -296,6 +332,7 @@ impl Provider {
             expires_in: self.lifetimes.access_token_ttl,
             id_token: Some(id_token),
             scope: Some(payload.scope),
+            refresh_token,
         })
     }
 
@@ -375,6 +412,135 @@ impl Provider {
             expires_in: self.lifetimes.access_token_ttl,
             id_token: None,
             scope: Some(scope),
+            refresh_token: None,
+        })
+    }
+
+    /// The `refresh_token` grant (RFC 6749 §6): exchange a refresh token for a
+    /// fresh access token and id_token, optionally narrowing scope. The refresh
+    /// token is a stateless sealed [`RefreshTokenPayload`]; it is rotated on each
+    /// use (a new one is returned) but, with no server-side store, cannot be
+    /// revoked before its own expiry. DPoP binding applies to the new access
+    /// token when a proof is presented.
+    async fn handle_refresh_token(
+        &self,
+        form: &BTreeMap<String, String>,
+        auth_header: Option<&str>,
+        token_url: &str,
+        dpop: Option<&crate::dpop::DpopProof>,
+    ) -> Result<TokenResponse, OAuthError> {
+        let client = self
+            .authenticate_client(form, auth_header, token_url)
+            .await?;
+
+        if !client_allows_refresh(&client) {
+            return Err(OAuthError::invalid_grant(
+                "refresh_token grant not allowed for client",
+            ));
+        }
+
+        let token = form
+            .get("refresh_token")
+            .ok_or_else(|| OAuthError::invalid_request("missing refresh_token"))?;
+        let rt = self
+            .codec
+            .open_refresh_token(token)
+            .map_err(|_| OAuthError::invalid_grant("invalid or expired refresh_token"))?;
+
+        // The refresh token is bound to the authenticating client.
+        if rt.client_id != client.client_id {
+            return Err(OAuthError::invalid_grant(
+                "refresh token was issued to another client",
+            ));
+        }
+
+        let cnf_jkt = match rt.cnf_jkt.as_deref() {
+            Some(bound_jkt) => match dpop {
+                Some(proof) if proof.jkt == bound_jkt => Some(bound_jkt.to_string()),
+                Some(_) => {
+                    return Err(OAuthError::invalid_dpop_proof(
+                        "DPoP proof key does not match the refresh token's cnf.jkt",
+                    ));
+                }
+                None => {
+                    return Err(OAuthError::invalid_dpop_proof(
+                        "refresh token is DPoP-bound; a matching DPoP proof is required",
+                    ));
+                }
+            },
+            None => dpop.map(|proof| proof.jkt.clone()),
+        };
+
+        // Scope may only be narrowed (RFC 6749 §6): a requested scope must be a
+        // subset of what was originally granted. Absent, the full grant carries.
+        let scope = match form.get("scope") {
+            Some(requested) => {
+                let requested_scopes: Vec<&str> = requested.split_whitespace().collect();
+                let original_scopes: Vec<&str> = rt.scope.split_whitespace().collect();
+                if requested_scopes.is_empty()
+                    || requested_scopes
+                        .iter()
+                        .any(|scope| !original_scopes.iter().any(|original| original == scope))
+                {
+                    return Err(OAuthError::new(
+                        OAuthErrorCode::InvalidScope,
+                        "requested scope exceeds original grant",
+                    ));
+                }
+                requested_scopes.join(" ")
+            }
+            None => rt.scope.clone(),
+        };
+
+        let now = now_secs();
+        let access_payload = AccessTokenPayload {
+            client_id: client.client_id.clone(),
+            sub: rt.sub.clone(),
+            scope: scope.clone(),
+            claims: rt.claims.clone(),
+            exp: now + self.lifetimes.access_token_ttl,
+            cnf_jkt: cnf_jkt.clone(),
+        };
+        let access_token = self
+            .codec
+            .seal_access_token(&access_payload)
+            .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
+
+        let id_token = self
+            .build_id_token(
+                &client.client_id,
+                &rt.sub,
+                rt.nonce.as_deref(),
+                &rt.claims,
+                rt.acr.as_deref(),
+                rt.auth_time,
+            )
+            .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
+
+        // Rotate the refresh token (sliding expiry), carrying the narrowed scope.
+        let new_refresh = RefreshTokenPayload {
+            client_id: client.client_id.clone(),
+            sub: rt.sub.clone(),
+            scope: scope.clone(),
+            nonce: rt.nonce.clone(),
+            claims: rt.claims.clone(),
+            auth_time: rt.auth_time,
+            exp: now + self.lifetimes.refresh_token_ttl,
+            acr: rt.acr.clone(),
+            cnf_jkt,
+        };
+        let refresh_token = self
+            .codec
+            .seal_refresh_token(&new_refresh)
+            .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
+
+        Ok(TokenResponse {
+            access_token,
+            token_type: Self::token_type(dpop).to_string(),
+            expires_in: self.lifetimes.access_token_ttl,
+            id_token: Some(id_token),
+            scope: Some(scope),
+            refresh_token: Some(refresh_token),
         })
     }
 
@@ -551,6 +717,7 @@ impl Provider {
         nonce: Option<&str>,
         claims: &BTreeMap<String, serde_json::Value>,
         acr: Option<&str>,
+        auth_time: u64,
     ) -> crate::error::Result<String> {
         let now = now_secs();
         let mut c = Claims::default();
@@ -567,7 +734,10 @@ impl Provider {
             c.extra
                 .insert("acr".into(), serde_json::Value::String(a.to_string()));
         }
-        c.extra.insert("auth_time".into(), serde_json::json!(now));
+        // `auth_time` reflects the *original* end-user authentication, so it is
+        // carried through code/refresh exchanges rather than reset to now.
+        c.extra
+            .insert("auth_time".into(), serde_json::json!(auth_time));
         for (k, v) in claims {
             // Released claims must never shadow the registered claims set as
             // typed fields: serde flattens `extra`, so a released `sub`
@@ -580,6 +750,11 @@ impl Provider {
         }
         jwt::sign(&self.signing_key, &c, None)
     }
+}
+
+/// Whether the client is registered for the `refresh_token` grant (RFC 6749 §6).
+fn client_allows_refresh(client: &Client) -> bool {
+    client.grant_types.iter().any(|g| g == "refresh_token")
 }
 
 /// Flatten a multi-valued external claim map into JSON values: single-element

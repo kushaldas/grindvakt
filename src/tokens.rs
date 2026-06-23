@@ -1,6 +1,6 @@
-//! Stateless authorization codes and access tokens.
+//! Stateless authorization codes, access tokens, and refresh tokens.
 //!
-//! Both are confidential, self-contained tokens: a JSON payload encrypted as a
+//! These are confidential, self-contained tokens: each a JSON payload encrypted as a
 //! JWE compact token (`dir` + `A256GCM`) under a 256-bit key derived from the
 //! OP's secret. Because they carry their own state (and expiry), neither the
 //! token endpoint nor the userinfo endpoint needs a server-side lookup — the
@@ -69,7 +69,56 @@ pub struct AccessTokenPayload {
     pub cnf_jkt: Option<String>,
 }
 
-/// Seals/opens authorization codes and access tokens.
+/// The payload sealed inside a refresh token (RFC 6749 §6).
+///
+/// It carries everything needed to re-mint an access token and id_token on
+/// refresh without a server lookup: the subject, the granted scope, the released
+/// claims, the original `auth_time`/`nonce`/`acr` so a refreshed id_token stays
+/// faithful to the initial authentication, and any DPoP confirmation thumbprint
+/// that sender-constrains the refresh token. Refresh tokens are rotated on each
+/// use, but — like every other token here — they are stateless, so they cannot
+/// be revoked before their own `exp` (no server-side store to consult).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshTokenPayload {
+    pub client_id: String,
+    pub sub: String,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub claims: BTreeMap<String, serde_json::Value>,
+    pub auth_time: u64,
+    pub exp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf_jkt: Option<String>,
+}
+
+/// Token-type discriminators sealed alongside each payload so a token of one
+/// kind cannot be replayed as another — e.g. a refresh token (or an
+/// authorization code) presented as an access token at the userinfo endpoint.
+/// The tag is checked on every open.
+const TYP_CODE: &str = "code";
+const TYP_ACCESS: &str = "at";
+const TYP_REFRESH: &str = "rt";
+
+/// On-the-wire envelope: a type tag plus the payload. Sealing wraps the payload;
+/// opening verifies the tag before the payload is trusted.
+#[derive(Serialize)]
+struct SealedEnvelope<'a, T: Serialize> {
+    typ: &'a str,
+    p: &'a T,
+}
+
+#[derive(Deserialize)]
+struct OpenedEnvelope<T> {
+    #[serde(default)]
+    typ: String,
+    p: T,
+}
+
+/// Seals/opens authorization codes, access tokens, and refresh tokens.
 #[derive(Clone)]
 pub struct TokenCodec {
     /// AEAD keys derived from the OP secret(s). `keys[0]` is the primary, used
@@ -98,8 +147,8 @@ impl TokenCodec {
         self
     }
 
-    fn seal<T: Serialize>(&self, value: &T) -> Result<String> {
-        let plaintext = serde_json::to_vec(value)?;
+    fn seal<T: Serialize>(&self, typ: &str, value: &T) -> Result<String> {
+        let plaintext = serde_json::to_vec(&SealedEnvelope { typ, p: value })?;
         jose_rs::jwe::encrypt(
             &self.keys[0],
             &plaintext,
@@ -109,14 +158,26 @@ impl TokenCodec {
         .map_err(|e| Error::Crypto(format!("token seal: {e}")))
     }
 
-    fn open<T: for<'de> Deserialize<'de>>(&self, token: &str) -> Result<T> {
+    fn open<T: for<'de> Deserialize<'de>>(&self, expected_typ: &str, token: &str) -> Result<T> {
         // Pin the accepted algorithms — reject anything but dir + A256GCM before
         // touching key material (defence against algorithm substitution).
         let opts = JweDecryptOptions::new(vec![JweAlgorithm::Dir], vec![JweEncryption::A256GCM]);
         let mut last_err = None;
         for key in &self.keys {
             match jose_rs::jwe::decrypt_with_options(key, token, &opts) {
-                Ok(plaintext) => return serde_json::from_slice(&plaintext).map_err(Error::from),
+                // Decryption succeeded under this key, so this is one of our
+                // tokens: a payload/type problem from here on is a hard error,
+                // not a reason to try the next key.
+                Ok(plaintext) => {
+                    let env: OpenedEnvelope<T> = serde_json::from_slice(&plaintext)?;
+                    if env.typ != expected_typ {
+                        return Err(Error::Authn(format!(
+                            "token type mismatch: expected {expected_typ}, got {}",
+                            env.typ
+                        )));
+                    }
+                    return Ok(env.p);
+                }
                 Err(e) => last_err = Some(e),
             }
         }
@@ -127,12 +188,12 @@ impl TokenCodec {
     }
 
     pub fn seal_code(&self, payload: &AuthCodePayload) -> Result<String> {
-        self.seal(payload)
+        self.seal(TYP_CODE, payload)
     }
 
     /// Open and expiry-check an authorization code.
     pub fn open_code(&self, token: &str) -> Result<AuthCodePayload> {
-        let payload: AuthCodePayload = self.open(token)?;
+        let payload: AuthCodePayload = self.open(TYP_CODE, token)?;
         if payload.exp <= now_secs() {
             return Err(Error::Authn("authorization code expired".into()));
         }
@@ -140,14 +201,27 @@ impl TokenCodec {
     }
 
     pub fn seal_access_token(&self, payload: &AccessTokenPayload) -> Result<String> {
-        self.seal(payload)
+        self.seal(TYP_ACCESS, payload)
     }
 
     /// Open and expiry-check an access token.
     pub fn open_access_token(&self, token: &str) -> Result<AccessTokenPayload> {
-        let payload: AccessTokenPayload = self.open(token)?;
+        let payload: AccessTokenPayload = self.open(TYP_ACCESS, token)?;
         if payload.exp <= now_secs() {
             return Err(Error::Authn("access token expired".into()));
+        }
+        Ok(payload)
+    }
+
+    pub fn seal_refresh_token(&self, payload: &RefreshTokenPayload) -> Result<String> {
+        self.seal(TYP_REFRESH, payload)
+    }
+
+    /// Open and expiry-check a refresh token.
+    pub fn open_refresh_token(&self, token: &str) -> Result<RefreshTokenPayload> {
+        let payload: RefreshTokenPayload = self.open(TYP_REFRESH, token)?;
+        if payload.exp <= now_secs() {
+            return Err(Error::Authn("refresh token expired".into()));
         }
         Ok(payload)
     }
@@ -199,6 +273,70 @@ mod tests {
         };
         let token = codec.seal_access_token(&payload).unwrap();
         assert!(other.open_access_token(&token).is_err());
+    }
+
+    #[test]
+    fn refresh_roundtrip_and_expiry() {
+        let codec = TokenCodec::new("op-secret");
+        let mut claims = BTreeMap::new();
+        claims.insert("email".to_string(), serde_json::json!("anna@example.com"));
+        let payload = RefreshTokenPayload {
+            client_id: "client-1".into(),
+            sub: "user-1".into(),
+            scope: "openid email".into(),
+            nonce: Some("n".into()),
+            claims,
+            auth_time: now_secs() - 30,
+            exp: now_secs() + 60,
+            acr: Some("urn:acr:mock".into()),
+            cnf_jkt: None,
+        };
+        let token = codec.seal_refresh_token(&payload).unwrap();
+        let opened = codec.open_refresh_token(&token).unwrap();
+        assert_eq!(opened.sub, "user-1");
+        assert_eq!(opened.scope, "openid email");
+        assert_eq!(opened.acr.as_deref(), Some("urn:acr:mock"));
+
+        // Expired.
+        let mut expired = payload.clone();
+        expired.exp = now_secs() - 1;
+        let token = codec.seal_refresh_token(&expired).unwrap();
+        assert!(codec.open_refresh_token(&token).is_err());
+    }
+
+    #[test]
+    fn token_types_are_not_interchangeable() {
+        // A refresh token must not open as an access token (else it could be
+        // replayed at userinfo), and vice versa, even under the same key.
+        let codec = TokenCodec::new("op-secret");
+        let refresh = codec
+            .seal_refresh_token(&RefreshTokenPayload {
+                client_id: "c".into(),
+                sub: "s".into(),
+                scope: "openid".into(),
+                nonce: None,
+                claims: BTreeMap::new(),
+                auth_time: now_secs(),
+                exp: now_secs() + 60,
+                acr: None,
+                cnf_jkt: None,
+            })
+            .unwrap();
+        assert!(codec.open_access_token(&refresh).is_err());
+        assert!(codec.open_code(&refresh).is_err());
+
+        let access = codec
+            .seal_access_token(&AccessTokenPayload {
+                client_id: "c".into(),
+                sub: "s".into(),
+                scope: "openid".into(),
+                claims: BTreeMap::new(),
+                exp: now_secs() + 60,
+                cnf_jkt: None,
+            })
+            .unwrap();
+        assert!(codec.open_refresh_token(&access).is_err());
+        assert!(codec.open_code(&access).is_err());
     }
 
     #[test]
