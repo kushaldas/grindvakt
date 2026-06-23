@@ -776,7 +776,11 @@ pub fn flatten_claims(
         .iter()
         .map(|(k, v)| {
             let value = if v.len() == 1 {
-                serde_json::Value::String(v[0].clone())
+                // Standard OIDC claims with a non-string JSON type are coerced
+                // (e.g. `email_verified` → `true`, not `"true"`); everything
+                // else stays a string.
+                coerce_standard_claim(k, &v[0])
+                    .unwrap_or_else(|| serde_json::Value::String(v[0].clone()))
             } else {
                 serde_json::Value::Array(
                     v.iter()
@@ -787,6 +791,30 @@ pub fn flatten_claims(
             (k.clone(), value)
         })
         .collect()
+}
+
+/// Coerce the standard OIDC claims whose JSON type is not a string (OIDC Core
+/// §5.1) from their released string form to the spec type: the `*_verified`
+/// flags are booleans and `updated_at` is a number (seconds since epoch).
+/// Returns `None` for any other claim, or when the value cannot be parsed as
+/// the expected type (the caller then keeps it as a string rather than dropping
+/// or fabricating data).
+fn coerce_standard_claim(name: &str, value: &str) -> Option<serde_json::Value> {
+    match name {
+        "email_verified" | "phone_number_verified" => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(serde_json::Value::Bool(true)),
+                "false" | "0" | "no" | "off" => Some(serde_json::Value::Bool(false)),
+                _ => None,
+            }
+        }
+        "updated_at" => value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|n| serde_json::json!(n)),
+        _ => None,
+    }
 }
 
 /// Build a redirect response appending params to the URI's query or fragment.
@@ -838,4 +866,43 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_boolean_and_number_claims_are_typed() {
+        let mut external: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        external.insert("email".into(), vec!["a@example.com".into()]);
+        external.insert("email_verified".into(), vec!["true".into()]);
+        external.insert("phone_number_verified".into(), vec!["false".into()]);
+        external.insert("updated_at".into(), vec!["1700000000".into()]);
+
+        let flat = flatten_claims(&external);
+        // email_verified is a real JSON boolean, not the string "true".
+        assert_eq!(flat["email_verified"], serde_json::Value::Bool(true));
+        assert_eq!(
+            flat["phone_number_verified"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(flat["updated_at"], serde_json::json!(1700000000));
+        // Ordinary claims stay strings.
+        assert_eq!(
+            flat["email"],
+            serde_json::Value::String("a@example.com".into())
+        );
+    }
+
+    #[test]
+    fn unparseable_typed_claim_falls_back_to_string() {
+        let mut external: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        external.insert("email_verified".into(), vec!["maybe".into()]);
+        let flat = flatten_claims(&external);
+        assert_eq!(
+            flat["email_verified"],
+            serde_json::Value::String("maybe".into())
+        );
+    }
 }
