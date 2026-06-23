@@ -2,6 +2,35 @@
 
 ## unreleased
 
+## 0.4.0 [2026-06-23]
+
+- Added the `refresh_token` grant (RFC 6749 §6). The OP now issues a refresh
+  token from the authorization-code exchange for clients registered with
+  `refresh_token` in `grant_types`, and the token endpoint handles
+  `grant_type=refresh_token`: it authenticates the client, opens the (stateless)
+  refresh token, enforces client binding, allows scope to be **narrowed** (never
+  widened), mints a new access token and id_token, and **rotates** the refresh
+  token (sliding expiry). New `tokens::RefreshTokenPayload`,
+  `TokenCodec::seal_refresh_token`/`open_refresh_token`,
+  `TokenLifetimes.refresh_token_ttl` (default 30 days), and
+  `TokenResponse.refresh_token`. `refresh_token` is advertised in
+  `grant_types_supported`.
+  - The refreshed id_token preserves the original `auth_time`, `nonce`, and
+    `acr` (`build_id_token` now takes `auth_time`) so it stays faithful to the
+    initial authentication.
+  - DPoP-bound refresh tokens preserve their `cnf.jkt` binding across rotation
+    and require a matching DPoP proof when redeemed.
+  - Refresh tokens are stateless like codes/access tokens, so they cannot be
+    revoked before their own expiry (no server-side store) — an accepted
+    trade-off of the stateless design; rotation slides the window but does not
+    add server-side reuse detection.
+- Hardening: every sealed token (code, access token, refresh token) now carries
+  a type tag that is verified on open, so a token of one kind can no longer be
+  replayed as another (e.g. a refresh token or authorization code presented as
+  an access token at userinfo). **Token format change**: tokens sealed by
+  ≤ 0.3.x do not open under 0.4.0 — codes/access tokens are short-lived so this
+  only affects in-flight tokens across an upgrade.
+
 ## 0.3.1 [2026-06-11]
 
 - Added `rp::signed_request_object` building an RFC 9101 signed request

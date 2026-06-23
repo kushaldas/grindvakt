@@ -157,6 +157,339 @@ async fn authorization_code_pkce_flow() {
 }
 
 #[tokio::test]
+async fn refresh_token_grant_flow() {
+    // Confidential client registered for the refresh_token grant.
+    let client = Client {
+        client_id: "rp-conf".into(),
+        client_secret: Some("s3cret".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: None,
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    // Authorization code (no PKCE; confidential client).
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-conf"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid email profile"),
+        ("nonce", "nonce-abc"),
+    ]))
+    .unwrap();
+    let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    claims.insert("email".into(), vec!["anna@example.com".into()]);
+    let redirect = op
+        .authorization_redirect(&req, "subject-123", &claims, Some("urn:acr:pwd".into()))
+        .unwrap();
+    let location = redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let code = extract_param(&location, "code").unwrap();
+
+    // Code exchange returns a refresh token.
+    let token_resp = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-conf"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .expect("token exchange");
+    let refresh = token_resp
+        .refresh_token
+        .clone()
+        .expect("refresh token issued");
+
+    // Refresh, narrowing scope to a subset of the original grant.
+    let refreshed = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("scope", "openid email"),
+                ("client_id", "rp-conf"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .expect("refresh exchange");
+    assert_eq!(refreshed.scope.as_deref(), Some("openid email"));
+
+    // Rotation: a new refresh token is returned, and the new access token works.
+    let rotated = refreshed.refresh_token.clone().expect("rotated refresh");
+    assert_ne!(rotated, refresh, "refresh token should rotate");
+    let userinfo = op.userinfo(&refreshed.access_token, None).await.unwrap();
+    assert_eq!(userinfo["sub"], "subject-123");
+
+    // The refreshed id_token preserves the subject and original nonce.
+    let jwks = op.jwks_document();
+    let validation = jose_rs::jwt::Validation::new()
+        .with_issuer("https://op.example.com")
+        .with_audience("rp-conf");
+    let id_claims =
+        jose_rs::jwt::decode_with_jwkset(&jwks, &refreshed.id_token.unwrap(), &validation).unwrap();
+    assert_eq!(id_claims.sub.as_deref(), Some("subject-123"));
+    assert_eq!(
+        id_claims.extra.get("nonce").and_then(|v| v.as_str()),
+        Some("nonce-abc")
+    );
+
+    // Requesting any scope outside the original grant is rejected, even when
+    // mixed with otherwise-valid scopes.
+    let err = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &rotated),
+                ("scope", "openid admin"),
+                ("client_id", "rp-conf"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidScope);
+
+    let err = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &rotated),
+                ("scope", "admin"),
+                ("client_id", "rp-conf"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await;
+    assert!(err.is_err(), "scope escalation must be rejected");
+}
+
+#[tokio::test]
+async fn dpop_bound_refresh_token_requires_matching_proof() {
+    use grindvakt::dpop::DpopProof;
+
+    let client = Client {
+        client_id: "rp-dpop".into(),
+        client_secret: Some("s3cret".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: None,
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-dpop"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid email"),
+    ]))
+    .unwrap();
+    let redirect = op
+        .authorization_redirect(&req, "subject-123", &BTreeMap::new(), None)
+        .unwrap();
+    let location = redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let code = extract_param(&location, "code").unwrap();
+
+    let original_proof = DpopProof {
+        jkt: "original-proof-key".into(),
+    };
+    let token_resp = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-dpop"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            Some(&original_proof),
+        )
+        .await
+        .expect("token exchange");
+    assert_eq!(token_resp.token_type, "DPoP");
+    let refresh = token_resp.refresh_token.expect("refresh token issued");
+    let opened_refresh = op.codec.open_refresh_token(&refresh).unwrap();
+    assert_eq!(
+        opened_refresh.cnf_jkt.as_deref(),
+        Some("original-proof-key")
+    );
+
+    let missing_proof = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "rp-dpop"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing_proof.code,
+        grindvakt::OAuthErrorCode::InvalidDpopProof
+    );
+
+    let wrong_proof = DpopProof {
+        jkt: "wrong-proof-key".into(),
+    };
+    let wrong_key = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "rp-dpop"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            Some(&wrong_proof),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_key.code, grindvakt::OAuthErrorCode::InvalidDpopProof);
+
+    let refreshed = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "rp-dpop"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            Some(&original_proof),
+        )
+        .await
+        .expect("refresh with matching DPoP proof");
+    assert_eq!(refreshed.token_type, "DPoP");
+    let opened_access = op.codec.open_access_token(&refreshed.access_token).unwrap();
+    assert_eq!(opened_access.cnf_jkt.as_deref(), Some("original-proof-key"));
+    let rotated = refreshed.refresh_token.expect("rotated refresh token");
+    let opened_rotated = op.codec.open_refresh_token(&rotated).unwrap();
+    assert_eq!(
+        opened_rotated.cnf_jkt.as_deref(),
+        Some("original-proof-key")
+    );
+}
+
+#[tokio::test]
+async fn refresh_token_denied_when_grant_not_registered() {
+    // Client NOT registered for refresh_token: code exchange yields none, and a
+    // forged refresh attempt is rejected.
+    let client = Client {
+        client_id: "rp-1".into(),
+        client_secret: None,
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_NONE.into(),
+        jwks: None,
+        scope: None,
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let challenge = pkce::s256_challenge(verifier);
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-1"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+    ]))
+    .unwrap();
+    let redirect = op
+        .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .unwrap();
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1;
+    let code = extract_param(location, "code").unwrap();
+
+    let token_resp = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-1"),
+                ("code_verifier", verifier),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        token_resp.refresh_token.is_none(),
+        "no refresh token without the grant"
+    );
+
+    let err = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "anything"),
+                ("client_id", "rp-1"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await;
+    assert!(err.is_err(), "refresh_token grant must be denied");
+}
+
+#[tokio::test]
 async fn pkce_mismatch_rejected() {
     let client = Client {
         client_id: "rp-1".into(),

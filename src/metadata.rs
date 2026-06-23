@@ -63,7 +63,11 @@ impl ProviderMetadata {
             scopes_supported: vec!["openid".into(), "profile".into(), "email".into()],
             response_types_supported: vec!["code".into()],
             response_modes_supported: vec!["query".into(), "fragment".into()],
-            grant_types_supported: vec!["authorization_code".into(), "client_credentials".into()],
+            grant_types_supported: vec![
+                "authorization_code".into(),
+                "client_credentials".into(),
+                "refresh_token".into(),
+            ],
             subject_types_supported: vec!["public".into(), "pairwise".into()],
             id_token_signing_alg_values_supported: vec!["RS256".into(), "ES256".into()],
             token_endpoint_auth_methods_supported: vec![
