@@ -1,6 +1,6 @@
 [package]
 name = "grindvakt"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "BSD-2-Clause"
 rust-version = "1.83"
@@ -9,9 +9,17 @@ repository = "https://github.com/kushaldas/grindvakt"
 keywords = ["oauth2", "openid-connect", "oidc", "jose", "dpop"]
 categories = ["authentication", "web-programming"]
 
+[features]
+default = []
+# Hardware-token signing via PKCS#11. Pulls in kryptering's pkcs11 backend and
+# the cryptoki bindings; keys are selected by CKA_LABEL on the first slot with
+# an initialized token (kryptering 0.3 exposes no slot/token selection).
+pkcs11 = ["kryptering/pkcs11", "dep:cryptoki"]
+
 [dependencies]
-jose-rs = { version = "0.3.1", default-features = false }
+jose-rs = { version = "0.5.0", default-features = false }
 kryptering = { version = "0.3", default-features = false }
+cryptoki = { version = "0.12", optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

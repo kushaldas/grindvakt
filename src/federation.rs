@@ -87,10 +87,10 @@ pub fn build_entity_configuration(
         );
     }
 
-    let mut header = JoseHeader::for_alg(key.alg);
-    header.kid = key.kid.clone();
+    let mut header = JoseHeader::for_alg(key.alg());
+    header.kid = key.kid().map(|k| k.to_string());
     header.typ = Some(ENTITY_STATEMENT_TYP.to_string());
-    jose_rs::jwt::encode_with_jwk(&key.jwk, &header, &c).map_err(Error::from)
+    jose_rs::jwt::encode(key.signer(), &header, &c).map_err(Error::from)
 }
 
 /// The decoded claims of an entity statement, as a JSON object.

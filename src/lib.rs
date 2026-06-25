@@ -63,6 +63,8 @@ pub use jose_rs;
 pub use error::{Error, Result};
 pub use http::{HttpClient, HttpFetchResponse, HttpRequestData, Response};
 pub use keys::{signing_key_from_jwk_json, signing_key_from_pem, SigningKey};
+#[cfg(feature = "pkcs11")]
+pub use keys::{signing_key_from_pkcs11, Pkcs11KeyConfig};
 
 // Convenient root re-exports — protocol.
 pub use client::{Client, ClientStore, InMemoryClientStore};

@@ -9,10 +9,10 @@ use jose_rs::JoseHeader;
 /// Sign a set of claims into a compact JWS using a [`SigningKey`], setting the
 /// `alg`, `kid` and (optionally) a custom `typ` header.
 pub fn sign(key: &SigningKey, claims: &Claims, typ: Option<&str>) -> Result<String> {
-    let mut header = JoseHeader::for_alg(key.alg);
-    header.kid = key.kid.clone();
+    let mut header = JoseHeader::for_alg(key.alg());
+    header.kid = key.kid().map(|k| k.to_string());
     header.typ = typ.map(|t| t.to_string());
-    jose_rs::jwt::encode_with_jwk(&key.jwk, &header, claims).map_err(Error::from)
+    jose_rs::jwt::encode(key.signer(), &header, claims).map_err(Error::from)
 }
 
 /// Verify and validate a compact JWS against a JWK Set.
