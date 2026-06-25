@@ -2,6 +2,30 @@
 
 ## unreleased
 
+## 0.5.0 [2026-06-25]
+
+- Added optional PKCS#11 / HSM signing behind the new, default-off `pkcs11`
+  feature. With it enabled, `signing_key_from_pkcs11(&Pkcs11KeyConfig)` loads a
+  signing key whose private material stays on a hardware token (SoftHSM2,
+  Kryoptic, …); all asymmetric signing flows — id_tokens, federation entity
+  statements, RP client assertions and signed request objects — then sign over
+  PKCS#11 (`C_Sign`) and the key never leaves the module. The public key is read
+  back from the token and published unchanged through `to_public_jwks()`.
+  Supports RSA (`RS256/384/512`), EC (`ES256`/`ES384`) and `EdDSA` (Ed25519).
+  - Keys are identified by `CKA_LABEL` on the first slot with an initialized
+    token; kryptering 0.3 exposes no slot/token selection.
+  - Symmetric token sealing (codes/access/refresh tokens) stays software-only.
+- **Breaking**: `SigningKey` is now immutable after construction and no longer
+  exposes public fields. It holds a `kryptering::Signer` trait object (software-
+  or HSM-backed) plus a cached public JWK, so software and HSM keys are
+  interchangeable. The former `jwk` field is gone; `alg` and `kid` are now
+  read-only accessors (`alg()` / `kid()`) rather than public fields, which keeps
+  the signer, the JWT headers, and the cached public JWK from drifting apart.
+  Use `public_jwk()` / `to_public_jwks()` to obtain the publishable key and the
+  new `signer()` accessor when calling jose-rs signing APIs directly.
+  Construction via `signing_key_from_pem` / `signing_key_from_jwk_json` is
+  unchanged.
+
 ## 0.4.0 [2026-06-23]
 
 - The OP now emits standard OIDC claims with their correct JSON type instead of
