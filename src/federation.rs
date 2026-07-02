@@ -280,29 +280,7 @@ fn extract_resolved_entity(
         .get("trust_chain")
         .and_then(|v| v.as_array())
         .ok_or_else(|| Error::Authn("resolve response has no trust_chain".into()))?;
-    let first = chain
-        .first()
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Authn("resolve response trust_chain is empty".into()))?;
-    let last = chain
-        .last()
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Authn("resolve response trust_chain is empty".into()))?;
-
-    let subject_ec = verify_self_signed(first)?;
-    if subject_ec.iss() != Some(sub) || subject_ec.sub() != Some(sub) {
-        return Err(Error::Authn(
-            "resolve response trust_chain does not start with the subject entity configuration"
-                .into(),
-        ));
-    }
-
-    let ta_ec = verify(last, ta_keys)?;
-    if ta_ec.iss() != Some(ta_id) || ta_ec.sub() != Some(ta_id) {
-        return Err(Error::Authn(
-            "resolve response trust_chain does not end with the selected trust anchor".into(),
-        ));
-    }
+    let subject_ec = validate_trust_chain(chain, sub, ta_id, ta_keys)?;
 
     let metadata = resolved
         .claims
@@ -317,6 +295,109 @@ fn extract_resolved_entity(
         subject_jwks: subject_ec.jwks()?,
         exp: resolved.claims.get("exp").and_then(claim_secs),
     })
+}
+
+fn validate_trust_chain(
+    chain: &[Value],
+    sub: &str,
+    ta_id: &str,
+    ta_keys: &JwkSet,
+) -> Result<EntityStatement> {
+    let tokens: Vec<&str> = chain
+        .iter()
+        .map(|v| {
+            v.as_str().ok_or_else(|| {
+                Error::Authn("resolve response trust_chain contains a non-string".into())
+            })
+        })
+        .collect::<Result<_>>()?;
+    if tokens.is_empty() {
+        return Err(Error::Authn("resolve response trust_chain is empty".into()));
+    }
+
+    let unverified: Vec<EntityStatement> = tokens
+        .iter()
+        .map(|token| decode_unverified(token))
+        .collect::<Result<_>>()?;
+    for (idx, stmt) in unverified.iter().enumerate() {
+        validate_statement_claims(stmt, &format!("trust_chain[{idx}]"))?;
+    }
+
+    let first = unverified
+        .first()
+        .expect("non-empty trust chain was checked");
+    if first.iss() != Some(sub) || first.sub() != Some(sub) {
+        return Err(Error::Authn(
+            "resolve response trust_chain does not start with the subject entity configuration"
+                .into(),
+        ));
+    }
+
+    let last = unverified
+        .last()
+        .expect("non-empty trust chain was checked");
+    if last.iss() != Some(ta_id) || last.sub() != Some(ta_id) {
+        return Err(Error::Authn(
+            "resolve response trust_chain does not end with the selected trust anchor".into(),
+        ));
+    }
+
+    for idx in 0..unverified.len().saturating_sub(1) {
+        if unverified[idx].iss() != unverified[idx + 1].sub() {
+            return Err(Error::Authn(format!(
+                "trust_chain[{idx}] issuer does not match trust_chain[{}] subject",
+                idx + 1
+            )));
+        }
+    }
+
+    let subject_ec = verify_self_signed(tokens[0])?;
+    for idx in 0..unverified.len().saturating_sub(1) {
+        let signer_jwks = unverified[idx + 1].jwks()?;
+        verify(tokens[idx], &signer_jwks).map_err(|e| {
+            Error::Authn(format!(
+                "trust_chain[{idx}] signature failed against trust_chain[{}] keys: {e}",
+                idx + 1
+            ))
+        })?;
+    }
+
+    let ta_token = tokens[tokens.len() - 1];
+    let ta_ec = verify(ta_token, ta_keys)?;
+    verify_self_signed(ta_token)?;
+    if ta_ec.iss() != Some(ta_id) || ta_ec.sub() != Some(ta_id) {
+        return Err(Error::Authn(
+            "resolve response trust_chain trust anchor mismatch".into(),
+        ));
+    }
+
+    Ok(subject_ec)
+}
+
+fn validate_statement_claims(stmt: &EntityStatement, label: &str) -> Result<()> {
+    let iss = stmt.iss().filter(|s| !s.is_empty());
+    let sub = stmt.sub().filter(|s| !s.is_empty());
+    if iss.is_none() || sub.is_none() {
+        return Err(Error::Authn(format!("{label} missing iss/sub")));
+    }
+    let iat = stmt
+        .claims
+        .get("iat")
+        .and_then(claim_secs)
+        .ok_or_else(|| Error::Authn(format!("{label} missing iat")))?;
+    let exp = stmt
+        .claims
+        .get("exp")
+        .and_then(claim_secs)
+        .ok_or_else(|| Error::Authn(format!("{label} missing exp")))?;
+    let now = now_secs();
+    if iat > now {
+        return Err(Error::Authn(format!("{label} iat is in the future")));
+    }
+    if exp <= now {
+        return Err(Error::Authn(format!("{label} has expired")));
+    }
+    Ok(())
 }
 
 /// Resolve an Entity Type key set using the representations from OpenID
@@ -596,6 +677,53 @@ mod tests {
         signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), Some(kid)).unwrap()
     }
 
+    fn subordinate_statement(
+        key: &SigningKey,
+        iss: &str,
+        sub: &str,
+        subject_jwks: &JwkSet,
+    ) -> String {
+        let now = crate::util::now_secs();
+        let mut c = Claims::default();
+        c.iss = Some(iss.to_string());
+        c.sub = Some(sub.to_string());
+        c.iat = Some(now);
+        c.exp = Some(now + 3600);
+        c.extra.insert(
+            "jwks".to_string(),
+            serde_json::to_value(subject_jwks).unwrap(),
+        );
+        let mut header = JoseHeader::for_alg(key.alg());
+        header.kid = key.kid().map(str::to_string);
+        header.typ = Some(ENTITY_STATEMENT_TYP.to_string());
+        jose_rs::jwt::encode(key.signer(), &header, &c).unwrap()
+    }
+
+    fn resolve_response(
+        key: &SigningKey,
+        issuer: &str,
+        subject: &str,
+        chain: Vec<String>,
+    ) -> EntityStatement {
+        let now = crate::util::now_secs();
+        let mut c = Claims::default();
+        c.iss = Some(issuer.to_string());
+        c.sub = Some(subject.to_string());
+        c.iat = Some(now);
+        c.exp = Some(now + 3600);
+        c.extra.insert(
+            "metadata".to_string(),
+            serde_json::json!({ "openid_relying_party": { "client_id": subject } }),
+        );
+        c.extra
+            .insert("trust_chain".to_string(), serde_json::json!(chain));
+        let mut header = JoseHeader::for_alg(key.alg());
+        header.kid = key.kid().map(str::to_string);
+        header.typ = Some(RESOLVE_RESPONSE_TYP.to_string());
+        let jwt = jose_rs::jwt::encode(key.signer(), &header, &c).unwrap();
+        verify_typed(&jwt, &key.to_public_jwks(), RESOLVE_RESPONSE_TYP).unwrap()
+    }
+
     #[test]
     fn entity_configuration_roundtrip() {
         let k = key("fed-1");
@@ -645,6 +773,64 @@ mod tests {
         )
         .unwrap();
         assert!(verify(&token, &other.to_public_jwks()).is_err());
+    }
+
+    #[test]
+    fn resolve_response_trust_chain_is_validated_end_to_end() {
+        let subject_key = key("rp");
+        let ta_key = key("ta");
+        let subject = "https://rp.example.com";
+        let ta = "https://ta.example.com";
+        let subject_ec = build_entity_configuration(
+            &subject_key,
+            subject,
+            &subject_key.to_public_jwks(),
+            &[ta.to_string()],
+            serde_json::json!({ "openid_relying_party": { "client_id": subject } }),
+            &[],
+            3600,
+        )
+        .unwrap();
+        let ta_statement =
+            subordinate_statement(&ta_key, ta, subject, &subject_key.to_public_jwks());
+        let ta_ec = build_entity_configuration(
+            &ta_key,
+            ta,
+            &ta_key.to_public_jwks(),
+            &[],
+            serde_json::json!({
+                "federation_entity": {
+                    "federation_resolve_endpoint": "https://ta.example.com/resolve"
+                }
+            }),
+            &[],
+            3600,
+        )
+        .unwrap();
+
+        let resolved = resolve_response(
+            &ta_key,
+            ta,
+            subject,
+            vec![subject_ec.clone(), ta_statement, ta_ec.clone()],
+        );
+        let entity =
+            extract_resolved_entity(&resolved, ta, subject, &ta_key.to_public_jwks()).unwrap();
+        assert_eq!(entity.subject, subject);
+        assert_eq!(
+            entity.subject_jwks.keys.len(),
+            subject_key.to_public_jwks().keys.len()
+        );
+
+        let attacker = key("attacker");
+        let bad_statement =
+            subordinate_statement(&attacker, ta, subject, &subject_key.to_public_jwks());
+        let bad_resolved =
+            resolve_response(&ta_key, ta, subject, vec![subject_ec, bad_statement, ta_ec]);
+        assert!(
+            extract_resolved_entity(&bad_resolved, ta, subject, &ta_key.to_public_jwks()).is_err(),
+            "subordinate statements must verify against the next entity's jwks"
+        );
     }
 
     #[test]

@@ -71,6 +71,6 @@ pub use client::{Client, ClientStore, InMemoryClientStore};
 pub use dpop::{DpopConfig, DpopError, DpopProof, NoReplayStore, ReplayStore};
 pub use metadata::ProviderMetadata;
 pub use oauth_error::{OAuthError, OAuthErrorCode};
-pub use provider::{Provider, TokenLifetimes, TokenResponse};
+pub use provider::{InMemoryTokenUseStore, Provider, TokenLifetimes, TokenResponse, TokenUseStore};
 pub use request::AuthorizationRequest;
 pub use tokens::TokenCodec;
