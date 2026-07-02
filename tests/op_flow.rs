@@ -130,6 +130,23 @@ async fn authorization_code_pkce_flow() {
     assert_eq!(token_resp.token_type, "Bearer");
     let id_token = token_resp.id_token.clone().unwrap();
 
+    let replay = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-1"),
+                ("code_verifier", verifier),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(replay.code, grindvakt::OAuthErrorCode::InvalidGrant);
+
     // Verify the id_token with the OP's published JWKS.
     let jwks = op.jwks_document();
     let validation = jose_rs::jwt::Validation::new()
@@ -239,6 +256,22 @@ async fn refresh_token_grant_flow() {
     assert_ne!(rotated, refresh, "refresh token should rotate");
     let userinfo = op.userinfo(&refreshed.access_token, None).await.unwrap();
     assert_eq!(userinfo["sub"], "subject-123");
+
+    let old_replay = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "rp-conf"),
+                ("client_secret", "s3cret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(old_replay.code, grindvakt::OAuthErrorCode::InvalidGrant);
 
     // The refreshed id_token preserves the subject and original nonce.
     let jwks = op.jwks_document();
@@ -541,6 +574,60 @@ async fn pkce_mismatch_rejected() {
         )
         .await;
     assert!(err.is_err(), "wrong PKCE verifier must be rejected");
+}
+
+#[tokio::test]
+async fn public_code_flow_requires_s256_pkce() {
+    let client = Client {
+        client_id: "rp-public".into(),
+        client_secret: None,
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_NONE.into(),
+        jwks: None,
+        scope: None,
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-public"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+    ]))
+    .unwrap();
+    let err = op.validate_authorization_request(&req).await.unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidRequest);
+
+    // Defense in depth for codes created by callers that skipped validation or
+    // by older versions before S256 PKCE was mandatory for public clients.
+    let redirect = op
+        .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .unwrap();
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1;
+    let code = extract_param(location, "code").unwrap();
+    let err = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", "rp-public"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidGrant);
 }
 
 #[tokio::test]

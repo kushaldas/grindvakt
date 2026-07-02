@@ -1,12 +1,14 @@
 //! The OpenID Provider engine — pure protocol logic for the OP (frontend) side.
 //!
-//! Stateless: authorization codes and access tokens carry their own state
-//! (sealed via [`crate::tokens::TokenCodec`]); id_tokens are signed JWTs. No
-//! server-side session store is consulted at the token or userinfo endpoints.
+//! Authorization codes, access tokens, and refresh tokens carry their own state
+//! (sealed via [`crate::tokens::TokenCodec`]); id_tokens are signed JWTs. A
+//! small token-use store is still required for one-time authorization-code use
+//! and refresh-token rotation.
 
 use crate::client::{Client, ClientStore, AUTH_NONE, AUTH_PRIVATE_KEY_JWT};
 use crate::jwt;
 use crate::keys::SigningKey;
+use crate::mac::sha256;
 use crate::metadata::ProviderMetadata;
 use crate::oauth_error::{OAuthError, OAuthErrorCode};
 use crate::pkce;
@@ -17,8 +19,8 @@ use base64::Engine;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
 use serde::Serialize;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 
 /// The JWT-bearer client assertion type (RFC 7523).
 pub const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -46,12 +48,17 @@ impl Default for TokenLifetimes {
 }
 
 /// The OpenID Provider engine.
+///
+/// Construct with [`Provider::new`]; the token-use store is installed via
+/// [`Provider::with_token_use_store`] rather than a public field so adding
+/// stores later does not break struct-literal construction downstream.
 pub struct Provider {
     pub metadata: ProviderMetadata,
     pub signing_key: SigningKey,
     pub clients: Arc<dyn ClientStore>,
     pub codec: TokenCodec,
     pub lifetimes: TokenLifetimes,
+    token_use_store: Arc<dyn TokenUseStore>,
 }
 
 /// The token endpoint success response.
@@ -68,6 +75,147 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
 }
 
+/// Atomic store for one-time token use.
+///
+/// The token endpoint uses this to consume authorization codes and refresh
+/// tokens exactly once. Deployments with multiple replicas should supply a
+/// shared implementation; the default in-memory store protects a single
+/// process.
+#[async_trait::async_trait]
+pub trait TokenUseStore: Send + Sync {
+    /// Mark `token_hash` as consumed for `ttl_secs`. Returns `Ok(true)` when
+    /// this call consumed it, `Ok(false)` when it was already live/consumed.
+    async fn consume(&self, token_hash: &str, ttl_secs: u64) -> std::result::Result<bool, String>;
+}
+
+/// Single-process [`TokenUseStore`] implementation.
+#[derive(Default)]
+pub struct InMemoryTokenUseStore {
+    inner: RwLock<InMemoryTokenUseInner>,
+}
+
+#[derive(Default)]
+struct InMemoryTokenUseInner {
+    entries: HashMap<String, u64>,
+    /// Earliest time the next full expiry sweep may run.
+    next_purge: u64,
+}
+
+/// How often [`InMemoryTokenUseStore`] sweeps expired entries from the map.
+/// Correctness never depends on the sweep — an expired entry for the consumed
+/// token is detected on lookup — so this only bounds memory growth.
+const IN_MEMORY_PURGE_INTERVAL_SECS: u64 = 60;
+
+impl InMemoryTokenUseStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenUseStore for InMemoryTokenUseStore {
+    async fn consume(&self, token_hash: &str, ttl_secs: u64) -> std::result::Result<bool, String> {
+        let now = now_secs();
+        let mut g = self
+            .inner
+            .write()
+            .map_err(|_| "token-use store lock poisoned".to_string())?;
+        if now >= g.next_purge {
+            g.entries.retain(|_, exp| *exp > now);
+            g.next_purge = now + IN_MEMORY_PURGE_INTERVAL_SECS;
+        }
+        match g.entries.get(token_hash) {
+            Some(exp) if *exp > now => Ok(false),
+            _ => {
+                g.entries
+                    .insert(token_hash.to_string(), now + ttl_secs.max(1));
+                Ok(true)
+            }
+        }
+    }
+}
+
+/// Redis-backed [`TokenUseStore`] implementation for multi-process deployments.
+///
+/// Values are written with `SET key 1 NX EX ttl`, so the first consumer wins and
+/// Redis expires the replay marker after the original token lifetime.
+///
+/// Commands run over a shared async [`redis::aio::ConnectionManager`]
+/// (multiplexed, reconnecting), so consuming a token never blocks the async
+/// executor and does not open a new connection per call. The `redis` feature
+/// enables the tokio-backed transport of the `redis` crate.
+#[cfg(feature = "redis")]
+pub struct RedisStore {
+    conn: redis::aio::ConnectionManager,
+    key_prefix: String,
+}
+
+#[cfg(feature = "redis")]
+impl RedisStore {
+    pub const DEFAULT_KEY_PREFIX: &'static str = "grindvakt:token-use:";
+
+    pub fn new(redis_url: &str) -> redis::RedisResult<Self> {
+        Self::from_client(redis::Client::open(redis_url)?)
+    }
+
+    pub fn from_client(client: redis::Client) -> redis::RedisResult<Self> {
+        let conn = client.get_connection_manager_lazy(redis::aio::ConnectionManagerConfig::new())?;
+        Ok(Self {
+            conn,
+            key_prefix: Self::DEFAULT_KEY_PREFIX.to_string(),
+        })
+    }
+
+    pub fn with_key_prefix(mut self, key_prefix: impl Into<String>) -> Self {
+        self.key_prefix = key_prefix.into();
+        self
+    }
+
+    fn key(&self, token_hash: &str) -> String {
+        format!("{}{}", self.key_prefix, token_hash)
+    }
+}
+
+#[cfg(feature = "redis")]
+#[async_trait::async_trait]
+impl TokenUseStore for RedisStore {
+    async fn consume(&self, token_hash: &str, ttl_secs: u64) -> std::result::Result<bool, String> {
+        // ConnectionManager is a cheap handle over one shared multiplexed
+        // connection; cloning it per call is the intended usage.
+        let mut conn = self.conn.clone();
+        redis_consume_token_once(&mut conn, &self.key(token_hash), ttl_secs)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "redis")]
+async fn redis_consume_token_once<C: redis::aio::ConnectionLike>(
+    conn: &mut C,
+    key: &str,
+    ttl_secs: u64,
+) -> redis::RedisResult<bool> {
+    let response: redis::Value = redis::cmd("SET")
+        .arg(key)
+        .arg("1")
+        .arg("EX")
+        .arg(ttl_secs.max(1))
+        .arg("NX")
+        .query_async(conn)
+        .await?;
+
+    match response {
+        redis::Value::Okay => Ok(true),
+        redis::Value::SimpleString(s) if s.eq_ignore_ascii_case("OK") => Ok(true),
+        redis::Value::Nil => Ok(false),
+        other => Err(redis::RedisError::from((
+            redis::ErrorKind::UnexpectedReturnType,
+            "unexpected Redis SET NX response",
+            format!("{other:?}"),
+        ))),
+    }
+}
+
 impl Provider {
     pub fn new(
         metadata: ProviderMetadata,
@@ -82,7 +230,14 @@ impl Provider {
             clients,
             codec,
             lifetimes,
+            token_use_store: Arc::new(InMemoryTokenUseStore::new()),
         }
+    }
+
+    /// Replace the default single-process token-use store.
+    pub fn with_token_use_store(mut self, store: Arc<dyn TokenUseStore>) -> Self {
+        self.token_use_store = store;
+        self
     }
 
     /// The `.well-known/openid-configuration` document.
@@ -119,6 +274,20 @@ impl Provider {
                 "response_type not allowed for client",
             )
             .with_state(req.state.clone()));
+        }
+        if client.token_endpoint_auth_method == AUTH_NONE && req.wants_code() {
+            match (
+                req.code_challenge.as_deref(),
+                req.code_challenge_method.as_deref(),
+            ) {
+                (Some(challenge), Some("S256")) if !challenge.is_empty() => {}
+                _ => {
+                    return Err(
+                        OAuthError::invalid_request("public clients must use S256 PKCE")
+                            .with_state(req.state.clone()),
+                    );
+                }
+            }
         }
         Ok(client)
     }
@@ -263,6 +432,20 @@ impl Provider {
             }
         }
 
+        if client.token_endpoint_auth_method == AUTH_NONE {
+            match (
+                payload.code_challenge.as_deref(),
+                payload.code_challenge_method.as_deref(),
+            ) {
+                (Some(challenge), Some("S256")) if !challenge.is_empty() => {}
+                _ => {
+                    return Err(OAuthError::invalid_grant(
+                        "public client code was issued without S256 PKCE",
+                    ));
+                }
+            }
+        }
+
         // PKCE.
         if let Some(challenge) = &payload.code_challenge {
             let verifier = form
@@ -276,6 +459,9 @@ impl Provider {
                 return Err(OAuthError::invalid_grant("PKCE verification failed"));
             }
         }
+
+        self.consume_token_once("code", code, payload.exp, "authorization code already used")
+            .await?;
 
         // Mint access token + id_token.
         let access_payload = AccessTokenPayload {
@@ -493,6 +679,9 @@ impl Provider {
         };
 
         let now = now_secs();
+        self.consume_token_once("refresh", token, rt.exp, "refresh token already used")
+            .await?;
+
         let access_payload = AccessTokenPayload {
             client_id: client.client_id.clone(),
             sub: rt.sub.clone(),
@@ -542,6 +731,31 @@ impl Provider {
             scope: Some(scope),
             refresh_token: Some(refresh_token),
         })
+    }
+
+    async fn consume_token_once(
+        &self,
+        kind: &str,
+        token: &str,
+        exp: u64,
+        replay_message: &str,
+    ) -> Result<(), OAuthError> {
+        let ttl = exp.saturating_sub(now_secs()).max(1);
+        let hash = token_use_hash(kind, token);
+        match self.token_use_store.consume(&hash, ttl).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(OAuthError::invalid_grant(replay_message)),
+            Err(e) => {
+                // The store error may carry infrastructure details (Redis
+                // addresses, connection failures); log it, but hand the client
+                // only a generic error_description.
+                tracing::error!(kind, error = %e, "token-use store failure");
+                Err(OAuthError::new(
+                    OAuthErrorCode::ServerError,
+                    "temporarily unable to process the request",
+                ))
+            }
+        }
     }
 
     // ── UserInfo endpoint ───────────────────────────────────────────────
@@ -752,6 +966,14 @@ impl Provider {
     }
 }
 
+fn token_use_hash(kind: &str, token: &str) -> String {
+    format!(
+        "{}:{}",
+        kind,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha256(token.as_bytes()))
+    )
+}
+
 /// Whether the client is registered for the `refresh_token` grant (RFC 6749 §6).
 fn client_allows_refresh(client: &Client) -> bool {
     client.grant_types.iter().any(|g| g == "refresh_token")
@@ -871,6 +1093,61 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "redis")]
+    fn redis_set_cmd(key: &str, ttl_secs: u64) -> redis::Cmd {
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg("1").arg("EX").arg(ttl_secs).arg("NX");
+        cmd
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_store_consumes_token_once() {
+        let mut conn = redis_test::MockRedisConnection::new([redis_test::MockCmd::new(
+            redis_set_cmd("grindvakt:token-use:code:abc", 42),
+            Ok(redis::Value::Okay),
+        )])
+        .assert_all_commands_consumed();
+
+        assert!(
+            redis_consume_token_once(&mut conn, "grindvakt:token-use:code:abc", 42)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_store_reports_existing_token_as_replay() {
+        let mut conn = redis_test::MockRedisConnection::new([redis_test::MockCmd::new(
+            redis_set_cmd("grindvakt:token-use:refresh:abc", 120),
+            Ok(redis::Value::Nil),
+        )])
+        .assert_all_commands_consumed();
+
+        assert!(
+            !redis_consume_token_once(&mut conn, "grindvakt:token-use:refresh:abc", 120)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_store_clamps_zero_ttl() {
+        let mut conn = redis_test::MockRedisConnection::new([redis_test::MockCmd::new(
+            redis_set_cmd("grindvakt:token-use:code:abc", 1),
+            Ok(redis::Value::Okay),
+        )])
+        .assert_all_commands_consumed();
+
+        assert!(
+            redis_consume_token_once(&mut conn, "grindvakt:token-use:code:abc", 0)
+                .await
+                .unwrap()
+        );
+    }
 
     #[test]
     fn standard_boolean_and_number_claims_are_typed() {
