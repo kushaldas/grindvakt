@@ -2,6 +2,27 @@
 
 ## unreleased
 
+- Added replay protection for authorization codes and refresh tokens via the
+  new `TokenUseStore` trait. `Provider::new` installs the single-process
+  `InMemoryTokenUseStore` by default; multi-replica deployments can supply a
+  shared store with `Provider::with_token_use_store` (see ADR 0001/0002).
+- Added an optional `redis` feature exposing `RedisStore`, a Redis-backed
+  `TokenUseStore` (`SET key 1 EX ttl NX`). Commands run over a shared async
+  `ConnectionManager` (tokio-backed, multiplexed, auto-reconnecting), so token
+  consumption never blocks the async executor and no per-call connection is
+  opened. `RedisStore::from_client` now returns `redis::RedisResult<Self>`.
+- **Breaking**: `Provider` gained a `token_use_store` member, which is private
+  (set it with `Provider::with_token_use_store`). Code constructing `Provider`
+  with struct-literal syntax must switch to `Provider::new`; this also shields
+  downstream users from similar breakage when future fields are added.
+- Token-use store failures now surface to OAuth clients as a generic
+  `server_error` description instead of echoing the underlying store error
+  (which could leak infrastructure details such as Redis connection strings);
+  the store error is logged via `tracing` instead.
+- `InMemoryTokenUseStore::consume` no longer sweeps the whole map on every
+  call; expired entries are detected on lookup and full sweeps run at most
+  once a minute, keeping consumption O(1) amortized under load.
+
 ## 0.5.0 [2026-06-25]
 
 - Added optional PKCS#11 / HSM signing behind the new, default-off `pkcs11`

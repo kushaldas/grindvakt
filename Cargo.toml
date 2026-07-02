@@ -15,7 +15,9 @@ default = []
 # the cryptoki bindings; keys are selected by CKA_LABEL on the first slot with
 # an initialized token (kryptering 0.3 exposes no slot/token selection).
 pkcs11 = ["kryptering/pkcs11", "dep:cryptoki"]
-redis = ["dep:redis"]
+# Uses the redis crate's tokio-backed async transport with a shared,
+# reconnecting multiplexed connection.
+redis = ["dep:redis", "redis/tokio-comp", "redis/connection-manager"]
 
 [dependencies]
 jose-rs = { version = "0.5.0", default-features = false }
@@ -48,5 +50,8 @@ sec1 = "0.7"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [dev-dependencies]
-redis-test = "1.0.4"
+# redis-test's aio mock enables redis/aio, which requires a runtime comp
+# feature; pin tokio-comp here so plain `cargo test` builds resolve.
+redis = { version = "1.3", default-features = false, features = ["tokio-comp"] }
+redis-test = { version = "1.0.4", features = ["aio"] }
 tokio = { version = "1", features = ["full"] }
