@@ -2,10 +2,22 @@
 
 ## unreleased
 
+## 0.6.0 [2026-07-02]
+
 - Added replay protection for authorization codes and refresh tokens via the
   new `TokenUseStore` trait. `Provider::new` installs the single-process
   `InMemoryTokenUseStore` by default; multi-replica deployments can supply a
   shared store with `Provider::with_token_use_store` (see ADR 0001/0002).
+- Hardening: public code-flow clients (`token_endpoint_auth_method` of
+  `none`) must now use PKCE with `S256`; authorization requests with no
+  code challenge or the `plain` method are rejected, and legacy codes that
+  were issued to a public client without S256 PKCE are refused at the token
+  endpoint.
+- Hardening: OpenID Federation resolve-response trust chains are now
+  validated end to end: required entity-statement claims, `iat`/`exp`
+  timestamps, issuer/subject linkage between adjacent statements, trust-
+  anchor self-signature, and each statement's signature against the keys of
+  its superior.
 - Added an optional `redis` feature exposing `RedisStore`, a Redis-backed
   `TokenUseStore` (`SET key 1 EX ttl NX`). Commands run over a shared async
   `ConnectionManager` (tokio-backed, multiplexed, auto-reconnecting), so token
@@ -22,6 +34,8 @@
 - `InMemoryTokenUseStore::consume` no longer sweeps the whole map on every
   call; expired entries are detected on lookup and full sweeps run at most
   once a minute, keeping consumption O(1) amortized under load.
+- The minimum supported Rust version is now 1.88 (required by current
+  `redis` crates).
 
 ## 0.5.0 [2026-06-25]
 
