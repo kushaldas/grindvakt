@@ -71,6 +71,8 @@ pub use client::{Client, ClientStore, InMemoryClientStore};
 pub use dpop::{DpopConfig, DpopError, DpopProof, NoReplayStore, ReplayStore};
 pub use metadata::ProviderMetadata;
 pub use oauth_error::{OAuthError, OAuthErrorCode};
+#[cfg(feature = "redis")]
+pub use provider::RedisStore;
 pub use provider::{InMemoryTokenUseStore, Provider, TokenLifetimes, TokenResponse, TokenUseStore};
 pub use request::AuthorizationRequest;
 pub use tokens::TokenCodec;

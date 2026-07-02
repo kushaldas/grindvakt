@@ -108,8 +108,79 @@ impl TokenUseStore for InMemoryTokenUseStore {
         if g.contains_key(token_hash) {
             return Ok(false);
         }
-        g.insert(token_hash.to_string(), now + ttl_secs);
+        g.insert(token_hash.to_string(), now + ttl_secs.max(1));
         Ok(true)
+    }
+}
+
+/// Redis-backed [`TokenUseStore`] implementation for multi-process deployments.
+///
+/// Values are written with `SET key 1 NX EX ttl`, so the first consumer wins and
+/// Redis expires the replay marker after the original token lifetime.
+#[cfg(feature = "redis")]
+pub struct RedisStore {
+    client: redis::Client,
+    key_prefix: String,
+}
+
+#[cfg(feature = "redis")]
+impl RedisStore {
+    pub const DEFAULT_KEY_PREFIX: &'static str = "grindvakt:token-use:";
+
+    pub fn new(redis_url: &str) -> redis::RedisResult<Self> {
+        Ok(Self::from_client(redis::Client::open(redis_url)?))
+    }
+
+    pub fn from_client(client: redis::Client) -> Self {
+        Self {
+            client,
+            key_prefix: Self::DEFAULT_KEY_PREFIX.to_string(),
+        }
+    }
+
+    pub fn with_key_prefix(mut self, key_prefix: impl Into<String>) -> Self {
+        self.key_prefix = key_prefix.into();
+        self
+    }
+
+    fn key(&self, token_hash: &str) -> String {
+        format!("{}{}", self.key_prefix, token_hash)
+    }
+}
+
+#[cfg(feature = "redis")]
+#[async_trait::async_trait]
+impl TokenUseStore for RedisStore {
+    async fn consume(&self, token_hash: &str, ttl_secs: u64) -> std::result::Result<bool, String> {
+        let mut conn = self.client.get_connection().map_err(|e| e.to_string())?;
+        redis_consume_token_once(&mut conn, &self.key(token_hash), ttl_secs)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "redis")]
+fn redis_consume_token_once<C: redis::ConnectionLike>(
+    conn: &mut C,
+    key: &str,
+    ttl_secs: u64,
+) -> redis::RedisResult<bool> {
+    let response: redis::Value = redis::cmd("SET")
+        .arg(key)
+        .arg("1")
+        .arg("EX")
+        .arg(ttl_secs.max(1))
+        .arg("NX")
+        .query(conn)?;
+
+    match response {
+        redis::Value::Okay => Ok(true),
+        redis::Value::SimpleString(s) if s.eq_ignore_ascii_case("OK") => Ok(true),
+        redis::Value::Nil => Ok(false),
+        other => Err(redis::RedisError::from((
+            redis::ErrorKind::UnexpectedReturnType,
+            "unexpected Redis SET NX response",
+            format!("{other:?}"),
+        ))),
     }
 }
 
@@ -637,7 +708,7 @@ impl Provider {
         exp: u64,
         replay_message: &str,
     ) -> Result<(), OAuthError> {
-        let ttl = exp.saturating_sub(now_secs());
+        let ttl = exp.saturating_sub(now_secs()).max(1);
         let hash = token_use_hash(kind, token);
         match self.token_use_store.consume(&hash, ttl).await {
             Ok(true) => Ok(()),
@@ -981,6 +1052,51 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "redis")]
+    fn redis_set_cmd(key: &str, ttl_secs: u64) -> redis::Cmd {
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg("1").arg("EX").arg(ttl_secs).arg("NX");
+        cmd
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_store_consumes_token_once() {
+        let mut conn = redis_test::MockRedisConnection::new([redis_test::MockCmd::new(
+            redis_set_cmd("grindvakt:token-use:code:abc", 42),
+            Ok(redis::Value::Okay),
+        )])
+        .assert_all_commands_consumed();
+
+        assert!(redis_consume_token_once(&mut conn, "grindvakt:token-use:code:abc", 42).unwrap());
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_store_reports_existing_token_as_replay() {
+        let mut conn = redis_test::MockRedisConnection::new([redis_test::MockCmd::new(
+            redis_set_cmd("grindvakt:token-use:refresh:abc", 120),
+            Ok(redis::Value::Nil),
+        )])
+        .assert_all_commands_consumed();
+
+        assert!(
+            !redis_consume_token_once(&mut conn, "grindvakt:token-use:refresh:abc", 120).unwrap()
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_store_clamps_zero_ttl() {
+        let mut conn = redis_test::MockRedisConnection::new([redis_test::MockCmd::new(
+            redis_set_cmd("grindvakt:token-use:code:abc", 1),
+            Ok(redis::Value::Okay),
+        )])
+        .assert_all_commands_consumed();
+
+        assert!(redis_consume_token_once(&mut conn, "grindvakt:token-use:code:abc", 0).unwrap());
+    }
 
     #[test]
     fn standard_boolean_and_number_claims_are_typed() {
