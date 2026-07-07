@@ -2,6 +2,15 @@
 
 ## unreleased
 
+## 0.6.1 [2026-07-07]
+
+- Updated the JOSE/signing dependency stack to `jose-rs` 0.5.1 and
+  `kryptering` 0.4.1. This keeps grindvakt's direct signing backend aligned
+  with the JOSE layer, removes the duplicate `kryptering` 0.3 dependency from
+  the lockfile, and preserves the existing software and PKCS#11 signing APIs.
+- Refreshed the PKCS#11 documentation and package comments for kryptering
+  0.4's provider selection behavior.
+
 ## 0.6.0 [2026-07-02]
 
 - Added replay protection for authorization codes and refresh tokens via the
