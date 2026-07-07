@@ -31,7 +31,7 @@ request objects — then sign over PKCS#11 (`C_Sign`). Symmetric token sealing
 (access/refresh/authorization codes) stays software-only.
 
 ```toml
-grindvakt = { version = "0.5", features = ["pkcs11"] }
+grindvakt = { version = "0.6", features = ["pkcs11"] }
 ```
 
 ```rust
@@ -50,9 +50,9 @@ let key = signing_key_from_pkcs11(&Pkcs11KeyConfig {
 
 Supported algorithms: RSA (`RS256/384/512`), EC `ES256`/`ES384`, and `EdDSA`
 (Ed25519). The public key is read back from the token and published through
-`key.to_public_jwks()`. **Limitation:** kryptering 0.3 selects the first slot
-with an initialized token — there is no slot/token-label selection, so keys are
-identified purely by `CKA_LABEL`.
+`key.to_public_jwks()`. **Limitation:** grindvakt's current `Pkcs11KeyConfig`
+uses kryptering's default provider selection, which accepts exactly one
+initialized token. Keys are then identified by `CKA_LABEL`.
 
 ## License
 

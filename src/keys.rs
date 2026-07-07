@@ -248,9 +248,9 @@ mod pkcs11 {
 
     /// Configuration identifying a signing key on a PKCS#11 token.
     ///
-    /// The token is the first slot with an initialized token in `module_path`
-    /// (kryptering 0.3 exposes no slot/token selection); the key pair is
-    /// selected by its `CKA_LABEL`.
+    /// The token is selected through kryptering's default provider selection
+    /// for `module_path`, which accepts exactly one initialized token; the key
+    /// pair is selected by its `CKA_LABEL`.
     #[derive(Clone)]
     pub struct Pkcs11KeyConfig {
         /// Path to the PKCS#11 module, e.g. `libsofthsm2.so` /
