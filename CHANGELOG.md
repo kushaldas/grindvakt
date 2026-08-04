@@ -2,6 +2,14 @@
 
 ## unreleased
 
+## 0.6.2 [2026-08-04]
+
+- Updated to `jose-rs` 0.6.0 and `kryptering` 0.5.0, migrated key loading to
+  kryptering's opaque software-key API, and refreshed all compatible
+  dependencies. `jose-rs` 0.6.0 is now resolved directly from crates.io.
+- Updated all GitHub Actions workflows to the SHA-pinned `actions/checkout`
+  v7.0.1 release.
+
 ## 0.6.1 [2026-07-07]
 
 - Updated the JOSE/signing dependency stack to `jose-rs` 0.5.1 and

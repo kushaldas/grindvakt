@@ -14,7 +14,7 @@
 use crate::error::{Error, Result};
 use jose_rs::algorithm::JwsAlgorithm;
 use jose_rs::jwk::{jwk_to_software_key, software_key_to_jwk, Jwk, JwkSet};
-use kryptering::{SoftwareKey, SoftwareSigner};
+use kryptering::{EcCurve as KrypteringEcCurve, KeyAlgorithm, SoftwareKey, SoftwareSigner};
 use std::sync::Arc;
 
 /// A loaded signing key: the signer that performs the cryptographic operation,
@@ -182,53 +182,48 @@ fn parse_private_key(bytes: &[u8]) -> Result<SoftwareKey> {
 
 fn rsa_from_der(der: &[u8]) -> Result<SoftwareKey> {
     use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
     let priv_key = rsa::RsaPrivateKey::from_pkcs8_der(der)
         .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_der(der))
         .map_err(|e| Error::Crypto(format!("not an RSA key: {e}")))?;
-    let public = priv_key.to_public_key();
-    Ok(SoftwareKey::Rsa {
-        private: Some(priv_key),
-        public,
-    })
+    let pkcs8 = priv_key
+        .to_pkcs8_der()
+        .map_err(|e| Error::Crypto(format!("RSA PKCS#8 encoding failed: {e}")))?;
+    SoftwareKey::from_pkcs8_der(KeyAlgorithm::Rsa, pkcs8.as_bytes())
+        .map_err(|e| Error::Crypto(format!("RSA key import failed: {e}")))
 }
 
 fn ec_p256_from_der(der: &[u8]) -> Result<SoftwareKey> {
-    use p256::pkcs8::DecodePrivateKey;
+    use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
     // Try PKCS#8 then SEC1.
     let secret = p256::SecretKey::from_pkcs8_der(der)
         .or_else(|_| p256::SecretKey::from_sec1_der(der))
         .map_err(|e| Error::Crypto(format!("not a P-256 key: {e}")))?;
-    let signing = p256::ecdsa::SigningKey::from(secret);
-    let verifying = *signing.verifying_key();
-    Ok(SoftwareKey::EcP256 {
-        private: Some(signing),
-        public: verifying,
-    })
+    let pkcs8 = secret
+        .to_pkcs8_der()
+        .map_err(|e| Error::Crypto(format!("P-256 PKCS#8 encoding failed: {e}")))?;
+    SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ec(KrypteringEcCurve::P256), pkcs8.as_bytes())
+        .map_err(|e| Error::Crypto(format!("P-256 key import failed: {e}")))
 }
 
 fn ec_p384_from_der(der: &[u8]) -> Result<SoftwareKey> {
-    use p384::pkcs8::DecodePrivateKey;
+    use p384::pkcs8::{DecodePrivateKey, EncodePrivateKey};
     let secret = p384::SecretKey::from_pkcs8_der(der)
         .or_else(|_| p384::SecretKey::from_sec1_der(der))
         .map_err(|e| Error::Crypto(format!("not a P-384 key: {e}")))?;
-    let signing = p384::ecdsa::SigningKey::from(secret);
-    let verifying = *signing.verifying_key();
-    Ok(SoftwareKey::EcP384 {
-        private: Some(signing),
-        public: verifying,
-    })
+    let pkcs8 = secret
+        .to_pkcs8_der()
+        .map_err(|e| Error::Crypto(format!("P-384 PKCS#8 encoding failed: {e}")))?;
+    SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ec(KrypteringEcCurve::P384), pkcs8.as_bytes())
+        .map_err(|e| Error::Crypto(format!("P-384 key import failed: {e}")))
 }
 
 fn ed25519_from_der(der: &[u8]) -> Result<SoftwareKey> {
     use ed25519_dalek::pkcs8::DecodePrivateKey;
-    let signing = ed25519_dalek::SigningKey::from_pkcs8_der(der)
+    ed25519_dalek::SigningKey::from_pkcs8_der(der)
         .map_err(|e| Error::Crypto(format!("not an Ed25519 key: {e}")))?;
-    let public = signing.verifying_key();
-    Ok(SoftwareKey::Ed25519 {
-        private: Some(signing),
-        public,
-    })
+    SoftwareKey::from_pkcs8_der(KeyAlgorithm::Ed25519, der)
+        .map_err(|e| Error::Crypto(format!("Ed25519 key import failed: {e}")))
 }
 
 #[cfg(feature = "pkcs11")]
@@ -349,6 +344,8 @@ mod pkcs11 {
     }
 
     fn rsa_public_from_token(session: &Pkcs11Session, handle: ObjectHandle) -> Result<SoftwareKey> {
+        use rsa::pkcs8::EncodePublicKey;
+
         let n = read_attr(session, handle, AttributeType::Modulus)?;
         let e = read_attr(session, handle, AttributeType::PublicExponent)?;
         let public = rsa::RsaPublicKey::new(
@@ -356,10 +353,11 @@ mod pkcs11 {
             rsa::BigUint::from_bytes_be(&e),
         )
         .map_err(|e| Error::Crypto(format!("invalid RSA public key from token: {e}")))?;
-        Ok(SoftwareKey::Rsa {
-            private: None,
-            public,
-        })
+        let spki = public
+            .to_public_key_der()
+            .map_err(|e| Error::Crypto(format!("RSA SPKI encoding failed: {e}")))?;
+        SoftwareKey::from_spki_der(KeyAlgorithm::Rsa, spki.as_bytes())
+            .map_err(|e| Error::Crypto(format!("RSA public key import failed: {e}")))
     }
 
     fn ec_public_from_token(
@@ -370,20 +368,32 @@ mod pkcs11 {
         let raw = read_attr(session, handle, AttributeType::EcPoint)?;
         match curve {
             EcCurve::P256 => {
+                use p256::pkcs8::EncodePublicKey;
+
                 let vk = parse_ec_point(&raw, p256::ecdsa::VerifyingKey::from_sec1_bytes)
                     .map_err(|e| Error::Crypto(format!("invalid P-256 point from token: {e}")))?;
-                Ok(SoftwareKey::EcP256 {
-                    private: None,
-                    public: vk,
-                })
+                let spki = vk
+                    .to_public_key_der()
+                    .map_err(|e| Error::Crypto(format!("P-256 SPKI encoding failed: {e}")))?;
+                SoftwareKey::from_spki_der(
+                    KeyAlgorithm::Ec(KrypteringEcCurve::P256),
+                    spki.as_bytes(),
+                )
+                .map_err(|e| Error::Crypto(format!("P-256 public key import failed: {e}")))
             }
             EcCurve::P384 => {
+                use p384::pkcs8::EncodePublicKey;
+
                 let vk = parse_ec_point(&raw, p384::ecdsa::VerifyingKey::from_sec1_bytes)
                     .map_err(|e| Error::Crypto(format!("invalid P-384 point from token: {e}")))?;
-                Ok(SoftwareKey::EcP384 {
-                    private: None,
-                    public: vk,
-                })
+                let spki = vk
+                    .to_public_key_der()
+                    .map_err(|e| Error::Crypto(format!("P-384 SPKI encoding failed: {e}")))?;
+                SoftwareKey::from_spki_der(
+                    KeyAlgorithm::Ec(KrypteringEcCurve::P384),
+                    spki.as_bytes(),
+                )
+                .map_err(|e| Error::Crypto(format!("P-384 public key import failed: {e}")))
             }
         }
     }
@@ -392,6 +402,8 @@ mod pkcs11 {
         session: &Pkcs11Session,
         handle: ObjectHandle,
     ) -> Result<SoftwareKey> {
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+
         let raw = read_attr(session, handle, AttributeType::EcPoint)?;
         // Try the raw 32-byte key first; only if that doesn't fit, treat the
         // bytes as a DER OCTET STRING wrapping the key (Edwards `CKA_EC_POINT`).
@@ -401,10 +413,11 @@ mod pkcs11 {
             .ok_or_else(|| Error::Crypto("Ed25519 public key is not 32 bytes".into()))?;
         let vk = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
             .map_err(|e| Error::Crypto(format!("invalid Ed25519 key from token: {e}")))?;
-        Ok(SoftwareKey::Ed25519 {
-            private: None,
-            public: vk,
-        })
+        let spki = vk
+            .to_public_key_der()
+            .map_err(|e| Error::Crypto(format!("Ed25519 SPKI encoding failed: {e}")))?;
+        SoftwareKey::from_spki_der(KeyAlgorithm::Ed25519, spki.as_bytes())
+            .map_err(|e| Error::Crypto(format!("Ed25519 public key import failed: {e}")))
     }
 
     /// Parse a SEC1 EC point from a `CKA_EC_POINT` value using `parse`.
