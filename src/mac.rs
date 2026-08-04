@@ -12,12 +12,13 @@ use kryptering::HashAlgorithm;
 /// Compute HMAC-SHA256 over `data` with `key`.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     compute_hmac(HashAlgorithm::Sha256, key, data)
+        .expect("the configured kryptering backend supports HMAC-SHA256")
 }
 
 /// Compute a plain SHA-256 digest of `data`. Used for the DPoP `ath`
 /// access-token hash (RFC 9449 §4.3).
 pub fn sha256(data: &[u8]) -> Vec<u8> {
-    digest(HashAlgorithm::Sha256, data)
+    digest(HashAlgorithm::Sha256, data).expect("the configured kryptering backend supports SHA-256")
 }
 
 /// Constant-time equality (no early return on first mismatching byte). Returns
