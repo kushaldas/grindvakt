@@ -2,6 +2,48 @@
 
 ## unreleased
 
+## 0.7.0 [2026-08-05]
+
+Security fixes from a completed audit (see ADR 0003–0007). Some are
+behavior-breaking for non-compliant clients; see the ADRs for migration
+notes.
+
+- Depends on jose-rs 0.7.0, which hard-rejects JWTs pinning an unknown
+  `kid`, and JWEs carrying a `zip` member or an empty `crit` array
+  (jose-rs ADR 0002–0004).
+
+- `private_key_jwt` client assertions must now carry `iat`, `exp`
+  (age-bounded to 300 seconds by default, adjustable via
+  `Provider::with_client_assertion_max_age`) and a `jti`; the `jti` is
+  consumed once through the `TokenUseStore` under a hashed, client-scoped
+  key, with the TTL capped at the acceptance window (`max_age` + leeway), so
+  a captured assertion can no longer be replayed and a hostile client cannot
+  fill the store with long-lived entries. The `invalid_client` error no
+  longer embeds jose-rs validation details (ADR 0003).
+- The authorization endpoint now rejects requested scopes outside the
+  client's registered scope set (`invalid_scope`; clients registered without
+  a `scope` remain unrestricted), requires a `nonce` for
+  implicit/hybrid response types, and the hybrid `code id_token` flow now
+  defaults to the fragment response mode so the id_token is not leaked in the
+  URL (ADR 0004).
+- The token endpoint now requires the `redirect_uri` to be echoed and to match
+  the one sealed in the authorization code (RFC 6749 §4.1.3), and rejects the
+  `authorization_code` grant for clients not registered for it (ADR 0004).
+- Token-endpoint client authentication is pinned to the registered
+  `token_endpoint_auth_method`: presenting a valid secret over the wrong
+  method (basic vs post) is rejected. Discovery no longer advertises
+  `request_parameter_supported` / `claims_parameter_supported`, which were
+  never implemented (ADR 0005).
+- RP side: `verify_id_token` requires `exp` and `iat`; `discover` requires an
+  https issuer (http only for loopback hosts) and verifies the returned
+  issuer matches the requested one (OIDC Discovery §4.3); `exchange_code`
+  truncates upstream error bodies to 512 characters and strips control
+  characters (ADR 0006).
+- `InMemoryClientStore` removes expired entries on `get` and sweeps them on
+  `put_with_ttl`, bounding memory growth from TTL'd federation registrations.
+  Federation entity statements and resolve responses are now verified with
+  `require_exp` (ADR 0007).
+
 ## 0.6.2 [2026-08-04]
 
 - Updated to `jose-rs` 0.6.0 and `kryptering` 0.5.0, migrated key loading to
