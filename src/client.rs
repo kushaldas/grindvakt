@@ -112,10 +112,12 @@ impl InMemoryClientStore {
 #[async_trait::async_trait]
 impl ClientStore for InMemoryClientStore {
     async fn get(&self, client_id: &str) -> Option<Client> {
-        let g = self.inner.read().ok()?;
+        // Write lock so an expired entry is removed on lookup, not just hidden.
+        let mut g = self.inner.write().ok()?;
         let entry = g.get(client_id)?;
         if let Some(exp) = entry.expires_at {
             if exp <= now_secs() {
+                g.remove(client_id);
                 return None;
             }
         }
@@ -136,11 +138,15 @@ impl ClientStore for InMemoryClientStore {
 
     async fn put_with_ttl(&self, client: Client, ttl: u64) {
         if let Ok(mut g) = self.inner.write() {
+            // Opportunistically sweep expired entries so the map cannot grow
+            // unboundedly with dead federation registrations.
+            let now = now_secs();
+            g.retain(|_, e| e.expires_at.is_none_or(|exp| exp > now));
             g.insert(
                 client.client_id.clone(),
                 Entry {
                     client,
-                    expires_at: Some(now_secs() + ttl),
+                    expires_at: Some(now + ttl),
                 },
             );
         }
@@ -172,5 +178,39 @@ mod tests {
 
         store.put_with_ttl(client, 0).await;
         assert!(store.get("c1").await.is_none(), "ttl=0 should expire");
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_removed() {
+        let client = Client {
+            client_id: "c1".into(),
+            client_secret: Some("s".into()),
+            redirect_uris: vec!["https://rp/cb".into()],
+            response_types: default_response_types(),
+            grant_types: default_grant_types(),
+            token_endpoint_auth_method: AUTH_CLIENT_SECRET_BASIC.into(),
+            jwks: None,
+            scope: None,
+            subject_type: "public".into(),
+            client_name: None,
+        };
+        let store = InMemoryClientStore::new();
+
+        // get removes the expired entry, not just hides it.
+        store.put_with_ttl(client.clone(), 0).await;
+        assert!(store.get("c1").await.is_none());
+        assert!(
+            store.inner.read().unwrap().is_empty(),
+            "expired entry must be removed on get"
+        );
+
+        // put_with_ttl sweeps expired entries left by other keys.
+        let mut dead = client.clone();
+        dead.client_id = "dead".into();
+        store.put_with_ttl(dead, 0).await;
+        store.put_with_ttl(client, 3600).await;
+        let g = store.inner.read().unwrap();
+        assert_eq!(g.len(), 1, "expired entries must be swept on put_with_ttl");
+        assert!(g.contains_key("c1"));
     }
 }

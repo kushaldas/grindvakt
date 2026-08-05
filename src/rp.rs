@@ -147,11 +147,23 @@ pub fn signed_request_object(
 }
 
 /// Discover provider metadata from an issuer.
+///
+/// The issuer URL must be https (plain http is only accepted for loopback
+/// hosts, for local development), and per OIDC Discovery §4.3 the `issuer`
+/// returned in the metadata MUST match the requested issuer exactly.
 pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<ProviderMetadata> {
-    let url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.trim_end_matches('/')
-    );
+    let issuer = issuer.trim_end_matches('/');
+    let parsed = url::Url::parse(issuer)
+        .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
+    let scheme_ok = parsed.scheme() == "https"
+        || (parsed.scheme() == "http"
+            && parsed.host_str().map(is_loopback_host).unwrap_or(false));
+    if !scheme_ok {
+        return Err(Error::BadRequest(format!(
+            "issuer must be an https URL (http allowed only for loopback hosts): {issuer}"
+        )));
+    }
+    let url = format!("{issuer}/.well-known/openid-configuration");
     let resp = http.get(&url).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
@@ -159,7 +171,23 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
             resp.status
         )));
     }
-    resp.json()
+    let metadata: ProviderMetadata = resp.json()?;
+    if metadata.issuer.trim_end_matches('/') != issuer {
+        return Err(Error::Authn(format!(
+            "discovered issuer {} does not match requested issuer {issuer}",
+            metadata.issuer
+        )));
+    }
+    Ok(metadata)
+}
+
+/// localhost / 127.0.0.1 / ::1 — the only hosts permitted over plain http.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// Fetch a JWKS document.
@@ -202,7 +230,7 @@ pub async fn exchange_code(
         return Err(Error::Authn(format!(
             "token endpoint returned {}: {}",
             resp.status,
-            resp.text()
+            sanitize_error_body(&resp.text())
         )));
     }
     let raw: serde_json::Value = resp.json()?;
@@ -233,7 +261,9 @@ pub fn verify_id_token(
 ) -> Result<Claims> {
     let validation = Validation::new()
         .with_issuer(issuer)
-        .with_audience(client_id);
+        .with_audience(client_id)
+        .require_exp()
+        .require_iat();
     let claims = jwt::verify_with_jwks(jwks, id_token, &validation)?;
 
     if let Some(nonce) = expected_nonce {
@@ -276,6 +306,17 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
     c.exp = Some(now + 300);
     c.jti = Some(crate::util::random_token(16));
     jwt::sign(key, &c, None)
+}
+
+/// Sanitize an upstream token-endpoint error body before embedding it in our
+/// error: control characters are stripped (log/terminal injection) and the
+/// text is truncated to 512 chars so a hostile or broken OP cannot blow up our
+/// logs or responses.
+fn sanitize_error_body(body: &str) -> String {
+    body.chars()
+        .filter(|c| !c.is_control())
+        .take(512)
+        .collect()
 }
 
 fn apply_client_auth(
@@ -396,5 +437,154 @@ mod tests {
         let claims = jwt::peek_claims_unverified(&jar).unwrap();
         assert!(!claims.extra.contains_key("code_challenge"));
         assert!(!claims.extra.contains_key("code_challenge_method"));
+    }
+
+    /// Minimal in-memory [`HttpClient`] for discovery / token-endpoint tests.
+    struct MockHttp {
+        get: Option<crate::http::HttpFetchResponse>,
+        post: Option<crate::http::HttpFetchResponse>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for MockHttp {
+        async fn get(&self, _url: &str) -> Result<crate::http::HttpFetchResponse> {
+            self.get
+                .clone()
+                .ok_or_else(|| Error::Internal("unexpected GET".into()))
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _form: &[(String, String)],
+            _headers: &[(String, String)],
+        ) -> Result<crate::http::HttpFetchResponse> {
+            self.post
+                .clone()
+                .ok_or_else(|| Error::Internal("unexpected POST".into()))
+        }
+    }
+
+    fn metadata_response(issuer: &str) -> crate::http::HttpFetchResponse {
+        let metadata = ProviderMetadata::new(issuer, issuer);
+        crate::http::HttpFetchResponse {
+            status: 200,
+            body: serde_json::to_vec(&metadata).unwrap(),
+            content_type: Some("application/json".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_plain_http_for_non_loopback() {
+        // The mock has no GET response: the request must be refused before any
+        // fetch happens.
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: None,
+            post: None,
+        });
+        assert!(discover(&http, "http://op.example.com").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn discover_allows_http_for_loopback() {
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(metadata_response("http://127.0.0.1:8080")),
+            post: None,
+        });
+        let metadata = discover(&http, "http://127.0.0.1:8080").await.unwrap();
+        assert_eq!(metadata.issuer, "http://127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_issuer_mismatch() {
+        // OIDC Discovery §4.3: the returned issuer must match the requested one.
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(metadata_response("https://evil.example.com")),
+            post: None,
+        });
+        assert!(discover(&http, "https://op.example.com").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exchange_code_error_body_is_sanitized() {
+        let (client, provider, _key) = client_and_provider();
+        // A hostile upstream: >512 chars, laced with ANSI escapes and newlines.
+        let body = "oops\x1b[31m\n".repeat(200);
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: None,
+            post: Some(crate::http::HttpFetchResponse {
+                status: 400,
+                body: body.into_bytes(),
+                content_type: None,
+            }),
+        });
+        let err = exchange_code(&http, &provider, &client, "code-1", None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.len() < 600, "upstream body must be truncated: {}", msg.len());
+        assert!(
+            !msg.chars().any(|c| c.is_control()),
+            "control characters must be stripped: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn verify_id_token_requires_exp_and_iat() {
+        let (_client, _provider, key) = client_and_provider();
+        let jwks = key.to_public_jwks();
+        let now = now_secs();
+
+        // No exp -> rejected.
+        let mut c = Claims::default();
+        c.iss = Some("https://op.example.org".into());
+        c.aud = Some(Audience::Single("https://rp.example.com".into()));
+        c.iat = Some(now);
+        let token = jwt::sign(&key, &c, None).unwrap();
+        assert!(
+            verify_id_token(
+                &jwks,
+                &token,
+                "https://op.example.org",
+                "https://rp.example.com",
+                None
+            )
+            .is_err(),
+            "id_token without exp must be rejected"
+        );
+
+        // No iat -> rejected.
+        let mut c = Claims::default();
+        c.iss = Some("https://op.example.org".into());
+        c.aud = Some(Audience::Single("https://rp.example.com".into()));
+        c.exp = Some(now + 300);
+        let token = jwt::sign(&key, &c, None).unwrap();
+        assert!(
+            verify_id_token(
+                &jwks,
+                &token,
+                "https://op.example.org",
+                "https://rp.example.com",
+                None
+            )
+            .is_err(),
+            "id_token without iat must be rejected"
+        );
+
+        // Both present -> accepted.
+        let mut c = Claims::default();
+        c.iss = Some("https://op.example.org".into());
+        c.aud = Some(Audience::Single("https://rp.example.com".into()));
+        c.iat = Some(now);
+        c.exp = Some(now + 300);
+        let token = jwt::sign(&key, &c, None).unwrap();
+        verify_id_token(
+            &jwks,
+            &token,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+        )
+        .unwrap();
     }
 }

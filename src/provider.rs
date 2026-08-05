@@ -5,7 +5,10 @@
 //! small token-use store is still required for one-time authorization-code use
 //! and refresh-token rotation.
 
-use crate::client::{Client, ClientStore, AUTH_NONE, AUTH_PRIVATE_KEY_JWT};
+use crate::client::{
+    Client, ClientStore, AUTH_CLIENT_SECRET_BASIC, AUTH_CLIENT_SECRET_POST, AUTH_NONE,
+    AUTH_PRIVATE_KEY_JWT,
+};
 use crate::jwt;
 use crate::keys::SigningKey;
 use crate::mac::sha256;
@@ -275,6 +278,15 @@ impl Provider {
             )
             .with_state(req.state.clone()));
         }
+        // OIDC Core §3.2.2.1 / §3.3.2.1: a nonce is REQUIRED for any response
+        // type that returns an id_token from the authorization endpoint
+        // (implicit and hybrid flows).
+        if req.wants_id_token() && req.nonce.is_none() {
+            return Err(
+                OAuthError::invalid_request("nonce is required for implicit/hybrid flows")
+                    .with_state(req.state.clone()),
+            );
+        }
         if client.token_endpoint_auth_method == AUTH_NONE && req.wants_code() {
             match (
                 req.code_challenge.as_deref(),
@@ -288,6 +300,21 @@ impl Provider {
                     );
                 }
             }
+        }
+        // The requested scope must not exceed the client's registered scope set
+        // (mirrors the client_credentials intersection at the token endpoint).
+        let allowed: Vec<&str> = client
+            .scope
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        if req.scopes().iter().any(|s| !allowed.contains(s)) {
+            return Err(OAuthError::new(
+                OAuthErrorCode::InvalidScope,
+                "requested scope exceeds the client's registered scope",
+            )
+            .with_state(req.state.clone()));
         }
         Ok(client)
     }
@@ -410,6 +437,14 @@ impl Provider {
             .authenticate_client(form, auth_header, token_url)
             .await?;
 
+        // The client must be registered for the authorization_code grant
+        // (mirrors the client_credentials / refresh_token grant gates).
+        if !client.grant_types.iter().any(|g| g == "authorization_code") {
+            return Err(OAuthError::invalid_grant(
+                "authorization_code grant not allowed for client",
+            ));
+        }
+
         let code = form
             .get("code")
             .ok_or_else(|| OAuthError::invalid_request("missing code"))?;
@@ -425,10 +460,12 @@ impl Provider {
             ));
         }
 
-        // redirect_uri must match the one used at the authorization endpoint.
-        if let Some(redirect_uri) = form.get("redirect_uri") {
-            if redirect_uri != &payload.redirect_uri {
-                return Err(OAuthError::invalid_grant("redirect_uri mismatch"));
+        // RFC 6749 §4.1.3: when the authorization request carried a
+        // redirect_uri, the token request MUST echo it and it MUST match.
+        if !payload.redirect_uri.is_empty() {
+            match form.get("redirect_uri") {
+                Some(redirect_uri) if redirect_uri == &payload.redirect_uri => {}
+                _ => return Err(OAuthError::invalid_grant("redirect_uri mismatch")),
             }
         }
 
@@ -828,13 +865,13 @@ impl Provider {
             if let Some(b64) = header.strip_prefix("Basic ") {
                 let (id, secret) = decode_basic(b64)
                     .ok_or_else(|| OAuthError::invalid_client("malformed Basic auth"))?;
-                return self.check_secret(&id, &secret).await;
+                return self.check_secret(&id, &secret, AUTH_CLIENT_SECRET_BASIC).await;
             }
         }
 
         // client_secret_post.
         if let (Some(id), Some(secret)) = (form.get("client_id"), form.get("client_secret")) {
-            return self.check_secret(id, secret).await;
+            return self.check_secret(id, secret, AUTH_CLIENT_SECRET_POST).await;
         }
 
         // public client (auth method "none").
@@ -852,12 +889,24 @@ impl Provider {
         Err(OAuthError::invalid_client("client authentication required"))
     }
 
-    async fn check_secret(&self, client_id: &str, secret: &str) -> Result<Client, OAuthError> {
+    async fn check_secret(
+        &self,
+        client_id: &str,
+        secret: &str,
+        presented_method: &str,
+    ) -> Result<Client, OAuthError> {
         let client = self
             .clients
             .get(client_id)
             .await
             .ok_or_else(|| OAuthError::invalid_client("unknown client"))?;
+        // The presented authentication method must be the one the client
+        // registered (OIDC Registration §2, token_endpoint_auth_method).
+        if client.token_endpoint_auth_method != presented_method {
+            return Err(OAuthError::invalid_client(
+                "client authentication method does not match the registered method",
+            ));
+        }
         match &client.client_secret {
             Some(expected) if constant_time_eq(expected.as_bytes(), secret.as_bytes()) => {
                 Ok(client)
@@ -901,12 +950,19 @@ impl Provider {
             .ok_or_else(|| OAuthError::invalid_client("client has no keys for private_key_jwt"))?;
 
         // RFC 7523: iss == sub == client_id, aud == token endpoint URL (or issuer),
-        // signature valid, not expired.
+        // signature valid. exp is required and the assertion may be at most 300
+        // seconds old, bounding the replay window.
         let validation = Validation::new()
             .with_issuer(&client_id)
-            .with_subject(&client_id);
-        let claims = jwt::verify_with_jwks(jwks, assertion, &validation)
-            .map_err(|e| OAuthError::invalid_client(format!("client_assertion invalid: {e}")))?;
+            .with_subject(&client_id)
+            .require_exp()
+            .with_max_age(300);
+        let claims = jwt::verify_with_jwks(jwks, assertion, &validation).map_err(|e| {
+            // The jose-rs detail can carry internals; keep it for the logs and
+            // hand the client only a generic description.
+            tracing::debug!(error = %e, "client_assertion validation failed");
+            OAuthError::invalid_client("client_assertion validation failed")
+        })?;
 
         // Audience must include the token endpoint or the issuer identifier.
         let aud_ok = match &claims.aud {
@@ -917,6 +973,34 @@ impl Provider {
             return Err(OAuthError::invalid_client(
                 "client_assertion audience mismatch",
             ));
+        }
+
+        // Replay protection: the assertion's jti is single-use until its exp,
+        // so a captured assertion cannot be replayed within its lifetime.
+        let jti = claims
+            .jti
+            .as_deref()
+            .ok_or_else(|| OAuthError::invalid_client("client_assertion missing jti"))?;
+        let key = format!("assertion:{client_id}:{jti}");
+        let ttl = claims
+            .exp
+            .map(|exp| exp.saturating_sub(now_secs()))
+            .unwrap_or(1)
+            .max(1);
+        match self.token_use_store.consume(&key, ttl).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(OAuthError::invalid_client("client_assertion already used"));
+            }
+            Err(e) => {
+                // As in consume_token_once: store errors may carry
+                // infrastructure details; log them, return a generic error.
+                tracing::error!(error = %e, "token-use store failure");
+                return Err(OAuthError::new(
+                    OAuthErrorCode::ServerError,
+                    "temporarily unable to process the request",
+                ));
+            }
         }
 
         Ok(client)

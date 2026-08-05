@@ -65,7 +65,7 @@ async fn authorization_code_pkce_flow() {
         grant_types: vec!["authorization_code".into()],
         token_endpoint_auth_method: AUTH_NONE.into(),
         jwks: None,
-        scope: None,
+        scope: Some("openid email".into()),
         subject_type: "public".into(),
         client_name: None,
     };
@@ -924,7 +924,7 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
         grant_types: vec!["authorization_code".into()],
         token_endpoint_auth_method: AUTH_NONE.into(),
         jwks: None,
-        scope: None,
+        scope: Some("openid".into()),
         subject_type: "public".into(),
         client_name: None,
     };
@@ -1002,4 +1002,372 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
     let userinfo = op.userinfo(&token_resp.access_token, None).await.unwrap();
     assert_eq!(userinfo["sub"], "canonical-subject-id");
     assert_eq!(userinfo["email"], "anna@example.com");
+}
+
+/// Regression: client assertions (`private_key_jwt`) must carry `exp` (with an
+/// age bound), and a captured assertion must not be replayable — its `jti` is
+/// consumed once via the token-use store.
+#[tokio::test]
+async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
+    let client_key = ec_signing_key("rp-key-2");
+    let client = Client {
+        client_id: "rp-pkj".into(),
+        client_secret: None,
+        redirect_uris: vec![],
+        response_types: vec![],
+        grant_types: vec!["client_credentials".into()],
+        token_endpoint_auth_method: AUTH_PRIVATE_KEY_JWT.into(),
+        jwks: Some(client_key.to_public_jwks()),
+        scope: Some("read".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+    let token_url = "https://op.example.com/token";
+
+    // An assertion without exp must be rejected; the error description must
+    // stay generic (no jose-rs detail leaks to the client).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = jose_rs::jwt::Claims {
+        iss: Some("rp-pkj".into()),
+        sub: Some("rp-pkj".into()),
+        aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
+        iat: Some(now),
+        jti: Some("no-exp-jti".into()),
+        ..Default::default()
+    };
+    let mut header = jose_rs::JoseHeader::for_alg(client_key.alg());
+    header.kid = client_key.kid().map(str::to_string);
+    let no_exp = jose_rs::jwt::encode(client_key.signer(), &header, &claims).unwrap();
+    let err = op
+        .authenticate_client(
+            &map(&[
+                ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+                ("client_assertion", &no_exp),
+            ]),
+            None,
+            token_url,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidClient);
+    assert_eq!(
+        err.description.as_deref(),
+        Some("client_assertion validation failed"),
+        "validation detail must not leak into error_description"
+    );
+
+    // A valid assertion authenticates once...
+    let assertion =
+        grindvakt::rp::build_client_assertion(&client_key, "rp-pkj", token_url).unwrap();
+    let form = map(&[
+        ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+        ("client_assertion", &assertion),
+    ]);
+    op.authenticate_client(&form, None, token_url)
+        .await
+        .expect("first use of the assertion");
+
+    // ...but replaying the same assertion (same jti) is rejected.
+    let err = op
+        .authenticate_client(&form, None, token_url)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidClient);
+    assert_eq!(
+        err.description.as_deref(),
+        Some("client_assertion already used")
+    );
+}
+
+/// Regression: the requested scope at the authorization endpoint must not
+/// exceed the client's registered scope set.
+#[tokio::test]
+async fn authorization_request_scope_checked_against_registered_scope() {
+    let client = Client {
+        client_id: "rp-scope".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid email".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    // A subset of the registered scope is fine.
+    let ok = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-scope"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid email"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&ok).await.unwrap();
+
+    // Any scope outside the registered set is rejected, even when mixed with
+    // valid scopes.
+    let excess = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-scope"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid admin"),
+    ]))
+    .unwrap();
+    let err = op
+        .validate_authorization_request(&excess)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidScope);
+}
+
+/// Regression: the presented token-endpoint authentication method must match
+/// the client's registered `token_endpoint_auth_method`.
+#[tokio::test]
+async fn presented_auth_method_must_match_registered_method() {
+    use base64::Engine;
+
+    let client = Client {
+        client_id: "rp-basic".into(),
+        client_secret: Some("topsecret".into()),
+        redirect_uris: vec![],
+        response_types: vec![],
+        grant_types: vec!["client_credentials".into()],
+        token_endpoint_auth_method: grindvakt::client::AUTH_CLIENT_SECRET_BASIC.into(),
+        jwks: None,
+        scope: Some("read".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    // The correct secret presented via client_secret_post is rejected: the
+    // client is registered for client_secret_basic only.
+    let err = op
+        .authenticate_client(
+            &map(&[
+                ("client_id", "rp-basic"),
+                ("client_secret", "topsecret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidClient);
+
+    // The registered method works.
+    let b64 = base64::engine::general_purpose::STANDARD.encode("rp-basic:topsecret");
+    let header = format!("Basic {b64}");
+    op.authenticate_client(
+        &map(&[("client_id", "rp-basic")]),
+        Some(&header),
+        "https://op.example.com/token",
+    )
+    .await
+    .expect("registered basic auth method");
+}
+
+/// Regression: implicit and hybrid response types require a nonce (OIDC Core
+/// §3.2.2.1 / §3.3.2.1).
+#[tokio::test]
+async fn implicit_and_hybrid_flows_require_nonce() {
+    let client = Client {
+        client_id: "rp-implicit".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["id_token token".into(), "code id_token".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    for response_type in ["id_token token", "code id_token"] {
+        let req = AuthorizationRequest::from_params(&map(&[
+            ("client_id", "rp-implicit"),
+            ("response_type", response_type),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("scope", "openid"),
+        ]))
+        .unwrap();
+        let err = op.validate_authorization_request(&req).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            grindvakt::OAuthErrorCode::InvalidRequest,
+            "{response_type} without nonce must be rejected"
+        );
+
+        let req = AuthorizationRequest::from_params(&map(&[
+            ("client_id", "rp-implicit"),
+            ("response_type", response_type),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("scope", "openid"),
+            ("nonce", "n-1"),
+        ]))
+        .unwrap();
+        op.validate_authorization_request(&req)
+            .await
+            .unwrap_or_else(|e| panic!("{response_type} with nonce must pass: {e}"));
+    }
+}
+
+/// Regression: the hybrid `code id_token` response type defaults to the
+/// fragment response mode, so the id_token is not leaked in the URL query.
+#[tokio::test]
+async fn hybrid_flow_defaults_to_fragment_response_mode() {
+    let client = Client {
+        client_id: "rp-hybrid".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code id_token".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-hybrid"),
+        ("response_type", "code id_token"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("nonce", "n-1"),
+    ]))
+    .unwrap();
+    let redirect = op
+        .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .unwrap();
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1;
+    let fragment = location.split_once('#').expect("fragment separator").1;
+    assert!(
+        fragment.contains("id_token="),
+        "id_token must be delivered in the fragment: {location}"
+    );
+}
+
+/// Regression: when the authorization code carries a redirect_uri, the token
+/// request MUST echo a matching redirect_uri (RFC 6749 §4.1.3).
+#[tokio::test]
+async fn token_request_must_echo_redirect_uri() {
+    let client = Client {
+        client_id: "rp-redir".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-redir"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+    ]))
+    .unwrap();
+    let redirect = op
+        .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .unwrap();
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1;
+    let code = extract_param(location, "code").unwrap();
+
+    // No redirect_uri echoed at all -> invalid_grant.
+    let err = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", "rp-redir"),
+                ("client_secret", "s"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidGrant);
+}
+
+/// Regression: a client not registered for the authorization_code grant cannot
+/// redeem a code at the token endpoint (mirrors the client_credentials and
+/// refresh_token grant gates).
+#[tokio::test]
+async fn authorization_code_grant_must_be_registered() {
+    let client = Client {
+        client_id: "rp-nogrant".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["refresh_token".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-nogrant"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+    ]))
+    .unwrap();
+    let redirect = op
+        .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .unwrap();
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1;
+    let code = extract_param(location, "code").unwrap();
+
+    let err = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-nogrant"),
+                ("client_secret", "s"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidGrant);
 }

@@ -111,8 +111,11 @@ impl AuthorizationRequest {
         match self.response_mode.as_deref() {
             Some("fragment") => true,
             Some("query") => false,
-            // Default: code flow uses query, implicit/hybrid use fragment.
-            _ => self.wants_id_token() && !self.wants_code(),
+            // Default: the pure code flow uses query; any response type that
+            // returns an id_token from the authorization endpoint (implicit
+            // and hybrid, OIDC Core §3.2.2.5 / §3.3.2.5) uses the fragment, so
+            // the id_token never leaks into the URL (logs, Referer, history).
+            _ => self.wants_id_token(),
         }
     }
 
@@ -171,5 +174,31 @@ mod tests {
     fn missing_client_id_errors() {
         let p = params(&[("response_type", "code"), ("redirect_uri", "https://rp/cb")]);
         assert!(AuthorizationRequest::from_params(&p).is_err());
+    }
+
+    #[test]
+    fn id_token_flows_default_to_fragment_response_mode() {
+        // Hybrid: the default is fragment, so the id_token is never in the URL
+        // query (OIDC Core §3.3.2.5).
+        let hybrid = AuthorizationRequest {
+            response_type: "code id_token".into(),
+            ..Default::default()
+        };
+        assert!(hybrid.use_fragment());
+
+        // Pure code flow keeps the query default.
+        let code = AuthorizationRequest {
+            response_type: "code".into(),
+            ..Default::default()
+        };
+        assert!(!code.use_fragment());
+
+        // An explicit response_mode still wins.
+        let explicit = AuthorizationRequest {
+            response_type: "code id_token".into(),
+            response_mode: Some("query".into()),
+            ..Default::default()
+        };
+        assert!(!explicit.use_fragment());
     }
 }

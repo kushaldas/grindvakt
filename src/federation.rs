@@ -148,7 +148,9 @@ pub fn verify(token: &str, jwks: &JwkSet) -> Result<EntityStatement> {
 /// header. Entity statements and resolve responses are both TA-signed but carry
 /// different `typ` values.
 pub fn verify_typed(token: &str, jwks: &JwkSet, typ: &str) -> Result<EntityStatement> {
-    let validation = Validation::new().with_typ(typ);
+    // exp is mandatory (OpenID Federation 1.0 §3.1 / §8.6): a statement that
+    // never expires could be replayed indefinitely.
+    let validation = Validation::new().with_typ(typ).require_exp();
     let claims = crate::jwt::verify_with_jwks(jwks, token, &validation)?;
     let value = serde_json::to_value(&claims)?;
     Ok(EntityStatement { claims: value })
@@ -773,6 +775,36 @@ mod tests {
         )
         .unwrap();
         assert!(verify(&token, &other.to_public_jwks()).is_err());
+    }
+
+    /// Regression: entity statements without `exp` must be rejected (OpenID
+    /// Federation 1.0 §3.1) — a statement that never expires could otherwise be
+    /// replayed indefinitely. Applies equally to trust-anchor entity
+    /// configurations and resolve responses (`verify_typed`).
+    #[test]
+    fn entity_statement_without_exp_is_rejected() {
+        let k = key("fed-1");
+        let mut c = Claims::default();
+        c.iss = Some("https://op.example.com".into());
+        c.sub = Some("https://op.example.com".into());
+        c.iat = Some(crate::util::now_secs());
+        c.extra.insert(
+            "jwks".to_string(),
+            serde_json::to_value(k.to_public_jwks()).unwrap(),
+        );
+        let mut header = JoseHeader::for_alg(k.alg());
+        header.kid = k.kid().map(str::to_string);
+        header.typ = Some(ENTITY_STATEMENT_TYP.to_string());
+        let token = jose_rs::jwt::encode(k.signer(), &header, &c).unwrap();
+
+        assert!(
+            verify(&token, &k.to_public_jwks()).is_err(),
+            "entity statement without exp must be rejected"
+        );
+        assert!(
+            verify_typed(&token, &k.to_public_jwks(), ENTITY_STATEMENT_TYP).is_err(),
+            "verify_typed must require exp"
+        );
     }
 
     #[test]

@@ -77,8 +77,11 @@ impl ProviderMetadata {
             ],
             claims_supported: vec!["sub".into(), "iss".into(), "aud".into(), "exp".into()],
             code_challenge_methods_supported: vec!["S256".into()],
-            claims_parameter_supported: true,
-            request_parameter_supported: true,
+            // Neither the `claims` parameter nor the `request` parameter (RFC
+            // 9101 request objects at the authorization endpoint) is
+            // implemented, so discovery must not advertise them.
+            claims_parameter_supported: false,
+            request_parameter_supported: false,
             // Off by default; a deployment enabling DPoP sets this to e.g.
             // ["ES256"] (and may add "client_credentials" to grant_types_supported).
             dpop_signing_alg_values_supported: Vec::new(),
@@ -90,5 +93,19 @@ impl ProviderMetadata {
     /// Serialize to the discovery JSON document.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unimplemented_parameters_are_not_advertised() {
+        // Neither the `claims` nor the `request` authorization parameter is
+        // implemented, so the discovery defaults must not claim support.
+        let doc = ProviderMetadata::new("https://op.example.com", "https://op.example.com").to_json();
+        assert_eq!(doc["claims_parameter_supported"], false);
+        assert_eq!(doc["request_parameter_supported"], false);
     }
 }
