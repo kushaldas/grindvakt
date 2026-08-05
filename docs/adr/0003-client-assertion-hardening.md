@@ -18,8 +18,11 @@ caller.
 
 `verify_private_key_jwt` now:
 
-- requires `exp` and bounds assertion age to 300 seconds via
-  `Validation::require_exp()` and `Validation::with_max_age(300)`;
+- requires `exp` and bounds assertion age via `Validation::require_exp()`
+  and `Validation::with_max_age(...)`; the bound defaults to 300 seconds
+  (`DEFAULT_CLIENT_ASSERTION_MAX_AGE`) and can be widened with
+  `Provider::with_client_assertion_max_age` for clients that cannot mint
+  fresh assertions per token request;
 - requires a `jti` and consumes it exactly once through the existing
   `TokenUseStore` under the key `assertion:{client_id}:{jti}` with a TTL
   running until the assertion's `exp`, so a captured assertion cannot be
@@ -34,6 +37,9 @@ Deployments using the default in-memory `TokenUseStore` get single-process
 replay protection; multi-replica deployments must install a shared store
 (e.g. `RedisStore`, ADR 0002) for the protection to hold across replicas — the
 same caveat that already applies to authorization codes and refresh tokens.
-Assertion issuers must now include `iat`, `exp` (at most 300 seconds after
-`iat`), and `jti`; `grindvakt::rp::build_client_assertion` already emits all
-three.
+Assertion issuers must now include `iat`, `exp` (by default at most 300
+seconds after `iat`, configurable via `with_client_assertion_max_age`), and
+`jti`; `grindvakt::rp::build_client_assertion` already emits all three.
+Widening the age bound extends how long a captured assertion stays usable
+and how long the `jti` store retains entries; the single-use `jti`
+requirement is not configurable.

@@ -1083,6 +1083,65 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
     );
 }
 
+/// Regression: the client-assertion max age is configurable. The default
+/// 300-second bound rejects older assertions; a provider built with
+/// `with_client_assertion_max_age` accepts them (exp and single-use jti are
+/// still enforced).
+#[tokio::test]
+async fn private_key_jwt_max_age_is_configurable() {
+    let client_key = ec_signing_key("rp-key-3");
+    let client = Client {
+        client_id: "rp-pkj-age".into(),
+        client_secret: None,
+        redirect_uris: vec![],
+        response_types: vec![],
+        grant_types: vec!["client_credentials".into()],
+        token_endpoint_auth_method: AUTH_PRIVATE_KEY_JWT.into(),
+        jwks: Some(client_key.to_public_jwks()),
+        scope: Some("read".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let token_url = "https://op.example.com/token";
+
+    // An assertion issued 600 seconds ago, still well within its exp.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = jose_rs::jwt::Claims {
+        iss: Some("rp-pkj-age".into()),
+        sub: Some("rp-pkj-age".into()),
+        aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
+        iat: Some(now - 600),
+        exp: Some(now + 3000),
+        jti: Some("old-assertion-jti".into()),
+        ..Default::default()
+    };
+    let mut header = jose_rs::JoseHeader::for_alg(client_key.alg());
+    header.kid = client_key.kid().map(str::to_string);
+    let assertion = jose_rs::jwt::encode(client_key.signer(), &header, &claims).unwrap();
+    let form = map(&[
+        ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+        ("client_assertion", &assertion),
+    ]);
+
+    // The default 300 s bound rejects it.
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client.clone()]));
+    let err = op
+        .authenticate_client(&form, None, token_url)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidClient);
+
+    // A widened bound accepts it.
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]))
+        .with_client_assertion_max_age(3600);
+    op.authenticate_client(&form, None, token_url)
+        .await
+        .expect("assertion within the configured max age");
+}
+
 /// Regression: the requested scope at the authorization endpoint must not
 /// exceed the client's registered scope set.
 #[tokio::test]
@@ -1151,10 +1210,7 @@ async fn presented_auth_method_must_match_registered_method() {
     // client is registered for client_secret_basic only.
     let err = op
         .authenticate_client(
-            &map(&[
-                ("client_id", "rp-basic"),
-                ("client_secret", "topsecret"),
-            ]),
+            &map(&[("client_id", "rp-basic"), ("client_secret", "topsecret")]),
             None,
             "https://op.example.com/token",
         )

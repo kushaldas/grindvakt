@@ -104,7 +104,8 @@ mod tests {
     fn unimplemented_parameters_are_not_advertised() {
         // Neither the `claims` nor the `request` authorization parameter is
         // implemented, so the discovery defaults must not claim support.
-        let doc = ProviderMetadata::new("https://op.example.com", "https://op.example.com").to_json();
+        let doc =
+            ProviderMetadata::new("https://op.example.com", "https://op.example.com").to_json();
         assert_eq!(doc["claims_parameter_supported"], false);
         assert_eq!(doc["request_parameter_supported"], false);
     }

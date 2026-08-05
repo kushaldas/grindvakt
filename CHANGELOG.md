@@ -13,7 +13,9 @@ notes.
   (jose-rs ADR 0002–0004).
 
 - `private_key_jwt` client assertions must now carry `exp` (age-bounded to
-  300 seconds) and a `jti`; the `jti` is consumed once through the
+  300 seconds by default, adjustable via
+  `Provider::with_client_assertion_max_age`) and a `jti`; the `jti` is
+  consumed once through the
   `TokenUseStore` (`assertion:{client_id}:{jti}`, TTL until `exp`), so a
   captured assertion can no longer be replayed. The `invalid_client` error no
   longer embeds jose-rs validation details (ADR 0003).

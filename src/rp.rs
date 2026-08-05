@@ -156,8 +156,7 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
     let parsed = url::Url::parse(issuer)
         .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
     let scheme_ok = parsed.scheme() == "https"
-        || (parsed.scheme() == "http"
-            && parsed.host_str().map(is_loopback_host).unwrap_or(false));
+        || (parsed.scheme() == "http" && parsed.host_str().map(is_loopback_host).unwrap_or(false));
     if !scheme_ok {
         return Err(Error::BadRequest(format!(
             "issuer must be an https URL (http allowed only for loopback hosts): {issuer}"
@@ -313,10 +312,7 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
 /// text is truncated to 512 chars so a hostile or broken OP cannot blow up our
 /// logs or responses.
 fn sanitize_error_body(body: &str) -> String {
-    body.chars()
-        .filter(|c| !c.is_control())
-        .take(512)
-        .collect()
+    body.chars().filter(|c| !c.is_control()).take(512).collect()
 }
 
 fn apply_client_auth(
@@ -522,7 +518,11 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.len() < 600, "upstream body must be truncated: {}", msg.len());
+        assert!(
+            msg.len() < 600,
+            "upstream body must be truncated: {}",
+            msg.len()
+        );
         assert!(
             !msg.chars().any(|c| c.is_control()),
             "control characters must be stripped: {msg:?}"

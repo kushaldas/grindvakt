@@ -62,7 +62,15 @@ pub struct Provider {
     pub codec: TokenCodec,
     pub lifetimes: TokenLifetimes,
     token_use_store: Arc<dyn TokenUseStore>,
+    /// Maximum accepted age of a `private_key_jwt` client assertion
+    /// (RFC 7523), measured from `iat`. Defaults to
+    /// [`DEFAULT_CLIENT_ASSERTION_MAX_AGE`]; see
+    /// [`Provider::with_client_assertion_max_age`].
+    client_assertion_max_age: u64,
 }
+
+/// Default maximum age of a `private_key_jwt` client assertion, in seconds.
+pub const DEFAULT_CLIENT_ASSERTION_MAX_AGE: u64 = 300;
 
 /// The token endpoint success response.
 #[derive(Debug, Serialize)]
@@ -234,12 +242,25 @@ impl Provider {
             codec,
             lifetimes,
             token_use_store: Arc::new(InMemoryTokenUseStore::new()),
+            client_assertion_max_age: DEFAULT_CLIENT_ASSERTION_MAX_AGE,
         }
     }
 
     /// Replace the default single-process token-use store.
     pub fn with_token_use_store(mut self, store: Arc<dyn TokenUseStore>) -> Self {
         self.token_use_store = store;
+        self
+    }
+
+    /// Override the maximum accepted age of `private_key_jwt` client
+    /// assertions (measured from `iat`; `exp` and a single-use `jti` are
+    /// always required). The default of 300 seconds follows the OAuth
+    /// Security BCP; widen it only for clients that cannot mint fresh
+    /// assertions per token request — a wider window extends how long a
+    /// captured assertion stays usable, and the `jti` store retains entries
+    /// for the assertion's whole lifetime.
+    pub fn with_client_assertion_max_age(mut self, secs: u64) -> Self {
+        self.client_assertion_max_age = secs;
         self
     }
 
@@ -865,7 +886,9 @@ impl Provider {
             if let Some(b64) = header.strip_prefix("Basic ") {
                 let (id, secret) = decode_basic(b64)
                     .ok_or_else(|| OAuthError::invalid_client("malformed Basic auth"))?;
-                return self.check_secret(&id, &secret, AUTH_CLIENT_SECRET_BASIC).await;
+                return self
+                    .check_secret(&id, &secret, AUTH_CLIENT_SECRET_BASIC)
+                    .await;
             }
         }
 
@@ -950,13 +973,13 @@ impl Provider {
             .ok_or_else(|| OAuthError::invalid_client("client has no keys for private_key_jwt"))?;
 
         // RFC 7523: iss == sub == client_id, aud == token endpoint URL (or issuer),
-        // signature valid. exp is required and the assertion may be at most 300
-        // seconds old, bounding the replay window.
+        // signature valid. exp is required and the assertion may be at most
+        // client_assertion_max_age seconds old, bounding the replay window.
         let validation = Validation::new()
             .with_issuer(&client_id)
             .with_subject(&client_id)
             .require_exp()
-            .with_max_age(300);
+            .with_max_age(self.client_assertion_max_age);
         let claims = jwt::verify_with_jwks(jwks, assertion, &validation).map_err(|e| {
             // The jose-rs detail can carry internals; keep it for the logs and
             // hand the client only a generic description.
