@@ -1060,6 +1060,34 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
         "validation detail must not leak into error_description"
     );
 
+    // An assertion without iat must be rejected too: the max-age bound is
+    // measured from iat, so a missing iat would make it unenforceable.
+    let claims = jose_rs::jwt::Claims {
+        iss: Some("rp-pkj".into()),
+        sub: Some("rp-pkj".into()),
+        aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
+        exp: Some(now + 300),
+        jti: Some("no-iat-jti".into()),
+        ..Default::default()
+    };
+    let no_iat = jose_rs::jwt::encode(client_key.signer(), &header, &claims).unwrap();
+    let err = op
+        .authenticate_client(
+            &map(&[
+                ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+                ("client_assertion", &no_iat),
+            ]),
+            None,
+            token_url,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidClient);
+    assert_eq!(
+        err.description.as_deref(),
+        Some("client_assertion validation failed")
+    );
+
     // A valid assertion authenticates once...
     let assertion =
         grindvakt::rp::build_client_assertion(&client_key, "rp-pkj", token_url).unwrap();
@@ -1184,6 +1212,37 @@ async fn authorization_request_scope_checked_against_registered_scope() {
         .await
         .unwrap_err();
     assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidScope);
+}
+
+/// A client registered without a `scope` is unrestricted at the authorization
+/// endpoint: `None` means "not configured", not "empty set" — otherwise every
+/// OIDC request (scope=openid) from such a client would fail.
+#[tokio::test]
+async fn client_without_registered_scope_is_unrestricted() {
+    let client = Client {
+        client_id: "rp-noscope".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: None,
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-noscope"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid email"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&req)
+        .await
+        .expect("scope: None must not be treated as an empty allowlist");
 }
 
 /// Regression: the presented token-endpoint authentication method must match

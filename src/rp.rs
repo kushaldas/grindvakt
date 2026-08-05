@@ -181,9 +181,13 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
 }
 
 /// localhost / 127.0.0.1 / ::1 — the only hosts permitted over plain http.
+/// `Url::host_str` serializes IPv6 hosts in bracketed form (`[::1]`), so the
+/// brackets are stripped before parsing as an address.
 fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .parse::<std::net::IpAddr>()
             .map(|ip| ip.is_loopback())
             .unwrap_or(false)
@@ -489,6 +493,25 @@ mod tests {
         });
         let metadata = discover(&http, "http://127.0.0.1:8080").await.unwrap();
         assert_eq!(metadata.issuer, "http://127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn discover_allows_http_for_ipv6_loopback() {
+        // Url::host_str yields the bracketed form ("[::1]"); it must still be
+        // recognized as loopback.
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(metadata_response("http://[::1]:8080")),
+            post: None,
+        });
+        let metadata = discover(&http, "http://[::1]:8080").await.unwrap();
+        assert_eq!(metadata.issuer, "http://[::1]:8080");
+
+        // Non-loopback IPv6 stays rejected over plain http.
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: None,
+            post: None,
+        });
+        assert!(discover(&http, "http://[2001:db8::1]").await.is_err());
     }
 
     #[tokio::test]

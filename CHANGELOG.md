@@ -12,15 +12,17 @@ notes.
   `kid`, and JWEs carrying a `zip` member or an empty `crit` array
   (jose-rs ADR 0002–0004).
 
-- `private_key_jwt` client assertions must now carry `exp` (age-bounded to
-  300 seconds by default, adjustable via
+- `private_key_jwt` client assertions must now carry `iat`, `exp`
+  (age-bounded to 300 seconds by default, adjustable via
   `Provider::with_client_assertion_max_age`) and a `jti`; the `jti` is
-  consumed once through the
-  `TokenUseStore` (`assertion:{client_id}:{jti}`, TTL until `exp`), so a
-  captured assertion can no longer be replayed. The `invalid_client` error no
+  consumed once through the `TokenUseStore` under a hashed, client-scoped
+  key, with the TTL capped at the acceptance window (`max_age` + leeway), so
+  a captured assertion can no longer be replayed and a hostile client cannot
+  fill the store with long-lived entries. The `invalid_client` error no
   longer embeds jose-rs validation details (ADR 0003).
 - The authorization endpoint now rejects requested scopes outside the
-  client's registered scope set (`invalid_scope`), requires a `nonce` for
+  client's registered scope set (`invalid_scope`; clients registered without
+  a `scope` remain unrestricted), requires a `nonce` for
   implicit/hybrid response types, and the hybrid `code id_token` flow now
   defaults to the fragment response mode so the id_token is not leaked in the
   URL (ADR 0004).

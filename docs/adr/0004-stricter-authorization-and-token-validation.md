@@ -25,8 +25,11 @@ endpoints:
 
 - `validate_authorization_request` rejects any requested scope outside the
   client's registered scope set with `invalid_scope`, mirroring the
-  `client_credentials` allowlist logic; a client with no registered scope
-  allows none.
+  `client_credentials` allowlist logic. A client registered without a `scope`
+  (`None`) is unrestricted: `None` means "not configured", not "empty set" —
+  treating it as empty would reject every OIDC request (`scope=openid`) from
+  existing registrations that never populated the field. A client registered
+  with an explicit empty scope string allows none.
 - `validate_authorization_request` rejects implicit/hybrid requests without a
   `nonce` with `invalid_request` (OIDC Core §3.2.2.1 / §3.3.2.1).
 - `AuthorizationRequest::use_fragment` defaults to the fragment response mode
@@ -40,8 +43,8 @@ endpoints:
 
 ## Consequences
 
-Client registrations without a `scope` field can no longer obtain codes for
-any scope — deployments must register the scopes each client may request
-(including `openid`). Hybrid clients must send a nonce and now receive the
+Clients with a registered `scope` are held to it; registrations without one
+keep working unrestricted (register a scope set to opt into the allowlist).
+Hybrid clients must send a nonce and now receive the
 authorization response in the fragment by default. RPs that previously omitted
 `redirect_uri` from the token request must echo it.

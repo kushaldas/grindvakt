@@ -257,8 +257,9 @@ impl Provider {
     /// always required). The default of 300 seconds follows the OAuth
     /// Security BCP; widen it only for clients that cannot mint fresh
     /// assertions per token request — a wider window extends how long a
-    /// captured assertion stays usable, and the `jti` store retains entries
-    /// for the assertion's whole lifetime.
+    /// captured assertion stays usable, and the `jti` store retains each
+    /// entry for the whole acceptance window (max age plus validation
+    /// leeway).
     pub fn with_client_assertion_max_age(mut self, secs: u64) -> Self {
         self.client_assertion_max_age = secs;
         self
@@ -324,18 +325,18 @@ impl Provider {
         }
         // The requested scope must not exceed the client's registered scope set
         // (mirrors the client_credentials intersection at the token endpoint).
-        let allowed: Vec<&str> = client
-            .scope
-            .as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .collect();
-        if req.scopes().iter().any(|s| !allowed.contains(s)) {
-            return Err(OAuthError::new(
-                OAuthErrorCode::InvalidScope,
-                "requested scope exceeds the client's registered scope",
-            )
-            .with_state(req.state.clone()));
+        // A client registered without a `scope` is unrestricted here: `None`
+        // means "not configured", not "empty set" — treating it as empty would
+        // reject every OIDC request (scope=openid) from such a client.
+        if let Some(registered) = client.scope.as_deref() {
+            let allowed: Vec<&str> = registered.split_whitespace().collect();
+            if req.scopes().iter().any(|s| !allowed.contains(s)) {
+                return Err(OAuthError::new(
+                    OAuthErrorCode::InvalidScope,
+                    "requested scope exceeds the client's registered scope",
+                )
+                .with_state(req.state.clone()));
+            }
         }
         Ok(client)
     }
@@ -975,10 +976,14 @@ impl Provider {
         // RFC 7523: iss == sub == client_id, aud == token endpoint URL (or issuer),
         // signature valid. exp is required and the assertion may be at most
         // client_assertion_max_age seconds old, bounding the replay window.
+        // `with_max_age` already implies `require_iat` in jose-rs; state it
+        // explicitly so the freshness bound never silently depends on that
+        // implicit coupling.
         let validation = Validation::new()
             .with_issuer(&client_id)
             .with_subject(&client_id)
             .require_exp()
+            .require_iat()
             .with_max_age(self.client_assertion_max_age);
         let claims = jwt::verify_with_jwks(jwks, assertion, &validation).map_err(|e| {
             // The jose-rs detail can carry internals; keep it for the logs and
@@ -998,17 +1003,25 @@ impl Provider {
             ));
         }
 
-        // Replay protection: the assertion's jti is single-use until its exp,
-        // so a captured assertion cannot be replayed within its lifetime.
+        // Replay protection: the assertion's jti is single-use, so a captured
+        // assertion cannot be replayed within its acceptance window. The store
+        // TTL is capped at max_age + leeway: past that point the max-age check
+        // above rejects the assertion regardless of its exp, so holding the
+        // jti until a (client-chosen, unbounded) exp would only let a hostile
+        // client grow the store with arbitrarily long-lived entries.
         let jti = claims
             .jti
             .as_deref()
             .ok_or_else(|| OAuthError::invalid_client("client_assertion missing jti"))?;
-        let key = format!("assertion:{client_id}:{jti}");
+        let key = assertion_use_hash(&client_id, jti);
         let ttl = claims
             .exp
             .map(|exp| exp.saturating_sub(now_secs()))
             .unwrap_or(1)
+            .min(
+                self.client_assertion_max_age
+                    .saturating_add(validation.leeway),
+            )
             .max(1);
         match self.token_use_store.consume(&key, ttl).await {
             Ok(true) => {}
@@ -1078,6 +1091,18 @@ fn token_use_hash(kind: &str, token: &str) -> String {
         "{}:{}",
         kind,
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha256(token.as_bytes()))
+    )
+}
+
+/// Store key for a single-use client-assertion `jti`, scoped to the client.
+/// Both parts are length-prefixed before hashing so no `(client_id, jti)`
+/// pair can collide with another — client_ids are often URLs containing `:`,
+/// so plain concatenation would be ambiguous — and an arbitrary-length,
+/// client-chosen `jti` never reaches the store key verbatim.
+fn assertion_use_hash(client_id: &str, jti: &str) -> String {
+    token_use_hash(
+        "assertion",
+        &format!("{}:{client_id}:{}:{jti}", client_id.len(), jti.len()),
     )
 }
 
@@ -1287,6 +1312,135 @@ mod tests {
         assert_eq!(
             flat["email_verified"],
             serde_json::Value::String("maybe".into())
+        );
+    }
+
+    /// The assertion-jti store key must be collision-free across clients:
+    /// client_ids are often URLs containing `:`, so plain concatenation of
+    /// `client_id` and `jti` would let two different pairs share a key.
+    #[test]
+    fn assertion_use_hash_is_collision_free_and_carries_no_raw_jti() {
+        // Under plain `assertion:{client_id}:{jti}` both pairs would map to
+        // "assertion:https://rp.example.com:8080:x".
+        let a = assertion_use_hash("https://rp.example.com", "8080:x");
+        let b = assertion_use_hash("https://rp.example.com:8080", "x");
+        assert_ne!(a, b, "distinct (client_id, jti) pairs must not collide");
+
+        // Deterministic per pair, and the raw jti never appears in the key.
+        let long_jti = "j".repeat(4096);
+        let k1 = assertion_use_hash("https://rp.example.com", &long_jti);
+        let k2 = assertion_use_hash("https://rp.example.com", &long_jti);
+        assert_eq!(k1, k2);
+        assert!(!k1.contains(&long_jti));
+        assert!(k1.len() < 100, "store key length must be bounded");
+    }
+
+    /// A recording [`TokenUseStore`] capturing every consume call.
+    #[derive(Default)]
+    struct RecordingStore {
+        seen: std::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenUseStore for RecordingStore {
+        async fn consume(
+            &self,
+            token_hash: &str,
+            ttl_secs: u64,
+        ) -> std::result::Result<bool, String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((token_hash.to_string(), ttl_secs));
+            Ok(true)
+        }
+    }
+
+    /// The jti replay entry must not live until a client-chosen (unbounded)
+    /// `exp`: past `iat + max_age + leeway` the max-age check rejects the
+    /// assertion anyway, so the store TTL is capped at that window. Otherwise
+    /// a hostile client could grow the store with decade-lived entries.
+    #[tokio::test]
+    async fn client_assertion_jti_ttl_is_capped_at_the_acceptance_window() {
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let key = crate::keys::signing_key_from_jwk_json(
+            &jwk.to_json().unwrap(),
+            Some("ES256"),
+            Some("rp-key"),
+        )
+        .unwrap();
+
+        let client = Client {
+            client_id: "rp-pkj".into(),
+            client_secret: None,
+            redirect_uris: vec![],
+            response_types: vec![],
+            grant_types: vec!["client_credentials".into()],
+            token_endpoint_auth_method: AUTH_PRIVATE_KEY_JWT.into(),
+            jwks: Some(key.to_public_jwks()),
+            scope: Some("read".into()),
+            subject_type: "public".into(),
+            client_name: None,
+        };
+        let store = Arc::new(RecordingStore::default());
+        let op = Provider::new(
+            ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+            crate::keys::signing_key_from_jwk_json(
+                &{
+                    let mut k = jose_rs::jwk::generate_ec("P-256").unwrap();
+                    k.alg = Some("ES256".into());
+                    k
+                }
+                .to_json()
+                .unwrap(),
+                Some("ES256"),
+                Some("op-key"),
+            )
+            .unwrap(),
+            Arc::new(crate::client::InMemoryClientStore::with_clients(vec![
+                client,
+            ])),
+            TokenCodec::new("op-secret"),
+            TokenLifetimes::default(),
+        )
+        .with_token_use_store(store.clone());
+
+        // Fresh assertion, but exp a decade out.
+        let now = now_secs();
+        let token_url = "https://op.example.com/token";
+        let claims = Claims {
+            iss: Some("rp-pkj".into()),
+            sub: Some("rp-pkj".into()),
+            aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
+            iat: Some(now),
+            exp: Some(now + 10 * 365 * 24 * 3600),
+            jti: Some("far-future-jti".into()),
+            ..Default::default()
+        };
+        let mut header = jose_rs::JoseHeader::for_alg(key.alg());
+        header.kid = key.kid().map(str::to_string);
+        let assertion = jose_rs::jwt::encode(key.signer(), &header, &claims).unwrap();
+
+        let form: BTreeMap<String, String> = [
+            (
+                "client_assertion_type".to_string(),
+                CLIENT_ASSERTION_TYPE.to_string(),
+            ),
+            ("client_assertion".to_string(), assertion),
+        ]
+        .into();
+        op.authenticate_client(&form, None, token_url)
+            .await
+            .expect("assertion authenticates");
+
+        let seen = store.seen.lock().unwrap();
+        let (hash, ttl) = seen.first().expect("consume was called");
+        assert!(hash.starts_with("assertion:"));
+        assert!(!hash.contains("far-future-jti"), "raw jti must be hashed");
+        assert!(
+            *ttl <= DEFAULT_CLIENT_ASSERTION_MAX_AGE + Validation::new().leeway,
+            "jti TTL ({ttl}) must be capped at max_age + leeway, not run to exp"
         );
     }
 }
