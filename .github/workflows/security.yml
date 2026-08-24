@@ -4,12 +4,6 @@ on:
   schedule:
     # Daily at 06:17 UTC. Offset from :00 to avoid the GitHub cron rush.
     - cron: "17 6 * * *"
-  push:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".cargo/audit.toml"
-      - ".github/workflows/security.yml"
   pull_request:
     paths:
       - "Cargo.toml"
