@@ -1369,18 +1369,24 @@ async fn authorization_request_validates_prompt_none_combinations() {
             .unwrap_or_else(|e| panic!("prompt={prompt} should pass: {e}"));
     }
 
-    let req = AuthorizationRequest::from_params(&map(&[
-        ("client_id", "rp-prompt"),
-        ("response_type", "code"),
-        ("redirect_uri", "https://rp.example.com/cb"),
-        ("scope", "openid"),
-        ("state", "state-prompt"),
-        ("prompt", "none login"),
-    ]))
-    .unwrap();
-    let err = op.validate_authorization_request(&req).await.unwrap_err();
-    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidRequest);
-    assert_eq!(err.state.as_deref(), Some("state-prompt"));
+    for prompt in ["none login", "none none"] {
+        let req = AuthorizationRequest::from_params(&map(&[
+            ("client_id", "rp-prompt"),
+            ("response_type", "code"),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("scope", "openid"),
+            ("state", "state-prompt"),
+            ("prompt", prompt),
+        ]))
+        .unwrap();
+        let err = op.validate_authorization_request(&req).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            grindvakt::OAuthErrorCode::InvalidRequest,
+            "prompt={prompt}"
+        );
+        assert_eq!(err.state.as_deref(), Some("state-prompt"));
+    }
 }
 
 /// Regression: the hybrid `code id_token` response type defaults to the

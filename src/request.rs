@@ -107,23 +107,23 @@ impl AuthorizationRequest {
 
     /// Validate the combinations constrained by OIDC Core for `prompt`.
     ///
-    /// `none` cannot be combined with a different value because it forbids UI
-    /// while every other standard value requests some form of interaction.
+    /// `none` must be the sole list entry because it forbids UI while every
+    /// other standard value requests some form of interaction.
     pub fn validate_prompt(&self) -> Result<(), OAuthError> {
         let Some(prompt) = self.prompt.as_deref() else {
             return Ok(());
         };
-        let mut values = prompt.split(' ').filter(|value| !value.is_empty());
-        if values.any(|value| value == "none")
-            && prompt
-                .split(' ')
-                .filter(|value| !value.is_empty())
-                .any(|value| value != "none")
-        {
-            return Err(OAuthError::invalid_request(
-                "prompt=none cannot be combined with other prompt values",
-            )
-            .with_state(self.state.clone()));
+        let mut value_count = 0;
+        let mut has_none = false;
+        for value in prompt.split(' ').filter(|value| !value.is_empty()) {
+            value_count += 1;
+            has_none |= value == "none";
+        }
+        if has_none && value_count != 1 {
+            return Err(
+                OAuthError::invalid_request("prompt=none must be the sole prompt value")
+                    .with_state(self.state.clone()),
+            );
         }
         Ok(())
     }
@@ -250,20 +250,16 @@ mod tests {
     }
 
     #[test]
-    fn prompt_none_cannot_be_combined_with_other_values() {
-        let req = AuthorizationRequest {
-            state: Some("state-1".into()),
-            prompt: Some("login none".into()),
-            ..Default::default()
-        };
-        let err = req.validate_prompt().unwrap_err();
-        assert_eq!(err.code, OAuthErrorCode::InvalidRequest);
-        assert_eq!(err.state.as_deref(), Some("state-1"));
-
-        let repeated_none = AuthorizationRequest {
-            prompt: Some("none none".into()),
-            ..Default::default()
-        };
-        repeated_none.validate_prompt().unwrap();
+    fn prompt_none_must_be_the_only_list_entry() {
+        for prompt in ["login none", "none none"] {
+            let req = AuthorizationRequest {
+                state: Some("state-1".into()),
+                prompt: Some(prompt.into()),
+                ..Default::default()
+            };
+            let err = req.validate_prompt().unwrap_err();
+            assert_eq!(err.code, OAuthErrorCode::InvalidRequest, "prompt={prompt}");
+            assert_eq!(err.state.as_deref(), Some("state-1"));
+        }
     }
 }
