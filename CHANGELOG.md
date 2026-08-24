@@ -2,6 +2,12 @@
 
 ## unreleased
 
+## 0.7.1 [2026-08-24]
+
+- Added exact, case-sensitive `AuthorizationRequest::has_prompt` handling and
+  authorization-request validation that rejects `prompt=none` when combined
+  with another prompt value, as required by OpenID Connect Core §3.1.2.1.
+
 ## 0.7.0 [2026-08-05]
 
 Security fixes from a completed audit (see ADR 0003–0007). Some are

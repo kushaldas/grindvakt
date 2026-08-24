@@ -94,6 +94,40 @@ impl AuthorizationRequest {
         self.scopes().contains(&"openid")
     }
 
+    /// Return whether `prompt` contains the exact, case-sensitive value.
+    ///
+    /// OpenID Connect defines `prompt` as a space-delimited list. Unknown
+    /// values are intentionally left to the caller: OIDC Core allows an OP to
+    /// ignore prompt values it does not understand.
+    pub fn has_prompt(&self, expected: &str) -> bool {
+        self.prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.split(' ').any(|value| value == expected))
+    }
+
+    /// Validate the combinations constrained by OIDC Core for `prompt`.
+    ///
+    /// `none` cannot be combined with a different value because it forbids UI
+    /// while every other standard value requests some form of interaction.
+    pub fn validate_prompt(&self) -> Result<(), OAuthError> {
+        let Some(prompt) = self.prompt.as_deref() else {
+            return Ok(());
+        };
+        let mut values = prompt.split(' ').filter(|value| !value.is_empty());
+        if values.any(|value| value == "none")
+            && prompt
+                .split(' ')
+                .filter(|value| !value.is_empty())
+                .any(|value| value != "none")
+        {
+            return Err(OAuthError::invalid_request(
+                "prompt=none cannot be combined with other prompt values",
+            )
+            .with_state(self.state.clone()));
+        }
+        Ok(())
+    }
+
     /// True if the response_type requests an authorization code.
     pub fn wants_code(&self) -> bool {
         self.response_type.split_whitespace().any(|t| t == "code")
@@ -200,5 +234,36 @@ mod tests {
             ..Default::default()
         };
         assert!(!explicit.use_fragment());
+    }
+
+    #[test]
+    fn prompt_values_are_exact_and_case_sensitive() {
+        let req = AuthorizationRequest {
+            prompt: Some("login consent".into()),
+            ..Default::default()
+        };
+        assert!(req.has_prompt("login"));
+        assert!(req.has_prompt("consent"));
+        assert!(!req.has_prompt("none"));
+        assert!(!req.has_prompt("Login"));
+        assert!(!req.has_prompt("log"));
+    }
+
+    #[test]
+    fn prompt_none_cannot_be_combined_with_other_values() {
+        let req = AuthorizationRequest {
+            state: Some("state-1".into()),
+            prompt: Some("login none".into()),
+            ..Default::default()
+        };
+        let err = req.validate_prompt().unwrap_err();
+        assert_eq!(err.code, OAuthErrorCode::InvalidRequest);
+        assert_eq!(err.state.as_deref(), Some("state-1"));
+
+        let repeated_none = AuthorizationRequest {
+            prompt: Some("none none".into()),
+            ..Default::default()
+        };
+        repeated_none.validate_prompt().unwrap();
     }
 }
