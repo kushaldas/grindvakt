@@ -1355,7 +1355,7 @@ async fn authorization_request_validates_prompt_none_combinations() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    for prompt in ["none", "login", "future_extension"] {
+    for prompt in ["none", "login", "future_extension", "None login"] {
         let req = AuthorizationRequest::from_params(&map(&[
             ("client_id", "rp-prompt"),
             ("response_type", "code"),
