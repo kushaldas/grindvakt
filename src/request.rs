@@ -100,9 +100,12 @@ impl AuthorizationRequest {
     /// values are intentionally left to the caller: OIDC Core allows an OP to
     /// ignore prompt values it does not understand.
     pub fn has_prompt(&self, expected: &str) -> bool {
-        self.prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.split(' ').any(|value| value == expected))
+        self.prompt.as_deref().is_some_and(|prompt| {
+            prompt
+                .split(' ')
+                .filter(|value| !value.is_empty())
+                .any(|value| value == expected)
+        })
     }
 
     /// Validate the combinations constrained by OIDC Core for `prompt`.
@@ -239,11 +242,12 @@ mod tests {
     #[test]
     fn prompt_values_are_exact_and_case_sensitive() {
         let req = AuthorizationRequest {
-            prompt: Some("login consent".into()),
+            prompt: Some(" login  consent ".into()),
             ..Default::default()
         };
         assert!(req.has_prompt("login"));
         assert!(req.has_prompt("consent"));
+        assert!(!req.has_prompt(""));
         assert!(!req.has_prompt("none"));
         assert!(!req.has_prompt("Login"));
         assert!(!req.has_prompt("log"));
