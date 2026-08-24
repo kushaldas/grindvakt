@@ -1336,6 +1336,59 @@ async fn implicit_and_hybrid_flows_require_nonce() {
     }
 }
 
+/// OIDC Core §3.1.2.1 forbids combining `prompt=none` with another
+/// prompt value. Unknown values on their own remain accepted because the OP
+/// is allowed to ignore extensions it does not understand.
+#[tokio::test]
+async fn authorization_request_validates_prompt_none_combinations() {
+    let client = Client {
+        client_id: "rp-prompt".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    for prompt in ["none", "login", "future_extension", "None login"] {
+        let req = AuthorizationRequest::from_params(&map(&[
+            ("client_id", "rp-prompt"),
+            ("response_type", "code"),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("scope", "openid"),
+            ("prompt", prompt),
+        ]))
+        .unwrap();
+        op.validate_authorization_request(&req)
+            .await
+            .unwrap_or_else(|e| panic!("prompt={prompt} should pass: {e}"));
+    }
+
+    for prompt in ["none login", "none none"] {
+        let req = AuthorizationRequest::from_params(&map(&[
+            ("client_id", "rp-prompt"),
+            ("response_type", "code"),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("scope", "openid"),
+            ("state", "state-prompt"),
+            ("prompt", prompt),
+        ]))
+        .unwrap();
+        let err = op.validate_authorization_request(&req).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            grindvakt::OAuthErrorCode::InvalidRequest,
+            "prompt={prompt}"
+        );
+        assert_eq!(err.state.as_deref(), Some("state-prompt"));
+    }
+}
+
 /// Regression: the hybrid `code id_token` response type defaults to the
 /// fragment response mode, so the id_token is not leaked in the URL query.
 #[tokio::test]

@@ -94,6 +94,43 @@ impl AuthorizationRequest {
         self.scopes().contains(&"openid")
     }
 
+    /// Return whether `prompt` contains the exact, case-sensitive value.
+    ///
+    /// OpenID Connect defines `prompt` as a space-delimited list. Unknown
+    /// values are intentionally left to the caller: OIDC Core allows an OP to
+    /// ignore prompt values it does not understand.
+    pub fn has_prompt(&self, expected: &str) -> bool {
+        self.prompt.as_deref().is_some_and(|prompt| {
+            prompt
+                .split(' ')
+                .filter(|value| !value.is_empty())
+                .any(|value| value == expected)
+        })
+    }
+
+    /// Validate the combinations constrained by OIDC Core for `prompt`.
+    ///
+    /// `none` must be the sole list entry because it forbids UI while every
+    /// other standard value requests some form of interaction.
+    pub fn validate_prompt(&self) -> Result<(), OAuthError> {
+        let Some(prompt) = self.prompt.as_deref() else {
+            return Ok(());
+        };
+        let mut value_count = 0;
+        let mut has_none = false;
+        for value in prompt.split(' ').filter(|value| !value.is_empty()) {
+            value_count += 1;
+            has_none |= value == "none";
+        }
+        if has_none && value_count != 1 {
+            return Err(
+                OAuthError::invalid_request("prompt=none must be the sole prompt value")
+                    .with_state(self.state.clone()),
+            );
+        }
+        Ok(())
+    }
+
     /// True if the response_type requests an authorization code.
     pub fn wants_code(&self) -> bool {
         self.response_type.split_whitespace().any(|t| t == "code")
@@ -200,5 +237,33 @@ mod tests {
             ..Default::default()
         };
         assert!(!explicit.use_fragment());
+    }
+
+    #[test]
+    fn prompt_values_are_exact_and_case_sensitive() {
+        let req = AuthorizationRequest {
+            prompt: Some(" login  consent ".into()),
+            ..Default::default()
+        };
+        assert!(req.has_prompt("login"));
+        assert!(req.has_prompt("consent"));
+        assert!(!req.has_prompt(""));
+        assert!(!req.has_prompt("none"));
+        assert!(!req.has_prompt("Login"));
+        assert!(!req.has_prompt("log"));
+    }
+
+    #[test]
+    fn prompt_none_must_be_the_only_list_entry() {
+        for prompt in ["login none", "none none"] {
+            let req = AuthorizationRequest {
+                state: Some("state-1".into()),
+                prompt: Some(prompt.into()),
+                ..Default::default()
+            };
+            let err = req.validate_prompt().unwrap_err();
+            assert_eq!(err.code, OAuthErrorCode::InvalidRequest, "prompt={prompt}");
+            assert_eq!(err.state.as_deref(), Some("state-1"));
+        }
     }
 }

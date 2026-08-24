@@ -293,6 +293,7 @@ impl Provider {
             return Err(OAuthError::invalid_request("redirect_uri not registered"));
         }
         req.validate_response_type()?;
+        req.validate_prompt()?;
         if !client.allows_response_type(&req.response_type) {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnauthorizedClient,
