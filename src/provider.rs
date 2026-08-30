@@ -351,7 +351,37 @@ impl Provider {
         external_claims: &BTreeMap<String, Vec<String>>,
         acr: Option<String>,
     ) -> Result<crate::http::Response, OAuthError> {
-        let claims = flatten_claims(external_claims);
+        self.authorization_redirect_with_claims(req, sub, external_claims, acr, &BTreeMap::new())
+    }
+
+    /// Like [`Self::authorization_redirect`], but also emits `extra_claims`:
+    /// typed id_token/userinfo claims the OP asserts on its own authority rather
+    /// than deriving from released user attributes — for example, which upstream
+    /// authority authenticated the user.
+    ///
+    /// Unlike `external_claims` (which [`flatten_claims`] renders, collapsing a
+    /// single value to a scalar), `extra_claims` keep their JSON type verbatim,
+    /// so an array stays an array even with one element. They overwrite any
+    /// released claim of the same name — the OP-asserted value wins over anything
+    /// an attribute map produced — and reserved registered claims (`iss`, `sub`,
+    /// …) are ignored, exactly as released claims are in [`Self::build_id_token`].
+    /// The values are sealed into the authorization code, so they survive the
+    /// code and refresh-token exchanges unchanged rather than being recomputed.
+    pub fn authorization_redirect_with_claims(
+        &self,
+        req: &AuthorizationRequest,
+        sub: &str,
+        external_claims: &BTreeMap<String, Vec<String>>,
+        acr: Option<String>,
+        extra_claims: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<crate::http::Response, OAuthError> {
+        let mut claims = flatten_claims(external_claims);
+        for (k, v) in extra_claims {
+            if is_reserved_id_token_claim(k) {
+                continue;
+            }
+            claims.insert(k.clone(), v.clone());
+        }
         let auth_time = now_secs();
         let mut out: Vec<(String, String)> = Vec::new();
 

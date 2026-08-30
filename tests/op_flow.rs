@@ -173,6 +173,107 @@ async fn authorization_code_pkce_flow() {
     assert_eq!(userinfo["email"], "anna@example.com");
 }
 
+/// `authorization_redirect_with_claims` emits OP-asserted typed claims that keep
+/// their JSON type through the code exchange: a single-element array stays an
+/// array (never collapsed to a scalar the way a released attribute would be), it
+/// overwrites a released claim of the same name, and a reserved registered claim
+/// is ignored.
+#[tokio::test]
+async fn extra_claims_keep_json_type_and_win_over_released() {
+    let client = Client {
+        client_id: "rp-1".into(),
+        client_secret: None,
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_NONE.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let challenge = pkce::s256_challenge(verifier);
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-1"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("nonce", "nonce-abc"),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&req).await.unwrap();
+
+    // A released attribute tries to set `authenticating_authority`; the
+    // OP-asserted extra claim must win, and its array shape must survive.
+    let mut released: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    released.insert(
+        "authenticating_authority".into(),
+        vec!["https://spoofed.example".into()],
+    );
+    let mut extra: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    extra.insert(
+        "authenticating_authority".into(),
+        serde_json::json!(["https://idp.example.org"]),
+    );
+    // A reserved claim in `extra` must be ignored, not overwrite `sub`.
+    extra.insert("sub".into(), serde_json::json!("attacker"));
+
+    let redirect = op
+        .authorization_redirect_with_claims(&req, "subject-123", &released, None, &extra)
+        .unwrap();
+    let location = redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let code = extract_param(&location, "code").unwrap();
+
+    let token_resp = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-1"),
+                ("code_verifier", verifier),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .expect("token exchange");
+
+    let id_token = token_resp.id_token.clone().unwrap();
+    let jwks = op.jwks_document();
+    let validation = jose_rs::jwt::Validation::new()
+        .with_issuer("https://op.example.com")
+        .with_audience("rp-1");
+    let id_claims = jose_rs::jwt::decode_with_jwkset(&jwks, &id_token, &validation).unwrap();
+
+    // Subject is the real one — a reserved `extra` claim cannot rewrite it.
+    assert_eq!(id_claims.sub.as_deref(), Some("subject-123"));
+    // The OP-asserted value wins over the released one, and stays a JSON array.
+    assert_eq!(
+        id_claims.extra.get("authenticating_authority"),
+        Some(&serde_json::json!(["https://idp.example.org"])),
+        "extra claim must overwrite the released claim and remain an array"
+    );
+
+    // It reaches userinfo too, still an array.
+    let userinfo = op.userinfo(&token_resp.access_token, None).await.unwrap();
+    assert_eq!(
+        userinfo["authenticating_authority"],
+        serde_json::json!(["https://idp.example.org"])
+    );
+}
+
 #[tokio::test]
 async fn refresh_token_grant_flow() {
     // Confidential client registered for the refresh_token grant.
