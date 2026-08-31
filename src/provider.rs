@@ -1150,7 +1150,7 @@ fn client_allows_refresh(client: &Client) -> bool {
 fn is_reserved_id_token_claim(name: &str) -> bool {
     matches!(
         name,
-        "iss" | "sub" | "aud" | "exp" | "iat" | "nbf" | "jti" | "nonce" | "auth_time"
+        "iss" | "sub" | "aud" | "exp" | "iat" | "nbf" | "jti" | "nonce" | "auth_time" | "acr"
     )
 }
 
