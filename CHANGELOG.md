@@ -2,6 +2,14 @@
 
 ## unreleased
 
+## 0.7.2 [2026-08-31]
+
+- Added `Provider::authorization_redirect_with_claims` for OP-asserted claims
+  that preserve their JSON types and take precedence over released attributes.
+  Reserved ID-token claims, including the canonical `acr`, cannot be overridden,
+  and typed claims are preserved across authorization-code, refresh-token, and
+  rotated-refresh exchanges and in UserInfo responses.
+
 ## 0.7.1 [2026-08-24]
 
 - Added exact, case-sensitive `AuthorizationRequest::has_prompt` handling and
