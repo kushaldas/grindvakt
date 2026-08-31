@@ -173,6 +173,172 @@ async fn authorization_code_pkce_flow() {
     assert_eq!(userinfo["email"], "anna@example.com");
 }
 
+/// `authorization_redirect_with_claims` emits OP-asserted typed claims that keep
+/// their JSON type through code and refresh exchanges: a single-element array
+/// stays an array (never collapsed to a scalar the way a released attribute
+/// would be), it overwrites a released claim of the same name, and reserved
+/// registered claims are ignored.
+#[tokio::test]
+async fn extra_claims_keep_json_type_and_win_over_released() {
+    let client = Client {
+        client_id: "rp-1".into(),
+        client_secret: None,
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        token_endpoint_auth_method: AUTH_NONE.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let challenge = pkce::s256_challenge(verifier);
+    let req = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-1"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("nonce", "nonce-abc"),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&req).await.unwrap();
+
+    // A released attribute tries to set `authenticating_authority`; the
+    // OP-asserted extra claim must win, and its array shape must survive.
+    let mut released: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    released.insert(
+        "authenticating_authority".into(),
+        vec!["https://spoofed.example".into()],
+    );
+    let mut extra: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    extra.insert(
+        "authenticating_authority".into(),
+        serde_json::json!(["https://idp.example.org"]),
+    );
+    // Reserved claims in `extra` must not overwrite their canonical values.
+    extra.insert("sub".into(), serde_json::json!("attacker"));
+    extra.insert(
+        "acr".into(),
+        serde_json::json!(["urn:acr:attacker-controlled-wrong-type"]),
+    );
+
+    let redirect = op
+        .authorization_redirect_with_claims(
+            &req,
+            "subject-123",
+            &released,
+            Some("urn:acr:trusted".into()),
+            &extra,
+        )
+        .unwrap();
+    let location = redirect
+        .headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let code = extract_param(&location, "code").unwrap();
+
+    let token_resp = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "rp-1"),
+                ("code_verifier", verifier),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .expect("token exchange");
+
+    let id_token = token_resp.id_token.clone().unwrap();
+    let jwks = op.jwks_document();
+    let validation = jose_rs::jwt::Validation::new()
+        .with_issuer("https://op.example.com")
+        .with_audience("rp-1");
+    let assert_id_token_claims = |token: &str| {
+        let claims = jose_rs::jwt::decode_with_jwkset(&jwks, token, &validation).unwrap();
+        // Reserved extra claims cannot rewrite canonical values.
+        assert_eq!(claims.sub.as_deref(), Some("subject-123"));
+        assert_eq!(
+            claims.extra.get("acr").and_then(|value| value.as_str()),
+            Some("urn:acr:trusted")
+        );
+        // The OP-asserted value wins over the released one and remains an array.
+        assert_eq!(
+            claims.extra.get("authenticating_authority"),
+            Some(&serde_json::json!(["https://idp.example.org"])),
+            "extra claim must overwrite the released claim and remain an array"
+        );
+    };
+    assert_id_token_claims(&id_token);
+
+    // It reaches userinfo too, still an array.
+    let userinfo = op.userinfo(&token_resp.access_token, None).await.unwrap();
+    assert_eq!(
+        userinfo["authenticating_authority"],
+        serde_json::json!(["https://idp.example.org"])
+    );
+    assert!(userinfo.get("acr").is_none());
+
+    // The typed claim and canonical ACR survive refresh and token rotation.
+    let refresh = token_resp.refresh_token.expect("refresh token issued");
+    let refreshed = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "rp-1"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .expect("refresh exchange");
+    assert_id_token_claims(refreshed.id_token.as_deref().unwrap());
+    let refreshed_userinfo = op.userinfo(&refreshed.access_token, None).await.unwrap();
+    assert_eq!(
+        refreshed_userinfo["authenticating_authority"],
+        serde_json::json!(["https://idp.example.org"])
+    );
+    assert!(refreshed_userinfo.get("acr").is_none());
+
+    let rotated = refreshed.refresh_token.expect("rotated refresh token");
+    let refreshed_again = op
+        .handle_token_request(
+            &map(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &rotated),
+                ("client_id", "rp-1"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .expect("rotated refresh exchange");
+    assert_id_token_claims(refreshed_again.id_token.as_deref().unwrap());
+    let refreshed_again_userinfo = op
+        .userinfo(&refreshed_again.access_token, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed_again_userinfo["authenticating_authority"],
+        serde_json::json!(["https://idp.example.org"])
+    );
+    assert!(refreshed_again_userinfo.get("acr").is_none());
+}
+
 #[tokio::test]
 async fn refresh_token_grant_flow() {
     // Confidential client registered for the refresh_token grant.
