@@ -288,6 +288,17 @@ fn is_loopback_host(host: &str) -> bool {
 /// Require an absolute HTTPS endpoint. Plain HTTP is supported only for
 /// loopback development servers, matching the issuer exception.
 pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
+    // The URL parser discards some raw whitespace and control characters.
+    // Reject them first because callers send or return the original string,
+    // and validation must describe the same bytes that reach the sink.
+    if endpoint
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(Error::BadRequest(format!(
+            "{name} must not contain whitespace or control characters"
+        )));
+    }
     let parsed = url::Url::parse(endpoint)
         .map_err(|e| Error::BadRequest(format!("invalid {name} URL {endpoint}: {e}")))?;
     let scheme_ok = parsed.scheme() == "https"
@@ -642,6 +653,62 @@ mod tests {
             jwks_uri: None,
         };
         (client, provider, key)
+    }
+
+    #[test]
+    fn service_endpoints_reject_raw_whitespace_and_controls() {
+        for endpoint in [
+            "https://op.example.\torg/token",
+            "ht\ntps://op.example.org/token",
+            " https://op.example.org/token",
+            "https://op.example.org/token\x1f",
+            "https://op.example.org/token\r\nX-Test: injected",
+        ] {
+            assert!(
+                validate_service_endpoint("token_endpoint", endpoint).is_err(),
+                "unsafe raw endpoint must be rejected: {endpoint:?}"
+            );
+        }
+
+        // Encoded octets do not create a parser/use mismatch, and the existing
+        // endpoint query and loopback-development policies remain unchanged.
+        for endpoint in [
+            "https://op.example.org/token?label=hello%20world",
+            "https://op.example.org/%09/%0A",
+            "http://localhost:8080/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+        ] {
+            validate_service_endpoint("token_endpoint", endpoint)
+                .unwrap_or_else(|error| panic!("valid endpoint {endpoint:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn provider_info_rejects_controls_in_every_endpoint_field() {
+        let (_, provider, _) = client_and_provider();
+        for field in [
+            "issuer",
+            "authorization_endpoint",
+            "token_endpoint",
+            "userinfo_endpoint",
+            "jwks_uri",
+        ] {
+            let mut contaminated = provider.clone();
+            let endpoint = "https://op.example.org/path\r\nX-Test: injected".to_string();
+            match field {
+                "issuer" => contaminated.issuer = endpoint,
+                "authorization_endpoint" => contaminated.authorization_endpoint = endpoint,
+                "token_endpoint" => contaminated.token_endpoint = endpoint,
+                "userinfo_endpoint" => contaminated.userinfo_endpoint = Some(endpoint),
+                "jwks_uri" => contaminated.jwks_uri = Some(endpoint),
+                _ => unreachable!(),
+            }
+            assert!(
+                contaminated.validate().is_err(),
+                "unsafe {field} must be rejected"
+            );
+        }
     }
 
     #[test]
