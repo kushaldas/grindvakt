@@ -58,8 +58,9 @@ impl AuthorizationRequest {
         Self::from_params(&unique)
     }
 
-    /// Parse from a flat parameter map (query string or merged request object).
-    pub fn from_params(params: &BTreeMap<String, String>) -> Result<Self, OAuthError> {
+    /// Parse the internal single-valued representation after the public
+    /// ordered-pair boundary has rejected duplicate parameters.
+    fn from_params(params: &BTreeMap<String, String>) -> Result<Self, OAuthError> {
         let get = |k: &str| params.get(k).cloned();
 
         let client_id =

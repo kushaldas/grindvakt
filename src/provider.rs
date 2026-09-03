@@ -558,16 +558,7 @@ impl Provider {
 
     // ── Token endpoint ──────────────────────────────────────────────────
 
-    /// Handle a token request. `auth_header` is the raw Authorization header
-    /// value; `token_url` is this endpoint's absolute URL (for `private_key_jwt`
-    /// audience checking).
-    ///
-    /// `dpop` is an already-validated DPoP proof (RFC 9449) for this request, if
-    /// the client presented one — validate it in the web layer with
-    /// [`crate::dpop::validate_proof`] and thread the result here. When present
-    /// the issued access token is sender-constrained (`token_type: DPoP`,
-    /// `cnf.jkt` bound to the proof key).
-    pub async fn handle_token_request(
+    async fn handle_token_request_map(
         &self,
         form: &BTreeMap<String, String>,
         auth_header: Option<&str>,
@@ -598,9 +589,13 @@ impl Provider {
         }
     }
 
-    /// Handle an ordered token request and reject duplicate parameters before
-    /// converting it to the single-valued representation used internally.
-    pub async fn handle_token_request_pairs(
+    /// Handle an ordered token request, rejecting duplicate parameters before
+    /// any grant selection or client-authentication precedence is applied.
+    ///
+    /// `auth_header` is the raw Authorization header value; `token_url` is this
+    /// endpoint's absolute configured URL for `private_key_jwt` audience
+    /// checking. `dpop` is an already-validated proof from the web layer.
+    pub async fn handle_token_request(
         &self,
         form: &[(String, String)],
         auth_header: Option<&str>,
@@ -608,7 +603,7 @@ impl Provider {
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
         let form = unique_parameters(form)?;
-        self.handle_token_request(&form, auth_header, token_url, dpop)
+        self.handle_token_request_map(&form, auth_header, token_url, dpop)
             .await
     }
 
@@ -629,7 +624,7 @@ impl Provider {
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
         let client = self
-            .authenticate_client(form, auth_header, token_url)
+            .authenticate_client_map(form, auth_header, token_url)
             .await?;
 
         // The client must be registered for the authorization_code grant
@@ -774,7 +769,7 @@ impl Provider {
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
         let client = self
-            .authenticate_client(form, auth_header, token_url)
+            .authenticate_client_map(form, auth_header, token_url)
             .await?;
 
         // RFC 6749 §4.4: client_credentials is for confidential clients only. A
@@ -866,7 +861,7 @@ impl Provider {
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
         let client = self
-            .authenticate_client(form, auth_header, token_url)
+            .authenticate_client_map(form, auth_header, token_url)
             .await?;
 
         if !client_allows_refresh(&client) {
@@ -1079,8 +1074,7 @@ impl Provider {
 
     // ── Client authentication ───────────────────────────────────────────
 
-    /// Authenticate the token-endpoint client across the supported methods.
-    pub async fn authenticate_client(
+    async fn authenticate_client_map(
         &self,
         form: &BTreeMap<String, String>,
         auth_header: Option<&str>,
@@ -1128,16 +1122,17 @@ impl Provider {
         Err(OAuthError::invalid_client("client authentication required"))
     }
 
-    /// Authenticate an ordered form while rejecting duplicate credentials and
-    /// protocol parameters before client-authentication precedence is applied.
-    pub async fn authenticate_client_pairs(
+    /// Authenticate a token-endpoint client from an ordered form, rejecting
+    /// duplicate credentials and protocol parameters before authentication
+    /// precedence is applied.
+    pub async fn authenticate_client(
         &self,
         form: &[(String, String)],
         auth_header: Option<&str>,
         token_url: &str,
     ) -> Result<Client, OAuthError> {
         let form = unique_parameters(form)?;
-        self.authenticate_client(&form, auth_header, token_url)
+        self.authenticate_client_map(&form, auth_header, token_url)
             .await
     }
 
@@ -1791,14 +1786,13 @@ mod tests {
         header.kid = key.kid().map(str::to_string);
         let assertion = jose_rs::jwt::encode(key.signer(), &header, &claims).unwrap();
 
-        let form: BTreeMap<String, String> = [
+        let form = vec![
             (
                 "client_assertion_type".to_string(),
                 CLIENT_ASSERTION_TYPE.to_string(),
             ),
             ("client_assertion".to_string(), assertion),
-        ]
-        .into();
+        ];
         op.authenticate_client(&form, None, token_url)
             .await
             .expect("assertion authenticates");

@@ -505,7 +505,9 @@ pub fn verify_id_token(
                 )));
             }
         }
-        if claims.extra.get("azp").and_then(|value| value.as_str()) != Some(client_id) {
+        if values.len() > 1
+            && claims.extra.get("azp").and_then(|value| value.as_str()) != Some(client_id)
+        {
             return Err(Error::Authn(
                 "multi-audience id_token requires azp equal to client_id".into(),
             ));
@@ -962,5 +964,51 @@ mod tests {
             &[],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn verify_id_token_accepts_single_element_array_audience_without_azp() {
+        let (_client, _provider, key) = client_and_provider();
+        let jwks = key.to_public_jwks();
+        let now = now_secs();
+        let client_id = "https://rp.example.com";
+
+        let mut claims = Claims {
+            iss: Some("https://op.example.org".into()),
+            sub: Some("subject".into()),
+            aud: Some(Audience::Multiple(vec![client_id.into()])),
+            iat: Some(now),
+            exp: Some(now + 300),
+            ..Default::default()
+        };
+        let token = jwt::sign(&key, &claims, None).unwrap();
+        verify_id_token(
+            &jwks,
+            &token,
+            "https://op.example.org",
+            client_id,
+            None,
+            &[JwsAlgorithm::ES256],
+            &[],
+        )
+        .expect("a one-element aud array does not require azp");
+
+        // An azp claim is optional for one audience, but still must identify
+        // this client when the issuer includes it.
+        claims.extra.insert("azp".into(), "another-client".into());
+        let token = jwt::sign(&key, &claims, None).unwrap();
+        assert!(
+            verify_id_token(
+                &jwks,
+                &token,
+                "https://op.example.org",
+                client_id,
+                None,
+                &[JwsAlgorithm::ES256],
+                &[],
+            )
+            .is_err(),
+            "a supplied azp must match client_id"
+        );
     }
 }

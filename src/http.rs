@@ -15,9 +15,17 @@ pub struct HttpRequestData {
     pub method: String,
     /// Full request URI (scheme://host/path?query) when available.
     pub uri: String,
-    /// Query-string parameters.
+    /// Ordered query-string parameters. Protocol parsers must consume this
+    /// representation so duplicate names remain visible for rejection.
+    pub query_pairs: Vec<(String, String)>,
+    /// Convenience query map for non-protocol application lookups. Duplicate
+    /// names have already been flattened; do not use it at a protocol boundary.
     pub query: BTreeMap<String, String>,
-    /// Parsed form body parameters (application/x-www-form-urlencoded).
+    /// Ordered form body parameters. Token endpoint handlers must consume this
+    /// representation so duplicate names remain visible for rejection.
+    pub form_pairs: Vec<(String, String)>,
+    /// Convenience form map for non-protocol application lookups. Duplicate
+    /// names have already been flattened; do not use it at a protocol boundary.
     pub form: BTreeMap<String, String>,
     /// Raw request body.
     pub body: Vec<u8>,
@@ -28,7 +36,9 @@ pub struct HttpRequestData {
 }
 
 impl HttpRequestData {
-    /// Look up a parameter from the query string first, then the form body.
+    /// Look up a convenience parameter from the flattened query/form maps.
+    /// Protocol handlers must instead pass `query_pairs` or `form_pairs` to
+    /// their duplicate-rejecting entry points.
     pub fn param(&self, key: &str) -> Option<&str> {
         self.query
             .get(key)

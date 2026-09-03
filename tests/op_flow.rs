@@ -74,8 +74,8 @@ fn provider_with(clients: InMemoryClientStore) -> Provider {
     )
 }
 
-fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs
+fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+    entries
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
@@ -106,6 +106,42 @@ fn es384_token_hash(value: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
 }
 
+/// Public token-endpoint entry points must retain the ordered representation
+/// until duplicate names have been rejected. Otherwise converting the form to
+/// a map first would silently choose one attacker-controlled value.
+#[tokio::test]
+async fn token_endpoint_public_boundaries_reject_duplicate_parameters() {
+    let op = provider_with(InMemoryClientStore::new());
+    let token_url = "https://op.example.com/token";
+
+    let error = op
+        .handle_token_request(
+            &pairs(&[
+                ("grant_type", "client_credentials"),
+                ("grant_type", "authorization_code"),
+            ]),
+            None,
+            token_url,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, grindvakt::OAuthErrorCode::InvalidRequest);
+
+    let error = op
+        .authenticate_client(
+            &pairs(&[
+                ("client_id", "first-client"),
+                ("client_id", "second-client"),
+            ]),
+            None,
+            token_url,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, grindvakt::OAuthErrorCode::InvalidRequest);
+}
+
 #[tokio::test]
 async fn authorization_code_pkce_flow() {
     // Public client using PKCE (auth method "none").
@@ -127,7 +163,7 @@ async fn authorization_code_pkce_flow() {
     let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
 
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-1"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -166,7 +202,7 @@ async fn authorization_code_pkce_flow() {
     // Token exchange with PKCE verifier.
     let token_resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -185,7 +221,7 @@ async fn authorization_code_pkce_flow() {
 
     let replay = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -249,7 +285,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
 
     let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-1"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -300,7 +336,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
 
     let token_resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -348,7 +384,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
     let refresh = token_resp.refresh_token.expect("refresh token issued");
     let refreshed = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
                 ("client_id", "rp-1"),
@@ -370,7 +406,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
     let rotated = refreshed.refresh_token.expect("rotated refresh token");
     let refreshed_again = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &rotated),
                 ("client_id", "rp-1"),
@@ -411,7 +447,7 @@ async fn refresh_token_grant_flow() {
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
     // Authorization code (no PKCE; confidential client).
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-conf"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -438,7 +474,7 @@ async fn refresh_token_grant_flow() {
     // Code exchange returns a refresh token.
     let token_resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -459,7 +495,7 @@ async fn refresh_token_grant_flow() {
     // Refresh, narrowing scope to a subset of the original grant.
     let refreshed = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
                 ("scope", "openid"),
@@ -492,7 +528,7 @@ async fn refresh_token_grant_flow() {
 
     let old_replay = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
                 ("client_id", "rp-conf"),
@@ -526,7 +562,7 @@ async fn refresh_token_grant_flow() {
     // mixed with otherwise-valid scopes.
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &rotated),
                 ("scope", "openid admin"),
@@ -543,7 +579,7 @@ async fn refresh_token_grant_flow() {
 
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &rotated),
                 ("scope", "admin"),
@@ -574,7 +610,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-dpop"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -596,7 +632,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
     let original_proof = validated_dpop_proof().await;
     let token_resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -619,7 +655,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
 
     let missing_proof = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
                 ("client_id", "rp-dpop"),
@@ -639,7 +675,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
     let wrong_proof = validated_dpop_proof().await;
     let wrong_key = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
                 ("client_id", "rp-dpop"),
@@ -655,7 +691,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
 
     let refreshed = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
                 ("client_id", "rp-dpop"),
@@ -698,7 +734,7 @@ async fn refresh_token_denied_when_grant_not_registered() {
 
     let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-1"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -721,7 +757,7 @@ async fn refresh_token_denied_when_grant_not_registered() {
 
     let token_resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -741,7 +777,7 @@ async fn refresh_token_denied_when_grant_not_registered() {
 
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", "anything"),
                 ("client_id", "rp-1"),
@@ -772,7 +808,7 @@ async fn pkce_mismatch_rejected() {
 
     let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-1"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -795,7 +831,7 @@ async fn pkce_mismatch_rejected() {
 
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("client_id", "rp-1"),
@@ -828,7 +864,7 @@ async fn public_code_flow_requires_s256_pkce() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-public"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -842,7 +878,7 @@ async fn public_code_flow_requires_s256_pkce() {
     // spelling of a 32-byte digest. It can never match the canonical S256
     // output computed from a verifier and must fail before a code is minted.
     let noncanonical_challenge = format!("{}B", "A".repeat(42));
-    let noncanonical = AuthorizationRequest::from_params(&map(&[
+    let noncanonical = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-public"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -883,7 +919,7 @@ async fn confidential_code_flow_validates_supplied_pkce_tuple() {
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
-    let base = AuthorizationRequest::from_params(&map(&[
+    let base = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-confidential-pkce"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -952,7 +988,7 @@ async fn private_key_jwt_client_auth() {
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
     // Issue a code (no PKCE).
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-fed"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -978,7 +1014,7 @@ async fn private_key_jwt_client_auth() {
 
     let token_resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -1002,7 +1038,7 @@ async fn private_key_jwt_client_auth() {
     .unwrap();
     let err = op
         .authenticate_client(
-            &map(&[
+            &pairs(&[
                 ("client_assertion_type", CLIENT_ASSERTION_TYPE),
                 ("client_assertion", &bad_assertion),
             ]),
@@ -1036,7 +1072,7 @@ async fn client_credentials_flow() {
     // Request a subset of the allowed scopes (the disallowed "delete" is dropped).
     let resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", "svc-1"),
                 ("client_secret", "svc-secret"),
@@ -1084,7 +1120,7 @@ async fn client_credentials_disallowed_grant_rejected() {
 
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", "svc-2"),
                 ("client_secret", "s"),
@@ -1118,7 +1154,7 @@ async fn client_credentials_empty_scope_intersection_rejected() {
 
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", "svc-3"),
                 ("client_secret", "s"),
@@ -1155,7 +1191,7 @@ async fn client_credentials_public_client_rejected() {
 
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", "pub-svc"),
             ]),
@@ -1190,7 +1226,7 @@ async fn client_credentials_dpop_bound() {
     let proof = validated_dpop_proof().await;
     let resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", "svc-4"),
                 ("client_secret", "s"),
@@ -1230,7 +1266,7 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
 
     let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-sub"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1261,7 +1297,7 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
 
     let token_resp = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),
@@ -1343,7 +1379,7 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
     let no_exp = jose_rs::jwt::encode(client_key.signer(), &header, &claims).unwrap();
     let err = op
         .authenticate_client(
-            &map(&[
+            &pairs(&[
                 ("client_assertion_type", CLIENT_ASSERTION_TYPE),
                 ("client_assertion", &no_exp),
             ]),
@@ -1372,7 +1408,7 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
     let no_iat = jose_rs::jwt::encode(client_key.signer(), &header, &claims).unwrap();
     let err = op
         .authenticate_client(
-            &map(&[
+            &pairs(&[
                 ("client_assertion_type", CLIENT_ASSERTION_TYPE),
                 ("client_assertion", &no_iat),
             ]),
@@ -1390,7 +1426,7 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
     // A valid assertion authenticates once...
     let assertion =
         grindvakt::rp::build_client_assertion(&client_key, "rp-pkj", token_url).unwrap();
-    let form = map(&[
+    let form = pairs(&[
         ("client_assertion_type", CLIENT_ASSERTION_TYPE),
         ("client_assertion", &assertion),
     ]);
@@ -1448,7 +1484,7 @@ async fn private_key_jwt_max_age_is_configurable() {
     let mut header = jose_rs::JoseHeader::for_alg(client_key.alg());
     header.kid = client_key.kid().map(str::to_string);
     let assertion = jose_rs::jwt::encode(client_key.signer(), &header, &claims).unwrap();
-    let form = map(&[
+    let form = pairs(&[
         ("client_assertion_type", CLIENT_ASSERTION_TYPE),
         ("client_assertion", &assertion),
     ]);
@@ -1488,7 +1524,7 @@ async fn authorization_request_scope_checked_against_registered_scope() {
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
     // A subset of the registered scope is fine.
-    let ok = AuthorizationRequest::from_params(&map(&[
+    let ok = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-scope"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1499,7 +1535,7 @@ async fn authorization_request_scope_checked_against_registered_scope() {
 
     // Any scope outside the registered set is rejected, even when mixed with
     // valid scopes.
-    let excess = AuthorizationRequest::from_params(&map(&[
+    let excess = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-scope"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1532,7 +1568,7 @@ async fn client_without_registered_scope_is_unrestricted() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-noscope"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1575,7 +1611,7 @@ async fn authorization_request_rejects_malformed_registered_redirect_uri() {
         "https://rp.example/cb\tignored",
         "\nhttps://rp.example/cb",
     ] {
-        let malformed = AuthorizationRequest::from_params(&map(&[
+        let malformed = AuthorizationRequest::from_pairs(&pairs(&[
             ("client_id", "rp-redirect"),
             ("response_type", "code"),
             ("redirect_uri", redirect_uri),
@@ -1593,7 +1629,7 @@ async fn authorization_request_rejects_malformed_registered_redirect_uri() {
         );
     }
 
-    let native = AuthorizationRequest::from_params(&map(&[
+    let native = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-redirect"),
         ("response_type", "code"),
         ("redirect_uri", "com.example.app:/callback"),
@@ -1629,7 +1665,7 @@ async fn presented_auth_method_must_match_registered_method() {
     // client is registered for client_secret_basic only.
     let err = op
         .authenticate_client(
-            &map(&[("client_id", "rp-basic"), ("client_secret", "topsecret")]),
+            &pairs(&[("client_id", "rp-basic"), ("client_secret", "topsecret")]),
             None,
             "https://op.example.com/token",
         )
@@ -1641,7 +1677,7 @@ async fn presented_auth_method_must_match_registered_method() {
     let b64 = base64::engine::general_purpose::STANDARD.encode("rp-basic:topsecret");
     let header = format!("Basic {b64}");
     op.authenticate_client(
-        &map(&[("client_id", "rp-basic")]),
+        &pairs(&[("client_id", "rp-basic")]),
         Some(&header),
         "https://op.example.com/token",
     )
@@ -1672,7 +1708,7 @@ async fn implicit_and_hybrid_flows_require_nonce() {
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
     for response_type in ["id_token token", "code id_token"] {
-        let req = AuthorizationRequest::from_params(&map(&[
+        let req = AuthorizationRequest::from_pairs(&pairs(&[
             ("client_id", "rp-implicit"),
             ("response_type", response_type),
             ("redirect_uri", "https://rp.example.com/cb"),
@@ -1686,7 +1722,7 @@ async fn implicit_and_hybrid_flows_require_nonce() {
             "{response_type} without nonce must be rejected"
         );
 
-        let req = AuthorizationRequest::from_params(&map(&[
+        let req = AuthorizationRequest::from_pairs(&pairs(&[
             ("client_id", "rp-implicit"),
             ("response_type", response_type),
             ("redirect_uri", "https://rp.example.com/cb"),
@@ -1701,7 +1737,7 @@ async fn implicit_and_hybrid_flows_require_nonce() {
 
     // OIDC Core section 3.3.2.1 explicitly makes nonce optional for this
     // hybrid response type because no ID token is returned at this endpoint.
-    let code_token = AuthorizationRequest::from_params(&map(&[
+    let code_token = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-implicit"),
         ("response_type", "code token"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1733,7 +1769,7 @@ async fn authorization_request_validates_prompt_none_combinations() {
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
     for prompt in ["none", "login", "future_extension", "None login"] {
-        let req = AuthorizationRequest::from_params(&map(&[
+        let req = AuthorizationRequest::from_pairs(&pairs(&[
             ("client_id", "rp-prompt"),
             ("response_type", "code"),
             ("redirect_uri", "https://rp.example.com/cb"),
@@ -1747,7 +1783,7 @@ async fn authorization_request_validates_prompt_none_combinations() {
     }
 
     for prompt in ["none login", "none none"] {
-        let req = AuthorizationRequest::from_params(&map(&[
+        let req = AuthorizationRequest::from_pairs(&pairs(&[
             ("client_id", "rp-prompt"),
             ("response_type", "code"),
             ("redirect_uri", "https://rp.example.com/cb"),
@@ -1784,7 +1820,7 @@ async fn hybrid_flow_defaults_to_fragment_response_mode() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-hybrid"),
         ("response_type", "code id_token"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1852,7 +1888,7 @@ async fn front_channel_id_token_hashes_bind_emitted_artifacts() {
         ("code id_token", true, false),
         ("code id_token token", true, true),
     ] {
-        let req = AuthorizationRequest::from_params(&map(&[
+        let req = AuthorizationRequest::from_pairs(&pairs(&[
             ("client_id", "rp-hashes"),
             ("response_type", response_type),
             ("redirect_uri", "https://rp.example.com/cb"),
@@ -1922,7 +1958,7 @@ async fn token_request_must_echo_redirect_uri() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-redir"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1944,7 +1980,7 @@ async fn token_request_must_echo_redirect_uri() {
     // No redirect_uri echoed at all -> invalid_grant.
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("client_id", "rp-redir"),
@@ -1978,7 +2014,7 @@ async fn authorization_code_grant_must_be_registered() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let req = AuthorizationRequest::from_params(&map(&[
+    let req = AuthorizationRequest::from_pairs(&pairs(&[
         ("client_id", "rp-nogrant"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
@@ -1999,7 +2035,7 @@ async fn authorization_code_grant_must_be_registered() {
 
     let err = op
         .handle_token_request(
-            &map(&[
+            &pairs(&[
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("redirect_uri", "https://rp.example.com/cb"),

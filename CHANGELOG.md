@@ -10,12 +10,17 @@
 - Hardened RP validation with exact issuer matching, safe endpoint policy,
   mandatory token-response fields, explicit signing-algorithm and audience
   policy, `azp` validation, public-client PKCE, and UserInfo subject binding.
-- Duplicate protocol parameters and reserved authorization extras are rejected;
+- **Breaking:** Public authorization and token-endpoint parsers now require
+  ordered parameter pairs so duplicate protocol parameters cannot be erased by
+  a map before validation. Reserved authorization extras are also rejected;
   authorization errors preserve the validated response mode.
 - Malformed registered redirect URIs and RP/federation service endpoints with
   raw whitespace or control characters are rejected, every supplied PKCE tuple
   must use canonical S256, and narrowed refresh grants remove standard claims
   for scopes the client dropped.
+- RP ID-token validation accepts a one-element JSON array in `aud` without
+  requiring `azp`, while retaining `azp` and trust checks for multiple
+  audiences and for any explicitly supplied `azp` claim.
 - DPoP always fails closed without an atomic replay store, and `DpopProof` is
   opaque so only validation can create it.
 - **Breaking:** `Provider::new` now requires an explicit `TokenUseStore`, and
