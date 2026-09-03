@@ -11,9 +11,10 @@ use crate::metadata::ProviderMetadata;
 use crate::oauth_error::urlencode;
 use crate::provider::CLIENT_ASSERTION_TYPE;
 use crate::util::now_secs;
+use jose_rs::algorithm::JwsAlgorithm;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Audience, Claims, Validation};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Minimal upstream provider info the RP needs.
@@ -35,6 +36,23 @@ impl From<ProviderMetadata> for ProviderInfo {
             userinfo_endpoint: Some(m.userinfo_endpoint),
             jwks_uri: Some(m.jwks_uri),
         }
+    }
+}
+
+impl ProviderInfo {
+    /// Validate every endpoint before it can receive requests or credentials.
+    pub fn validate(&self) -> Result<()> {
+        validate_issuer(&self.issuer)?;
+        validate_service_endpoint("authorization_endpoint", &self.authorization_endpoint)?;
+        validate_authorization_endpoint_query(&self.authorization_endpoint)?;
+        validate_service_endpoint("token_endpoint", &self.token_endpoint)?;
+        if let Some(endpoint) = self.userinfo_endpoint.as_deref() {
+            validate_service_endpoint("userinfo_endpoint", endpoint)?;
+        }
+        if let Some(endpoint) = self.jwks_uri.as_deref() {
+            validate_service_endpoint("jwks_uri", endpoint)?;
+        }
+        Ok(())
     }
 }
 
@@ -60,9 +78,9 @@ pub struct RpClient {
 /// The result of a successful token exchange.
 #[derive(Debug, Clone)]
 pub struct TokenSet {
-    pub access_token: Option<String>,
-    pub id_token: Option<String>,
-    pub token_type: Option<String>,
+    pub access_token: String,
+    pub id_token: String,
+    pub token_type: String,
     pub raw: serde_json::Value,
 }
 
@@ -74,7 +92,29 @@ pub fn authorization_url(
     nonce: &str,
     code_challenge: Option<&str>,
     extra: &[(&str, &str)],
-) -> String {
+) -> Result<String> {
+    provider.validate()?;
+    validate_redirect_uri(&client.redirect_uri)?;
+    if !client
+        .scope
+        .split_whitespace()
+        .any(|scope| scope == "openid")
+    {
+        return Err(Error::BadRequest(
+            "OIDC authorization requests require the openid scope".into(),
+        ));
+    }
+    if matches!(&client.auth, ClientAuth::None) && code_challenge.is_none() {
+        return Err(Error::BadRequest(
+            "public clients must use S256 PKCE".into(),
+        ));
+    }
+    if let Some(challenge) = code_challenge {
+        if !crate::pkce::is_valid_s256_challenge(challenge) {
+            return Err(Error::BadRequest("invalid S256 code_challenge".into()));
+        }
+    }
+    validate_authorization_extras(&provider.authorization_endpoint, extra)?;
     let mut params = vec![
         ("response_type", "code"),
         ("client_id", client.client_id.as_str()),
@@ -99,7 +139,44 @@ pub fn authorization_url(
     } else {
         '?'
     };
-    format!("{}{}{}", provider.authorization_endpoint, sep, qs)
+    Ok(format!("{}{}{}", provider.authorization_endpoint, sep, qs))
+}
+
+fn validate_authorization_extras(endpoint: &str, extra: &[(&str, &str)]) -> Result<()> {
+    const RESERVED: &[&str] = &[
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "state",
+        "nonce",
+        "code_challenge",
+        "code_challenge_method",
+    ];
+    // Seed the set from configured endpoint parameters so an application
+    // cannot accidentally append a second, conflicting vendor parameter.
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| Error::BadRequest(format!("invalid authorization_endpoint: {e}")))?;
+    let mut seen = parsed
+        .query_pairs()
+        .filter(|(name, _)| name != "resource")
+        .map(|(name, _)| name.into_owned())
+        .collect::<BTreeSet<_>>();
+    for (name, _) in extra {
+        if RESERVED.contains(name) {
+            return Err(Error::BadRequest(format!(
+                "authorization extra parameter {name} is library-controlled"
+            )));
+        }
+        // RFC 8707 permits repeated resource parameters. Other extension
+        // parameters must remain unambiguous.
+        if *name != "resource" && !seen.insert((*name).to_string()) {
+            return Err(Error::BadRequest(format!(
+                "duplicate authorization extra parameter: {name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Build a signed request object (RFC 9101, "JAR") carrying the
@@ -125,6 +202,27 @@ pub fn signed_request_object(
     nonce: &str,
     code_challenge: Option<&str>,
 ) -> Result<String> {
+    provider.validate()?;
+    validate_redirect_uri(&client.redirect_uri)?;
+    if !client
+        .scope
+        .split_whitespace()
+        .any(|scope| scope == "openid")
+    {
+        return Err(Error::BadRequest(
+            "OIDC authorization requests require the openid scope".into(),
+        ));
+    }
+    if matches!(&client.auth, ClientAuth::None) && code_challenge.is_none() {
+        return Err(Error::BadRequest(
+            "public clients must use S256 PKCE".into(),
+        ));
+    }
+    if let Some(challenge) = code_challenge {
+        if !crate::pkce::is_valid_s256_challenge(challenge) {
+            return Err(Error::BadRequest("invalid S256 code_challenge".into()));
+        }
+    }
     let now = now_secs();
     let mut c = Claims::default();
     c.iss = Some(client.client_id.clone());
@@ -152,17 +250,10 @@ pub fn signed_request_object(
 /// hosts, for local development), and per OIDC Discovery §4.3 the `issuer`
 /// returned in the metadata MUST match the requested issuer exactly.
 pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<ProviderMetadata> {
-    let issuer = issuer.trim_end_matches('/');
-    let parsed = url::Url::parse(issuer)
-        .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
-    let scheme_ok = parsed.scheme() == "https"
-        || (parsed.scheme() == "http" && parsed.host_str().map(is_loopback_host).unwrap_or(false));
-    if !scheme_ok {
-        return Err(Error::BadRequest(format!(
-            "issuer must be an https URL (http allowed only for loopback hosts): {issuer}"
-        )));
-    }
-    let url = format!("{issuer}/.well-known/openid-configuration");
+    let requested_issuer = issuer;
+    validate_issuer(requested_issuer)?;
+    let discovery_prefix = requested_issuer.trim_end_matches('/');
+    let url = format!("{discovery_prefix}/.well-known/openid-configuration");
     let resp = http.get(&url).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
@@ -171,12 +262,13 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
         )));
     }
     let metadata: ProviderMetadata = resp.json()?;
-    if metadata.issuer.trim_end_matches('/') != issuer {
+    if metadata.issuer != requested_issuer {
         return Err(Error::Authn(format!(
-            "discovered issuer {} does not match requested issuer {issuer}",
+            "discovered issuer {} does not match requested issuer {requested_issuer}",
             metadata.issuer
         )));
     }
+    ProviderInfo::from(metadata.clone()).validate()?;
     Ok(metadata)
 }
 
@@ -193,8 +285,86 @@ fn is_loopback_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Require an absolute HTTPS endpoint. Plain HTTP is supported only for
+/// loopback development servers, matching the issuer exception.
+pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| Error::BadRequest(format!("invalid {name} URL {endpoint}: {e}")))?;
+    let scheme_ok = parsed.scheme() == "https"
+        || (parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host));
+    if !scheme_ok || parsed.host_str().is_none() {
+        return Err(Error::BadRequest(format!(
+            "{name} must be an absolute https URL (http allowed only for loopback hosts): {endpoint}"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::BadRequest(format!(
+            "{name} must not contain userinfo: {endpoint}"
+        )));
+    }
+    if parsed.fragment().is_some() {
+        return Err(Error::BadRequest(format!(
+            "{name} must not contain a fragment: {endpoint}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
+    const RESERVED: &[&str] = &[
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "state",
+        "nonce",
+        "code_challenge",
+        "code_challenge_method",
+    ];
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| Error::BadRequest(format!("invalid authorization_endpoint: {e}")))?;
+    let mut seen = BTreeSet::new();
+    for (name, _) in parsed.query_pairs() {
+        if RESERVED.contains(&name.as_ref()) {
+            return Err(Error::BadRequest(format!(
+                "authorization_endpoint query parameter {name} is library-controlled"
+            )));
+        }
+        if name != "resource" && !seen.insert(name.into_owned()) {
+            return Err(Error::BadRequest(
+                "authorization_endpoint contains duplicate query parameters".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_issuer(issuer: &str) -> Result<()> {
+    validate_service_endpoint("issuer", issuer)?;
+    let parsed = url::Url::parse(issuer)
+        .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Error::BadRequest(
+            "issuer URL must not contain a query or fragment".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_redirect_uri(redirect_uri: &str) -> Result<()> {
+    let parsed = url::Url::parse(redirect_uri)
+        .map_err(|e| Error::BadRequest(format!("invalid redirect_uri {redirect_uri}: {e}")))?;
+    if parsed.fragment().is_some() {
+        return Err(Error::BadRequest(
+            "redirect_uri must not contain a fragment".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Fetch a JWKS document.
 pub async fn fetch_jwks(http: &Arc<dyn HttpClient>, jwks_uri: &str) -> Result<JwkSet> {
+    validate_service_endpoint("jwks_uri", jwks_uri)?;
     let resp = http.get(jwks_uri).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
@@ -213,6 +383,18 @@ pub async fn exchange_code(
     code: &str,
     code_verifier: Option<&str>,
 ) -> Result<TokenSet> {
+    provider.validate()?;
+    validate_redirect_uri(&client.redirect_uri)?;
+    if matches!(&client.auth, ClientAuth::None) && code_verifier.is_none() {
+        return Err(Error::BadRequest(
+            "public clients must supply a PKCE code_verifier".into(),
+        ));
+    }
+    if let Some(verifier) = code_verifier {
+        if !crate::pkce::is_valid_verifier(verifier) {
+            return Err(Error::BadRequest("invalid PKCE code_verifier".into()));
+        }
+    }
     let mut form: Vec<(String, String)> = vec![
         ("grant_type".into(), "authorization_code".into()),
         ("code".into(), code.to_string()),
@@ -237,19 +419,35 @@ pub async fn exchange_code(
         )));
     }
     let raw: serde_json::Value = resp.json()?;
+    let access_token = raw
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .ok_or_else(|| Error::Authn("token response missing access_token".into()))?;
+    let id_token = raw
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .ok_or_else(|| Error::Authn("token response missing id_token".into()))?;
+    let token_type = raw
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .ok_or_else(|| Error::Authn("token response missing token_type".into()))?;
+    // This RP currently sends access tokens using the Bearer scheme. RFC 6749
+    // section 7.1 forbids using a token type the client does not understand.
+    if !token_type.eq_ignore_ascii_case("Bearer") {
+        return Err(Error::Authn(format!(
+            "unsupported token_type in token response: {token_type}"
+        )));
+    }
     Ok(TokenSet {
-        access_token: raw
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        id_token: raw
-            .get("id_token")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        token_type: raw
-            .get("token_type")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        access_token,
+        id_token,
+        token_type,
         raw,
     })
 }
@@ -261,13 +459,52 @@ pub fn verify_id_token(
     issuer: &str,
     client_id: &str,
     expected_nonce: Option<&str>,
+    allowed_algorithms: &[JwsAlgorithm],
+    trusted_additional_audiences: &[&str],
 ) -> Result<Claims> {
+    if allowed_algorithms.is_empty() {
+        return Err(Error::BadRequest(
+            "at least one allowed id_token signing algorithm is required".into(),
+        ));
+    }
     let validation = Validation::new()
         .with_issuer(issuer)
         .with_audience(client_id)
         .require_exp()
-        .require_iat();
+        .require_iat()
+        .with_allowed_algorithms(allowed_algorithms.to_vec());
     let claims = jwt::verify_with_jwks(jwks, id_token, &validation)?;
+
+    if claims.sub.as_deref().is_none_or(str::is_empty) {
+        return Err(Error::Authn("id_token missing sub".into()));
+    }
+    if let Some(Audience::Multiple(values)) = claims.aud.as_ref() {
+        let mut seen = BTreeSet::new();
+        for audience in values {
+            if !seen.insert(audience) {
+                return Err(Error::Authn("id_token contains duplicate audiences".into()));
+            }
+            if audience != client_id
+                && !trusted_additional_audiences
+                    .iter()
+                    .any(|trusted| audience == trusted)
+            {
+                return Err(Error::Authn(format!(
+                    "id_token contains untrusted audience: {audience}"
+                )));
+            }
+        }
+        if claims.extra.get("azp").and_then(|value| value.as_str()) != Some(client_id) {
+            return Err(Error::Authn(
+                "multi-audience id_token requires azp equal to client_id".into(),
+            ));
+        }
+    }
+    if let Some(azp) = claims.extra.get("azp") {
+        if azp.as_str() != Some(client_id) {
+            return Err(Error::Authn("id_token azp mismatch".into()));
+        }
+    }
 
     if let Some(nonce) = expected_nonce {
         let got = claims.extra.get("nonce").and_then(|v| v.as_str());
@@ -283,7 +520,9 @@ pub async fn fetch_userinfo(
     http: &Arc<dyn HttpClient>,
     userinfo_endpoint: &str,
     access_token: &str,
+    expected_sub: &str,
 ) -> Result<serde_json::Value> {
+    validate_service_endpoint("userinfo_endpoint", userinfo_endpoint)?;
     // The injected client has no per-request header API on GET, so userinfo is
     // fetched via post_form with an empty body carrying the Authorization
     // header. (Most OPs accept GET or POST at userinfo.)
@@ -295,7 +534,13 @@ pub async fn fetch_userinfo(
     if resp.status != 200 {
         return Err(Error::Authn(format!("userinfo returned {}", resp.status)));
     }
-    resp.json()
+    let claims: serde_json::Value = resp.json()?;
+    if claims.get("sub").and_then(|value| value.as_str()) != Some(expected_sub) {
+        return Err(Error::Authn(
+            "userinfo sub does not match the validated id_token subject".into(),
+        ));
+    }
+    Ok(claims)
 }
 
 /// Build a `private_key_jwt` client assertion (RFC 7523) for token-endpoint auth.
@@ -402,8 +647,9 @@ mod tests {
     #[test]
     fn signed_request_object_carries_request_params_and_verifies() {
         let (client, provider, key) = client_and_provider();
-        let jar =
-            signed_request_object(&provider, &client, &key, "st-1", "n-1", Some("chal")).unwrap();
+        let challenge = crate::pkce::s256_challenge(&"v".repeat(43));
+        let jar = signed_request_object(&provider, &client, &key, "st-1", "n-1", Some(&challenge))
+            .unwrap();
 
         // Verifies against the RP's published public keys, audience = OP issuer.
         let validation = Validation::new()
@@ -417,7 +663,7 @@ mod tests {
         assert_eq!(claims.extra["scope"], "openid email");
         assert_eq!(claims.extra["state"], "st-1");
         assert_eq!(claims.extra["nonce"], "n-1");
-        assert_eq!(claims.extra["code_challenge"], "chal");
+        assert_eq!(claims.extra["code_challenge"], challenge);
         assert_eq!(claims.extra["code_challenge_method"], "S256");
         assert!(claims.jti.is_some(), "jti for replay detection");
         let (iat, exp) = (claims.iat.unwrap(), claims.exp.unwrap());
@@ -437,6 +683,37 @@ mod tests {
         let claims = jwt::peek_claims_unverified(&jar).unwrap();
         assert!(!claims.extra.contains_key("code_challenge"));
         assert!(!claims.extra.contains_key("code_challenge_method"));
+    }
+
+    #[test]
+    fn authorization_url_rejects_query_collisions_across_configuration_and_extras() {
+        let (client, mut provider, _) = client_and_provider();
+        provider.authorization_endpoint =
+            "https://op.example.org/authorize?tenant=configured".into();
+
+        let err = authorization_url(
+            &provider,
+            &client,
+            "state",
+            "nonce",
+            None,
+            &[("tenant", "override")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate authorization extra"));
+
+        // RFC 8707 deliberately permits repeated resource indicators.
+        let url = authorization_url(
+            &provider,
+            &client,
+            "state",
+            "nonce",
+            None,
+            &[("resource", "https://api.example.org")],
+        )
+        .unwrap();
+        assert!(url.contains("tenant=configured"));
+        assert!(url.contains("resource=https%3A%2F%2Fapi.example.org"));
     }
 
     /// Minimal in-memory [`HttpClient`] for discovery / token-endpoint tests.
@@ -561,6 +838,7 @@ mod tests {
         // No exp -> rejected.
         let mut c = Claims::default();
         c.iss = Some("https://op.example.org".into());
+        c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
         c.iat = Some(now);
         let token = jwt::sign(&key, &c, None).unwrap();
@@ -570,7 +848,9 @@ mod tests {
                 &token,
                 "https://op.example.org",
                 "https://rp.example.com",
-                None
+                None,
+                &[JwsAlgorithm::ES256],
+                &[],
             )
             .is_err(),
             "id_token without exp must be rejected"
@@ -579,6 +859,7 @@ mod tests {
         // No iat -> rejected.
         let mut c = Claims::default();
         c.iss = Some("https://op.example.org".into());
+        c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
         c.exp = Some(now + 300);
         let token = jwt::sign(&key, &c, None).unwrap();
@@ -588,7 +869,9 @@ mod tests {
                 &token,
                 "https://op.example.org",
                 "https://rp.example.com",
-                None
+                None,
+                &[JwsAlgorithm::ES256],
+                &[],
             )
             .is_err(),
             "id_token without iat must be rejected"
@@ -597,6 +880,7 @@ mod tests {
         // Both present -> accepted.
         let mut c = Claims::default();
         c.iss = Some("https://op.example.org".into());
+        c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
         c.iat = Some(now);
         c.exp = Some(now + 300);
@@ -607,6 +891,8 @@ mod tests {
             "https://op.example.org",
             "https://rp.example.com",
             None,
+            &[JwsAlgorithm::ES256],
+            &[],
         )
         .unwrap();
     }

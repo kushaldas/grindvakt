@@ -9,8 +9,7 @@
 //! Replay is prevented by remembering each proof's `jti` for the proof's
 //! freshness window (RFC 9449 §11.1). This crate is stateless-by-design, so the
 //! store is abstracted behind the [`ReplayStore`] trait: a deployment backs it
-//! with whatever store it likes (the `tunnelbana` binary uses the core TTL/disk
-//! cache), or uses [`NoReplayStore`] for the stateless-nonce-only mode.
+//! with a process-wide or shared atomic store.
 //!
 //! DPoP-Nonce (RFC 9449 §8) is supported but off by default. When enabled,
 //! nonces are stateless: a base64url HMAC over a timestamp, so no nonce store is
@@ -57,7 +56,18 @@ impl Default for DpopConfig {
 #[derive(Debug, Clone)]
 pub struct DpopProof {
     /// JWK SHA-256 thumbprint (RFC 7638) — the value bound as `cnf.jkt`.
-    pub jkt: String,
+    jkt: String,
+}
+
+impl DpopProof {
+    /// Return the validated proof key's RFC 7638 thumbprint.
+    ///
+    /// There is intentionally no public constructor: callers must obtain a
+    /// proof from [`validate_proof`] or [`validate_resource_proof`] before
+    /// using it to sender-constrain a token.
+    pub fn jkt(&self) -> &str {
+        &self.jkt
+    }
 }
 
 /// Why DPoP validation failed. The web layer maps these onto the right HTTP
@@ -98,21 +108,17 @@ pub trait ReplayStore: Send + Sync {
     async fn record(&self, jti: &str, ttl_secs: u64) -> Result<bool, String>;
 }
 
-/// A no-op [`ReplayStore`] for the stateless-nonce-only mode: every `jti` is
-/// treated as fresh.
+/// A fail-closed placeholder [`ReplayStore`].
 ///
-/// **Security caveat:** with this store a captured proof can be replayed for the
-/// whole `proof_max_age_secs` window *unless* `require_nonce` is also enabled —
-/// the HMAC nonce challenge is then the only thing bounding the replay window.
-/// Do not pair `NoReplayStore` with `require_nonce = false` on an internet-facing
-/// deployment; prefer a real (shared) [`ReplayStore`]. The in-tree frontends use
-/// a cache-backed store, never this.
+/// This type is retained for source compatibility, but it deliberately refuses
+/// every proof. DPoP nonces do not make a proof single-use, so accepting proofs
+/// without recording their `jti` would violate RFC 9449 replay protection.
 pub struct NoReplayStore;
 
 #[async_trait]
 impl ReplayStore for NoReplayStore {
     async fn record(&self, _jti: &str, _ttl_secs: u64) -> Result<bool, String> {
-        Ok(true)
+        Err("NoReplayStore cannot provide DPoP replay protection".into())
     }
 }
 
@@ -364,6 +370,15 @@ fn validate_nonce(config: &DpopConfig, nonce: &str) -> bool {
 mod tests {
     use super::*;
 
+    struct AcceptOnce;
+
+    #[async_trait]
+    impl ReplayStore for AcceptOnce {
+        async fn record(&self, _jti: &str, _ttl_secs: u64) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
     fn test_config() -> DpopConfig {
         DpopConfig {
             proof_max_age_secs: 300,
@@ -453,7 +468,7 @@ mod tests {
         // Correct ath → accepted.
         let (proof, _) = make_proof_ath("GET", htu, now, None, Some(&ath_of(token)));
         assert!(
-            validate_resource_proof(&NoReplayStore, &cfg, &proof, "GET", htu, token)
+            validate_resource_proof(&AcceptOnce, &cfg, &proof, "GET", htu, token)
                 .await
                 .is_ok()
         );
@@ -598,7 +613,7 @@ mod tests {
         let first = validate_proof(&store, &cfg, &proof, "POST", htu)
             .await
             .expect("first use valid");
-        assert_eq!(first.jkt, jkt);
+        assert_eq!(first.jkt(), jkt);
 
         // Same proof again → replay.
         let err = validate_proof(&store, &cfg, &proof, "POST", htu)
@@ -608,16 +623,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_replay_store_allows_reuse() {
+    async fn no_replay_store_fails_closed() {
         let cfg = test_config();
         let htu = "https://as.example/oauth2/token";
         let (proof, _) = make_proof("POST", htu, now_secs() as i64, None);
-        assert!(validate_proof(&NoReplayStore, &cfg, &proof, "POST", htu)
-            .await
-            .is_ok());
-        // NoReplayStore treats every jti as fresh.
-        assert!(validate_proof(&NoReplayStore, &cfg, &proof, "POST", htu)
-            .await
-            .is_ok());
+        assert!(matches!(
+            validate_proof(&NoReplayStore, &cfg, &proof, "POST", htu)
+                .await
+                .unwrap_err(),
+            DpopError::Server(_)
+        ));
     }
 }

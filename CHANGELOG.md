@@ -2,6 +2,21 @@
 
 ## unreleased
 
+## 0.8.0 [2026-09-03]
+
+- Hardened OIDC authorization responses: all advertised standard response
+  types are implemented, token-bearing responses use fragments, hybrid hashes
+  are emitted, and response-type order is handled per RFC 6749.
+- Hardened RP validation with exact issuer matching, safe endpoint policy,
+  mandatory token-response fields, explicit signing-algorithm and audience
+  policy, `azp` validation, public-client PKCE, and UserInfo subject binding.
+- Duplicate protocol parameters and reserved authorization extras are rejected;
+  authorization errors preserve the validated response mode.
+- DPoP always fails closed without an atomic replay store, and `DpopProof` is
+  opaque so only validation can create it.
+- **Breaking:** `Provider::new` now requires an explicit `TokenUseStore`, and
+  RP token verification / UserInfo APIs require their security-policy inputs.
+
 ## 0.7.2 [2026-08-31]
 
 - Added `Provider::authorization_redirect_with_claims` for OP-asserted claims

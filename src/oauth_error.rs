@@ -123,19 +123,40 @@ impl OAuthError {
 
     /// Render an error as a redirect back to the client (authorization endpoint).
     pub fn to_redirect(&self, redirect_uri: &str) -> Response {
-        let mut url = format!(
-            "{}{}error={}",
-            redirect_uri,
-            if redirect_uri.contains('?') { '&' } else { '?' },
-            self.code.as_str()
-        );
-        if let Some(desc) = &self.description {
-            url.push_str(&format!("&error_description={}", urlencode(desc)));
+        self.to_redirect_with_fragment(redirect_uri, false)
+    }
+
+    /// Render an authorization error using the validated response mode.
+    /// Fragment mode is required whenever the corresponding successful
+    /// response would have used the fragment.
+    pub fn to_redirect_with_fragment(&self, redirect_uri: &str, fragment: bool) -> Response {
+        let mut params = vec![("error", self.code.as_str())];
+        if let Some(desc) = self.description.as_deref() {
+            params.push(("error_description", desc));
         }
-        if let Some(state) = &self.state {
-            url.push_str(&format!("&state={}", urlencode(state)));
+        if let Some(state) = self.state.as_deref() {
+            params.push(("state", state));
         }
-        Response::redirect(url)
+        let encoded = params
+            .iter()
+            .map(|(name, value)| format!("{}={}", urlencode(name), urlencode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        if fragment {
+            let separator = if redirect_uri.contains('#') { '&' } else { '#' };
+            return Response::redirect(format!("{redirect_uri}{separator}{encoded}"));
+        }
+
+        // Insert the query before an existing fragment rather than appending
+        // protocol parameters after it.
+        let (base, fragment_suffix) = redirect_uri
+            .split_once('#')
+            .map_or((redirect_uri, String::new()), |(base, value)| {
+                (base, format!("#{value}"))
+            });
+        let separator = if base.contains('?') { '&' } else { '?' };
+        Response::redirect(format!("{base}{separator}{encoded}{fragment_suffix}"))
     }
 }
 
@@ -153,4 +174,34 @@ impl std::error::Error for OAuthError {}
 
 pub(crate) fn urlencode(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location(response: &Response) -> &str {
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "location")
+            .map(|(_, value)| value.as_str())
+            .unwrap()
+    }
+
+    #[test]
+    fn authorization_errors_preserve_validated_response_mode() {
+        let error = OAuthError::invalid_request("bad request").with_state(Some("s".into()));
+        let query = error.to_redirect_with_fragment("https://rp.example/cb#existing", false);
+        assert_eq!(
+            location(&query),
+            "https://rp.example/cb?error=invalid_request&error_description=bad+request&state=s#existing"
+        );
+
+        let fragment = error.to_redirect_with_fragment("https://rp.example/cb", true);
+        assert_eq!(
+            location(&fragment),
+            "https://rp.example/cb#error=invalid_request&error_description=bad+request&state=s"
+        );
+    }
 }

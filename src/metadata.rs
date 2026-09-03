@@ -68,7 +68,9 @@ impl ProviderMetadata {
                 "client_credentials".into(),
                 "refresh_token".into(),
             ],
-            subject_types_supported: vec!["public".into(), "pairwise".into()],
+            // Pairwise identifiers require sector-identifier based derivation;
+            // the core only implements public subjects.
+            subject_types_supported: vec!["public".into()],
             id_token_signing_alg_values_supported: vec!["RS256".into(), "ES256".into()],
             token_endpoint_auth_methods_supported: vec![
                 "client_secret_basic".into(),
@@ -108,5 +110,9 @@ mod tests {
             ProviderMetadata::new("https://op.example.com", "https://op.example.com").to_json();
         assert_eq!(doc["claims_parameter_supported"], false);
         assert_eq!(doc["request_parameter_supported"], false);
+        assert_eq!(
+            doc["subject_types_supported"],
+            serde_json::json!(["public"])
+        );
     }
 }

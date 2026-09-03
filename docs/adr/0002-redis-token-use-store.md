@@ -2,14 +2,14 @@
 
 ## Status
 
-Accepted.
+Amended for 0.8.0: the token-use store is now an explicit constructor argument.
 
 ## Context
 
 ADR 0001 introduced `TokenUseStore` so authorization codes and refresh tokens
-can be consumed exactly once. The default in-memory implementation is useful for
-tests and single-process deployments, but it is not enough for providers running
-more than one process or replica.
+can be consumed exactly once. The in-memory implementation is useful for tests
+and single-process deployments, but it is not enough for providers running more
+than one process or replica. Since 0.8.0, callers select the store explicitly.
 
 Those deployments need a shared store with an atomic insert-if-absent operation
 and automatic expiry. Redis is a common fit for this specific shape of state:
@@ -32,14 +32,15 @@ the same token hash values as other `TokenUseStore` implementations and are
 kept only until the original token expiry.
 
 The feature is optional so library users that do not deploy Redis do not pull in
-Redis dependencies. `Provider::new` continues to install the in-memory store by
-default, and Redis-backed deployments opt in with `Provider::with_token_use_store`.
+Redis dependencies. `Provider::new` requires a `TokenUseStore`; Redis-backed
+deployments pass `RedisStore` there, while a single-process deployment may pass
+`InMemoryTokenUseStore`.
 
 ## Consequences
 
 Multi-replica providers can use a maintained shared replay store without writing
-their own adapter. Single-process and non-Redis users keep the existing default
-dependency footprint.
+their own adapter. Single-process and non-Redis users keep the existing optional
+dependency footprint while making the process-local choice explicit.
 
 Redis availability becomes part of the token endpoint's availability for
 deployments that choose `RedisStore`. If Redis rejects the command or cannot be

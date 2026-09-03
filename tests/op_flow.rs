@@ -4,15 +4,57 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use grindvakt::client::{
     Client, InMemoryClientStore, AUTH_CLIENT_SECRET_POST, AUTH_NONE, AUTH_PRIVATE_KEY_JWT,
 };
 use grindvakt::keys::{signing_key_from_jwk_json, SigningKey};
 use grindvakt::metadata::ProviderMetadata;
 use grindvakt::pkce;
-use grindvakt::provider::{Provider, TokenLifetimes, CLIENT_ASSERTION_TYPE};
+use grindvakt::provider::{InMemoryTokenUseStore, Provider, TokenLifetimes, CLIENT_ASSERTION_TYPE};
 use grindvakt::request::AuthorizationRequest;
 use grindvakt::tokens::TokenCodec;
+
+struct AcceptDpopProof;
+
+#[async_trait]
+impl grindvakt::dpop::ReplayStore for AcceptDpopProof {
+    async fn record(&self, _jti: &str, _ttl_secs: u64) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+/// Produce the opaque proof capability through the same validation boundary
+/// an HTTP adapter uses; tests must not be able to fabricate a trusted `jkt`.
+async fn validated_dpop_proof() -> grindvakt::dpop::DpopProof {
+    use jose_rs::JoseHeader;
+
+    let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+    jwk.alg = Some("ES256".to_string());
+    let public = jwk.to_public_jwk();
+    let mut header = JoseHeader::new("ES256");
+    header.typ = Some("dpop+jwt".to_string());
+    header.jwk = Some(serde_json::from_str(&public.to_json().unwrap()).unwrap());
+    let endpoint = "https://op.example.com/token";
+    let claims = serde_json::json!({
+        "jti": grindvakt::util::random_token(16),
+        "htm": "POST",
+        "htu": endpoint,
+        "iat": grindvakt::util::now_secs() as i64,
+    });
+    let compact =
+        jose_rs::jws::compact::sign_with_jwk(&jwk, &serde_json::to_vec(&claims).unwrap(), &header)
+            .unwrap();
+    grindvakt::dpop::validate_proof(
+        &AcceptDpopProof,
+        &grindvakt::dpop::DpopConfig::default(),
+        &compact,
+        "POST",
+        endpoint,
+    )
+    .await
+    .unwrap()
+}
 
 fn ec_signing_key(kid: &str) -> SigningKey {
     let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
@@ -28,6 +70,7 @@ fn provider_with(clients: InMemoryClientStore) -> Provider {
         Arc::new(clients),
         TokenCodec::new("op-secret"),
         TokenLifetimes::default(),
+        Arc::new(InMemoryTokenUseStore::new()),
     )
 }
 
@@ -72,7 +115,7 @@ async fn authorization_code_pkce_flow() {
     let store = InMemoryClientStore::with_clients(vec![client]);
     let op = provider_with(store);
 
-    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
 
     let req = AuthorizationRequest::from_params(&map(&[
@@ -95,6 +138,7 @@ async fn authorization_code_pkce_flow() {
     claims.insert("email".into(), vec!["anna@example.com".into()]);
     let redirect = op
         .authorization_redirect(&req, "subject-123", &claims, Some("urn:acr:pwd".into()))
+        .await
         .unwrap();
     assert_eq!(redirect.status, 302);
     let location = redirect
@@ -194,7 +238,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
     let req = AuthorizationRequest::from_params(&map(&[
         ("client_id", "rp-1"),
@@ -235,6 +279,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
             Some("urn:acr:trusted".into()),
             &extra,
         )
+        .await
         .unwrap();
     let location = redirect
         .headers
@@ -369,6 +414,7 @@ async fn refresh_token_grant_flow() {
     claims.insert("email".into(), vec!["anna@example.com".into()]);
     let redirect = op
         .authorization_redirect(&req, "subject-123", &claims, Some("urn:acr:pwd".into()))
+        .await
         .unwrap();
     let location = redirect
         .headers
@@ -490,8 +536,6 @@ async fn refresh_token_grant_flow() {
 
 #[tokio::test]
 async fn dpop_bound_refresh_token_requires_matching_proof() {
-    use grindvakt::dpop::DpopProof;
-
     let client = Client {
         client_id: "rp-dpop".into(),
         client_secret: Some("s3cret".into()),
@@ -515,6 +559,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
     .unwrap();
     let redirect = op
         .authorization_redirect(&req, "subject-123", &BTreeMap::new(), None)
+        .await
         .unwrap();
     let location = redirect
         .headers
@@ -524,9 +569,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
         .unwrap();
     let code = extract_param(&location, "code").unwrap();
 
-    let original_proof = DpopProof {
-        jkt: "original-proof-key".into(),
-    };
+    let original_proof = validated_dpop_proof().await;
     let token_resp = op
         .handle_token_request(
             &map(&[
@@ -547,7 +590,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
     let opened_refresh = op.codec.open_refresh_token(&refresh).unwrap();
     assert_eq!(
         opened_refresh.cnf_jkt.as_deref(),
-        Some("original-proof-key")
+        Some(original_proof.jkt())
     );
 
     let missing_proof = op
@@ -569,9 +612,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
         grindvakt::OAuthErrorCode::InvalidDpopProof
     );
 
-    let wrong_proof = DpopProof {
-        jkt: "wrong-proof-key".into(),
-    };
+    let wrong_proof = validated_dpop_proof().await;
     let wrong_key = op
         .handle_token_request(
             &map(&[
@@ -604,12 +645,12 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
         .expect("refresh with matching DPoP proof");
     assert_eq!(refreshed.token_type, "DPoP");
     let opened_access = op.codec.open_access_token(&refreshed.access_token).unwrap();
-    assert_eq!(opened_access.cnf_jkt.as_deref(), Some("original-proof-key"));
+    assert_eq!(opened_access.cnf_jkt.as_deref(), Some(original_proof.jkt()));
     let rotated = refreshed.refresh_token.expect("rotated refresh token");
     let opened_rotated = op.codec.open_refresh_token(&rotated).unwrap();
     assert_eq!(
         opened_rotated.cnf_jkt.as_deref(),
-        Some("original-proof-key")
+        Some(original_proof.jkt())
     );
 }
 
@@ -631,7 +672,7 @@ async fn refresh_token_denied_when_grant_not_registered() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
     let req = AuthorizationRequest::from_params(&map(&[
         ("client_id", "rp-1"),
@@ -644,6 +685,7 @@ async fn refresh_token_denied_when_grant_not_registered() {
     .unwrap();
     let redirect = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .await
         .unwrap();
     let location = &redirect
         .headers
@@ -704,7 +746,7 @@ async fn pkce_mismatch_rejected() {
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
     let req = AuthorizationRequest::from_params(&map(&[
         ("client_id", "rp-1"),
@@ -717,6 +759,7 @@ async fn pkce_mismatch_rejected() {
     .unwrap();
     let redirect = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .await
         .unwrap();
     let location = &redirect
         .headers
@@ -732,7 +775,10 @@ async fn pkce_mismatch_rejected() {
                 ("grant_type", "authorization_code"),
                 ("code", &code),
                 ("client_id", "rp-1"),
-                ("code_verifier", "the-wrong-verifier-the-wrong-verifier"),
+                (
+                    "code_verifier",
+                    "wrong-verifier-0123456789-0123456789-012345",
+                ),
             ]),
             None,
             "https://op.example.com/token",
@@ -768,32 +814,13 @@ async fn public_code_flow_requires_s256_pkce() {
     let err = op.validate_authorization_request(&req).await.unwrap_err();
     assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidRequest);
 
-    // Defense in depth for codes created by callers that skipped validation or
-    // by older versions before S256 PKCE was mandatory for public clients.
-    let redirect = op
+    // The minting boundary revalidates too, so a deserialized/unvalidated
+    // request cannot bypass the public-client PKCE requirement.
+    let mint_err = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
-        .unwrap();
-    let location = &redirect
-        .headers
-        .iter()
-        .find(|(k, _)| k == "location")
-        .unwrap()
-        .1;
-    let code = extract_param(location, "code").unwrap();
-    let err = op
-        .handle_token_request(
-            &map(&[
-                ("grant_type", "authorization_code"),
-                ("code", &code),
-                ("client_id", "rp-public"),
-            ]),
-            None,
-            "https://op.example.com/token",
-            None,
-        )
         .await
         .unwrap_err();
-    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidGrant);
+    assert_eq!(mint_err.code, grindvakt::OAuthErrorCode::InvalidRequest);
 }
 
 #[tokio::test]
@@ -826,6 +853,7 @@ async fn private_key_jwt_client_auth() {
     .unwrap();
     let redirect = op
         .authorization_redirect(&req, "sub-fed", &BTreeMap::new(), None)
+        .await
         .unwrap();
     let location = &redirect
         .headers
@@ -1036,8 +1064,6 @@ async fn client_credentials_public_client_rejected() {
 /// access token so userinfo/introspection can read it back.
 #[tokio::test]
 async fn client_credentials_dpop_bound() {
-    use grindvakt::dpop::DpopProof;
-
     let client = Client {
         client_id: "svc-4".into(),
         client_secret: Some("s".into()),
@@ -1053,9 +1079,7 @@ async fn client_credentials_dpop_bound() {
     let store = InMemoryClientStore::with_clients(vec![client]);
     let op = provider_with(store);
 
-    let proof = DpopProof {
-        jkt: "the-proof-key-thumbprint".into(),
-    };
+    let proof = validated_dpop_proof().await;
     let resp = op
         .handle_token_request(
             &map(&[
@@ -1072,7 +1096,7 @@ async fn client_credentials_dpop_bound() {
 
     assert_eq!(resp.token_type, "DPoP");
     let opened = op.codec.open_access_token(&resp.access_token).unwrap();
-    assert_eq!(opened.cnf_jkt.as_deref(), Some("the-proof-key-thumbprint"));
+    assert_eq!(opened.cnf_jkt.as_deref(), Some(proof.jkt()));
 }
 
 /// Regression: an attribute map that releases a claim named `sub` (e.g.
@@ -1090,19 +1114,19 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
         grant_types: vec!["authorization_code".into()],
         token_endpoint_auth_method: AUTH_NONE.into(),
         jwks: None,
-        scope: Some("openid".into()),
+        scope: Some("openid email".into()),
         subject_type: "public".into(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
 
-    let verifier = "verifier-0123456789-0123456789-0123456789";
+    let verifier = "verifier-0123456789-0123456789-0123456789-01";
     let challenge = pkce::s256_challenge(verifier);
     let req = AuthorizationRequest::from_params(&map(&[
         ("client_id", "rp-sub"),
         ("response_type", "code"),
         ("redirect_uri", "https://rp.example.com/cb"),
-        ("scope", "openid"),
+        ("scope", "openid email"),
         ("nonce", "nonce-1"),
         ("code_challenge", &challenge),
         ("code_challenge_method", "S256"),
@@ -1117,6 +1141,7 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
     claims.insert("email".into(), vec!["anna@example.com".into()]);
     let redirect = op
         .authorization_redirect(&req, "canonical-subject-id", &claims, None)
+        .await
         .unwrap();
     let location = redirect
         .headers
@@ -1583,6 +1608,7 @@ async fn hybrid_flow_defaults_to_fragment_response_mode() {
     .unwrap();
     let redirect = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .await
         .unwrap();
     let location = &redirect
         .headers
@@ -1624,6 +1650,7 @@ async fn token_request_must_echo_redirect_uri() {
     .unwrap();
     let redirect = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .await
         .unwrap();
     let location = &redirect
         .headers
@@ -1679,6 +1706,7 @@ async fn authorization_code_grant_must_be_registered() {
     .unwrap();
     let redirect = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .await
         .unwrap();
     let location = &redirect
         .headers

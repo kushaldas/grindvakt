@@ -58,7 +58,9 @@ impl Client {
 
     /// Whether the client is allowed the given response type.
     pub fn allows_response_type(&self, rt: &str) -> bool {
-        self.response_types.iter().any(|r| r == rt)
+        self.response_types
+            .iter()
+            .any(|registered| crate::request::response_type_eq(registered, rt))
     }
 }
 
