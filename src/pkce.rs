@@ -14,10 +14,13 @@ pub fn is_valid_verifier(value: &str) -> bool {
 /// An S256 challenge is a 32-byte SHA-256 digest encoded as 43 base64url
 /// characters without padding.
 pub fn is_valid_s256_challenge(value: &str) -> bool {
-    value.len() == 43
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value) else {
+        return false;
+    };
+    // Re-encoding rejects alternate strings with non-zero unused trailing
+    // bits, so only the canonical representation of a SHA-256 digest passes.
+    decoded.len() == 32
+        && base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&decoded) == value
 }
 
 /// Compute the S256 code challenge for a verifier.
@@ -82,5 +85,25 @@ mod tests {
         assert!(!is_valid_verifier(&format!("{}!", "a".repeat(42))));
         assert!(!verify("short", &s256_challenge("short"), Some("S256")));
         assert!(!is_valid_s256_challenge("not-a-challenge"));
+    }
+
+    #[test]
+    fn rejects_noncanonical_s256_challenge() {
+        let canonical = s256_challenge(&"a".repeat(43));
+        assert!(is_valid_s256_challenge(&canonical));
+
+        // A SHA-256 digest has four significant bits in its final base64url
+        // character. Changing only an unused trailing bit must not create a
+        // second accepted spelling for the same digest.
+        let replacement = match canonical.as_bytes()[42] {
+            b'A' => 'B',
+            b'Q' => 'R',
+            b'g' => 'h',
+            b'w' => 'x',
+            other => panic!("unexpected canonical trailing character: {other}"),
+        };
+        let mut noncanonical = canonical[..42].to_string();
+        noncanonical.push(replacement);
+        assert!(!is_valid_s256_challenge(&noncanonical));
     }
 }

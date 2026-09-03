@@ -328,10 +328,22 @@ impl Provider {
         if !client.allows_redirect(&req.redirect_uri) {
             return Err(OAuthError::invalid_request("redirect_uri not registered"));
         }
-        if url::Url::parse(&req.redirect_uri)
-            .ok()
-            .is_some_and(|uri| uri.fragment().is_some())
+        // Exact registration matching is necessary but not sufficient: a
+        // malformed value can itself have been registered. Parse it before it
+        // can reach a Location header, while retaining absolute custom-scheme
+        // redirect URIs used by native applications.
+        if req
+            .redirect_uri
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
         {
+            return Err(OAuthError::invalid_request(
+                "redirect_uri must not contain whitespace or control characters",
+            ));
+        }
+        let redirect_uri = url::Url::parse(&req.redirect_uri)
+            .map_err(|_| OAuthError::invalid_request("redirect_uri must be an absolute URI"))?;
+        if redirect_uri.fragment().is_some() {
             return Err(OAuthError::invalid_request(
                 "redirect_uri must not contain a fragment",
             ));
@@ -363,9 +375,9 @@ impl Provider {
             )
             .with_state(req.state.clone()));
         }
-        // OIDC Core §3.2.2.1 / §3.3.2.1: a nonce is REQUIRED for any response
-        // type that returns an id_token from the authorization endpoint
-        // (implicit and hybrid flows).
+        // OIDC Core sections 3.2.2.1 and 3.3.2.1 require a nonce when an ID
+        // token is returned from the authorization endpoint. In particular,
+        // nonce remains optional for the `code token` hybrid response type.
         if req.wants_id_token() && req.nonce.is_none() {
             return Err(
                 OAuthError::invalid_request("nonce is required for implicit/hybrid flows")
@@ -915,11 +927,16 @@ impl Provider {
         self.consume_token_once("refresh", token, rt.exp, "refresh token already used")
             .await?;
 
+        // A narrowed refresh grant must not retain standard claims belonging
+        // to scopes the client removed. Reuse this one filtered map for every
+        // artifact minted by the refresh so their authorization agrees.
+        let claims = filter_claims(&scope, rt.claims.clone());
+
         let access_payload = AccessTokenPayload {
             client_id: client.client_id.clone(),
             sub: rt.sub.clone(),
             scope: scope.clone(),
-            claims: rt.claims.clone(),
+            claims: claims.clone(),
             exp: now + self.lifetimes.access_token_ttl,
             cnf_jkt: cnf_jkt.clone(),
         };
@@ -934,7 +951,7 @@ impl Provider {
                     &client.client_id,
                     &rt.sub,
                     rt.nonce.as_deref(),
-                    &rt.claims,
+                    &claims,
                     rt.acr.as_deref(),
                     rt.auth_time,
                     None,
@@ -953,7 +970,7 @@ impl Provider {
             sub: rt.sub.clone(),
             scope: scope.clone(),
             nonce: rt.nonce.clone(),
-            claims: rt.claims.clone(),
+            claims,
             auth_time: rt.auth_time,
             exp: now + self.lifetimes.refresh_token_ttl,
             acr: rt.acr.clone(),

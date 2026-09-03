@@ -412,6 +412,8 @@ async fn refresh_token_grant_flow() {
     .unwrap();
     let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
     claims.insert("email".into(), vec!["anna@example.com".into()]);
+    claims.insert("name".into(), vec!["Anna Example".into()]);
+    claims.insert("tenant_id".into(), vec!["tenant-1".into()]);
     let redirect = op
         .authorization_redirect(&req, "subject-123", &claims, Some("urn:acr:pwd".into()))
         .await
@@ -451,7 +453,7 @@ async fn refresh_token_grant_flow() {
             &map(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &refresh),
-                ("scope", "openid email"),
+                ("scope", "openid"),
                 ("client_id", "rp-conf"),
                 ("client_secret", "s3cret"),
             ]),
@@ -461,13 +463,23 @@ async fn refresh_token_grant_flow() {
         )
         .await
         .expect("refresh exchange");
-    assert_eq!(refreshed.scope.as_deref(), Some("openid email"));
+    assert_eq!(refreshed.scope.as_deref(), Some("openid"));
 
     // Rotation: a new refresh token is returned, and the new access token works.
     let rotated = refreshed.refresh_token.clone().expect("rotated refresh");
     assert_ne!(rotated, refresh, "refresh token should rotate");
     let userinfo = op.userinfo(&refreshed.access_token, None).await.unwrap();
     assert_eq!(userinfo["sub"], "subject-123");
+    assert!(userinfo.get("email").is_none());
+    assert!(userinfo.get("name").is_none());
+    assert_eq!(userinfo["tenant_id"], "tenant-1");
+
+    // The rotated refresh token must not reintroduce claims excluded by the
+    // narrowed scope on a later refresh.
+    let rotated_payload = op.codec.open_refresh_token(&rotated).unwrap();
+    assert!(!rotated_payload.claims.contains_key("email"));
+    assert!(!rotated_payload.claims.contains_key("name"));
+    assert_eq!(rotated_payload.claims["tenant_id"], "tenant-1");
 
     let old_replay = op
         .handle_token_request(
@@ -497,6 +509,9 @@ async fn refresh_token_grant_flow() {
         id_claims.extra.get("nonce").and_then(|v| v.as_str()),
         Some("nonce-abc")
     );
+    assert!(!id_claims.extra.contains_key("email"));
+    assert!(!id_claims.extra.contains_key("name"));
+    assert_eq!(id_claims.extra["tenant_id"], "tenant-1");
 
     // Requesting any scope outside the original grant is rejected, even when
     // mixed with otherwise-valid scopes.
@@ -812,6 +827,25 @@ async fn public_code_flow_requires_s256_pkce() {
     ]))
     .unwrap();
     let err = op.validate_authorization_request(&req).await.unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidRequest);
+
+    // Length and alphabet checks alone accept this alternate base64url
+    // spelling of a 32-byte digest. It can never match the canonical S256
+    // output computed from a verifier and must fail before a code is minted.
+    let noncanonical_challenge = format!("{}B", "A".repeat(42));
+    let noncanonical = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-public"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("code_challenge", &noncanonical_challenge),
+        ("code_challenge_method", "S256"),
+    ]))
+    .unwrap();
+    let err = op
+        .validate_authorization_request(&noncanonical)
+        .await
+        .unwrap_err();
     assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidRequest);
 
     // The minting boundary revalidates too, so a deserialized/unvalidated
@@ -1436,6 +1470,67 @@ async fn client_without_registered_scope_is_unrestricted() {
         .expect("scope: None must not be treated as an empty allowlist");
 }
 
+/// Regression: exact registration matching must not allow an unparseable
+/// redirect URI to flow into a Location header. Absolute custom-scheme URIs
+/// remain valid for native clients.
+#[tokio::test]
+async fn authorization_request_rejects_malformed_registered_redirect_uri() {
+    let client = Client {
+        client_id: "rp-redirect".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec![
+            "://malformed".into(),
+            "https://rp.example/cb\r\nX-Test: injected".into(),
+            "https://rp.example/cb\tignored".into(),
+            "\nhttps://rp.example/cb".into(),
+            "com.example.app:/callback".into(),
+        ],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+
+    for redirect_uri in [
+        "://malformed",
+        "https://rp.example/cb\r\nX-Test: injected",
+        "https://rp.example/cb\tignored",
+        "\nhttps://rp.example/cb",
+    ] {
+        let malformed = AuthorizationRequest::from_params(&map(&[
+            ("client_id", "rp-redirect"),
+            ("response_type", "code"),
+            ("redirect_uri", redirect_uri),
+            ("scope", "openid"),
+        ]))
+        .unwrap();
+        let err = op
+            .validate_authorization_request(&malformed)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            grindvakt::OAuthErrorCode::InvalidRequest,
+            "unsafe registered redirect URI must be rejected: {redirect_uri:?}"
+        );
+    }
+
+    let native = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-redirect"),
+        ("response_type", "code"),
+        ("redirect_uri", "com.example.app:/callback"),
+        ("scope", "openid"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&native)
+        .await
+        .expect("absolute custom-scheme redirect URI must remain valid");
+}
+
 /// Regression: the presented token-endpoint authentication method must match
 /// the client's registered `token_endpoint_auth_method`.
 #[tokio::test]
@@ -1488,7 +1583,11 @@ async fn implicit_and_hybrid_flows_require_nonce() {
         client_id: "rp-implicit".into(),
         client_secret: Some("s".into()),
         redirect_uris: vec!["https://rp.example.com/cb".into()],
-        response_types: vec!["id_token token".into(), "code id_token".into()],
+        response_types: vec![
+            "id_token token".into(),
+            "code id_token".into(),
+            "code token".into(),
+        ],
         grant_types: vec!["authorization_code".into()],
         token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
         jwks: None,
@@ -1525,6 +1624,19 @@ async fn implicit_and_hybrid_flows_require_nonce() {
             .await
             .unwrap_or_else(|e| panic!("{response_type} with nonce must pass: {e}"));
     }
+
+    // OIDC Core section 3.3.2.1 explicitly makes nonce optional for this
+    // hybrid response type because no ID token is returned at this endpoint.
+    let code_token = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-implicit"),
+        ("response_type", "code token"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&code_token)
+        .await
+        .expect("code token may omit nonce under OIDC Core");
 }
 
 /// OIDC Core §3.1.2.1 forbids combining `prompt=none` with another

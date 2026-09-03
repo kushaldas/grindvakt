@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) fn response_type_eq(left: &str, right: &str) -> bool {
     fn values(input: &str) -> Option<BTreeSet<&str>> {
         let mut result = BTreeSet::new();
-        for value in input.split(' ').filter(|value| !value.is_empty()) {
-            if !result.insert(value) {
+        for value in input.split(' ') {
+            if value.is_empty() || !result.insert(value) {
                 return None;
             }
         }
@@ -363,6 +363,21 @@ mod tests {
             duplicate.validate_response_type().unwrap_err().code,
             OAuthErrorCode::UnsupportedResponseType
         );
+
+        // RFC 6749's response-type grammar allows exactly one SP between
+        // non-empty response names. Do not normalize malformed spellings.
+        for response_type in [" code", "code ", "code  id_token"] {
+            let malformed = AuthorizationRequest {
+                response_type: response_type.into(),
+                scope: "openid".into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                malformed.validate_response_type().unwrap_err().code,
+                OAuthErrorCode::UnsupportedResponseType,
+                "malformed response_type must be rejected: {response_type:?}"
+            );
+        }
 
         let missing_openid = AuthorizationRequest {
             response_type: "id_token".into(),
