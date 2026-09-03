@@ -21,6 +21,9 @@
 - RP ID-token validation accepts a one-element JSON array in `aud` without
   requiring `azp`, while retaining `azp` and trust checks for multiple
   audiences and for any explicitly supplied `azp` claim.
+- **Breaking:** Authorization requests preserve repeated RFC 8707 `resource`
+  parameters in `AuthorizationRequest::resources` instead of `extra`, while
+  duplicate single-valued parameters remain invalid.
 - DPoP always fails closed without an atomic replay store, and `DpopProof` is
   opaque so only validation can create it.
 - **Breaking:** `Provider::new` now requires an explicit `TokenUseStore`, and

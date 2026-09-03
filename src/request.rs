@@ -39,6 +39,14 @@ pub struct AuthorizationRequest {
     pub claims: Option<serde_json::Value>,
     /// The raw `request` parameter (RFC 9101 request object JWT), if present.
     pub request_object: Option<String>,
+    /// Target resource indicators from repeated RFC 8707 `resource`
+    /// parameters, preserved in request order for application policy.
+    ///
+    /// Preservation does not enable RFC 8707 token audience restriction; an
+    /// application that accepts these values must validate and enforce its
+    /// resource policy before asking the provider to mint artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
     /// Other parameters preserved verbatim.
     pub extra: BTreeMap<String, String>,
 }
@@ -48,14 +56,24 @@ impl AuthorizationRequest {
     /// before converting it to the single-valued internal representation.
     pub fn from_pairs(params: &[(String, String)]) -> Result<Self, OAuthError> {
         let mut unique = BTreeMap::new();
+        let mut resources = Vec::new();
         for (name, value) in params {
+            // RFC 8707 section 2 permits multiple resource parameters. Every
+            // other supported field is single-valued and remains ambiguous if
+            // repeated, so it must be rejected before map conversion.
+            if name == "resource" {
+                resources.push(value.clone());
+                continue;
+            }
             if unique.insert(name.clone(), value.clone()).is_some() {
                 return Err(OAuthError::invalid_request(format!(
                     "duplicate authorization parameter: {name}"
                 )));
             }
         }
-        Self::from_params(&unique)
+        let mut request = Self::from_params(&unique)?;
+        request.resources = resources;
+        Ok(request)
     }
 
     /// Parse the internal single-valued representation after the public
@@ -93,6 +111,7 @@ impl AuthorizationRequest {
             "acr_values",
             "claims",
             "request",
+            "resource",
         ];
         let extra = params
             .iter()
@@ -114,6 +133,7 @@ impl AuthorizationRequest {
             acr_values: get("acr_values"),
             claims,
             request_object: get("request"),
+            resources: Vec::new(),
             extra,
         })
     }
@@ -214,6 +234,10 @@ impl AuthorizationRequest {
             )
             .with_state(self.state.clone()));
         }
+        // Only response types that return an ID Token invoke OpenID Connect.
+        // `code token` is independently defined as an OAuth response type by
+        // OAuth 2.0 Multiple Response Type Encoding Practices section 5, so it
+        // remains valid without the `openid` scope.
         if self.wants_id_token() && !self.is_oidc() {
             return Err(OAuthError::new(
                 OAuthErrorCode::InvalidScope,
@@ -330,6 +354,37 @@ mod tests {
     }
 
     #[test]
+    fn preserves_repeated_resource_indicators_without_weakening_duplicate_checks() {
+        let pairs = vec![
+            ("client_id".into(), "client".into()),
+            ("response_type".into(), "code".into()),
+            ("redirect_uri".into(), "https://rp.example/cb".into()),
+            ("resource".into(), "https://api-one.example".into()),
+            ("resource".into(), "https://api-two.example".into()),
+        ];
+        let request = AuthorizationRequest::from_pairs(&pairs).unwrap();
+        assert_eq!(
+            request.resources,
+            ["https://api-one.example", "https://api-two.example"]
+        );
+        assert!(!request.extra.contains_key("resource"));
+
+        let serialized = serde_json::to_value(&request).unwrap();
+        let restored: AuthorizationRequest = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.resources, request.resources);
+
+        let mut ambiguous = pairs;
+        ambiguous.push(("scope".into(), "read".into()));
+        ambiguous.push(("scope".into(), "write".into()));
+        assert_eq!(
+            AuthorizationRequest::from_pairs(&ambiguous)
+                .unwrap_err()
+                .code,
+            OAuthErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
     fn validates_standard_response_types_and_modes() {
         for response_type in [
             "code",
@@ -388,6 +443,15 @@ mod tests {
             missing_openid.validate_response_type().unwrap_err().code,
             OAuthErrorCode::InvalidScope
         );
+
+        let oauth_code_token = AuthorizationRequest {
+            response_type: "code token".into(),
+            scope: "read".into(),
+            ..Default::default()
+        };
+        oauth_code_token
+            .validate_response_type()
+            .expect("code token is also a registered OAuth response type");
 
         let unknown_mode = AuthorizationRequest {
             response_type: "code".into(),

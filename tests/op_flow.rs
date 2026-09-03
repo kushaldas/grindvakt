@@ -262,6 +262,65 @@ async fn authorization_code_pkce_flow() {
     assert_eq!(userinfo["email"], "anna@example.com");
 }
 
+/// `code token` is also defined by OAuth 2.0 Multiple Response Type Encoding
+/// Practices section 5. Without `openid`, it remains an OAuth authorization
+/// request and must not cause either authorization endpoint to emit an ID token.
+#[tokio::test]
+async fn oauth_code_token_without_openid_remains_valid() {
+    let client = Client {
+        client_id: "oauth-hybrid".into(),
+        client_secret: Some("secret".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code token".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("read".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+    let request = AuthorizationRequest::from_pairs(&pairs(&[
+        ("client_id", "oauth-hybrid"),
+        ("response_type", "code token"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "read"),
+    ]))
+    .unwrap();
+
+    op.validate_authorization_request(&request).await.unwrap();
+    let redirect = op
+        .authorization_redirect(&request, "subject", &BTreeMap::new(), None)
+        .await
+        .unwrap();
+    let location = &redirect
+        .headers
+        .iter()
+        .find(|(name, _)| name == "location")
+        .unwrap()
+        .1;
+    let code = extract_param(location, "code").expect("authorization code");
+    assert!(extract_param(location, "access_token").is_some());
+    assert!(extract_param(location, "id_token").is_none());
+
+    let token = op
+        .handle_token_request(
+            &pairs(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", "https://rp.example.com/cb"),
+                ("client_id", "oauth-hybrid"),
+                ("client_secret", "secret"),
+            ]),
+            None,
+            "https://op.example.com/token",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(token.id_token.is_none());
+}
+
 /// `authorization_redirect_with_claims` emits OP-asserted typed claims that keep
 /// their JSON type through code and refresh exchanges: a single-element array
 /// stays an array (never collapsed to a scalar the way a released attribute
