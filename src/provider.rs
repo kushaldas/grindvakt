@@ -384,18 +384,23 @@ impl Provider {
                     .with_state(req.state.clone()),
             );
         }
-        if client.token_endpoint_auth_method == AUTH_NONE && req.wants_code() {
-            match (
-                req.code_challenge.as_deref(),
-                req.code_challenge_method.as_deref(),
-            ) {
-                (Some(challenge), Some("S256")) if pkce::is_valid_s256_challenge(challenge) => {}
-                _ => {
-                    return Err(
-                        OAuthError::invalid_request("public clients must use S256 PKCE")
-                            .with_state(req.state.clone()),
-                    );
-                }
+        if req.wants_code() {
+            let challenge = req.code_challenge.as_deref();
+            let method = req.code_challenge_method.as_deref();
+            let valid_s256 = matches!(
+                (challenge, method),
+                (Some(challenge), Some("S256")) if pkce::is_valid_s256_challenge(challenge)
+            );
+            let omitted_for_confidential = challenge.is_none()
+                && method.is_none()
+                && client.token_endpoint_auth_method != AUTH_NONE;
+            if !valid_s256 && !omitted_for_confidential {
+                let description = if client.token_endpoint_auth_method == AUTH_NONE {
+                    "public clients must use S256 PKCE"
+                } else {
+                    "PKCE must use a canonical S256 code_challenge and method"
+                };
+                return Err(OAuthError::invalid_request(description).with_state(req.state.clone()));
             }
         }
         // The requested scope must not exceed the client's registered scope set

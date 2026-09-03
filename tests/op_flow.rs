@@ -97,6 +97,15 @@ fn extract_param(redirect: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Independently calculate the OIDC token hash for an ES384-signed ID token.
+fn es384_token_hash(value: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha384};
+
+    let digest = Sha384::digest(value.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+}
+
 #[tokio::test]
 async fn authorization_code_pkce_flow() {
     // Public client using PKCE (auth method "none").
@@ -852,6 +861,71 @@ async fn public_code_flow_requires_s256_pkce() {
     // request cannot bypass the public-client PKCE requirement.
     let mint_err = op
         .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(mint_err.code, grindvakt::OAuthErrorCode::InvalidRequest);
+}
+
+/// Regression: a confidential client may omit PKCE, but any supplied tuple
+/// must agree with the provider's advertised canonical S256-only policy.
+#[tokio::test]
+async fn confidential_code_flow_validates_supplied_pkce_tuple() {
+    let client = Client {
+        client_id: "rp-confidential-pkce".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+    let base = AuthorizationRequest::from_params(&map(&[
+        ("client_id", "rp-confidential-pkce"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+    ]))
+    .unwrap();
+
+    op.validate_authorization_request(&base)
+        .await
+        .expect("confidential clients may omit PKCE");
+
+    let verifier = "verifier-0123456789-0123456789-0123456789-01";
+    let canonical = pkce::s256_challenge(verifier);
+    let noncanonical = format!("{}B", "A".repeat(42));
+    for (challenge, method) in [
+        (Some(canonical.as_str()), None),
+        (None, Some("S256")),
+        (Some(verifier), Some("plain")),
+        (Some(noncanonical.as_str()), Some("S256")),
+    ] {
+        let mut malformed = base.clone();
+        malformed.code_challenge = challenge.map(str::to_string);
+        malformed.code_challenge_method = method.map(str::to_string);
+        let err = op
+            .validate_authorization_request(&malformed)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidRequest);
+    }
+
+    let mut protected = base.clone();
+    protected.code_challenge = Some(canonical);
+    protected.code_challenge_method = Some("S256".into());
+    op.validate_authorization_request(&protected)
+        .await
+        .expect("confidential clients may opt in to canonical S256 PKCE");
+
+    let mut plain = base;
+    plain.code_challenge = Some(verifier.into());
+    plain.code_challenge_method = Some("plain".into());
+    let mint_err = op
+        .authorization_redirect(&plain, "sub", &BTreeMap::new(), None)
         .await
         .unwrap_err();
     assert_eq!(mint_err.code, grindvakt::OAuthErrorCode::InvalidRequest);
@@ -1733,6 +1807,101 @@ async fn hybrid_flow_defaults_to_fragment_response_mode() {
         fragment.contains("id_token="),
         "id_token must be delivered in the fragment: {location}"
     );
+}
+
+/// Regression: front-channel ID-token hashes must use the signing algorithm,
+/// left-half truncation, and the exact code/access token emitted alongside it.
+#[tokio::test]
+async fn front_channel_id_token_hashes_bind_emitted_artifacts() {
+    let client = Client {
+        client_id: "rp-hashes".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec![
+            "id_token token".into(),
+            "code id_token".into(),
+            "code id_token token".into(),
+        ],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let mut jwk = jose_rs::jwk::generate_ec("P-384").unwrap();
+    jwk.alg = Some("ES384".into());
+    let signing_key =
+        signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES384"), Some("op-es384"))
+            .unwrap();
+    let op = Provider::new(
+        ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+        signing_key,
+        Arc::new(InMemoryClientStore::with_clients(vec![client])),
+        TokenCodec::new("op-secret"),
+        TokenLifetimes::default(),
+        Arc::new(InMemoryTokenUseStore::new()),
+    );
+    let jwks = op.jwks_document();
+    let validation = jose_rs::jwt::Validation::new()
+        .with_issuer("https://op.example.com")
+        .with_audience("rp-hashes");
+
+    for (response_type, expects_code, expects_access_token) in [
+        ("id_token token", false, true),
+        ("code id_token", true, false),
+        ("code id_token token", true, true),
+    ] {
+        let req = AuthorizationRequest::from_params(&map(&[
+            ("client_id", "rp-hashes"),
+            ("response_type", response_type),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("scope", "openid"),
+            ("nonce", "n-hash"),
+        ]))
+        .unwrap();
+        let redirect = op
+            .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let location = &redirect
+            .headers
+            .iter()
+            .find(|(name, _)| name == "location")
+            .unwrap()
+            .1;
+        let id_token = extract_param(location, "id_token").expect("front-channel ID token");
+        let claims = jose_rs::jwt::decode_with_jwkset(&jwks, &id_token, &validation).unwrap();
+        let code = extract_param(location, "code");
+        let access_token = extract_param(location, "access_token");
+
+        assert_eq!(
+            code.is_some(),
+            expects_code,
+            "response_type={response_type}"
+        );
+        assert_eq!(
+            access_token.is_some(),
+            expects_access_token,
+            "response_type={response_type}"
+        );
+        match code {
+            Some(code) => assert_eq!(
+                claims.extra.get("c_hash").and_then(|value| value.as_str()),
+                Some(es384_token_hash(&code).as_str()),
+                "response_type={response_type}"
+            ),
+            None => assert!(!claims.extra.contains_key("c_hash")),
+        }
+        match access_token {
+            Some(access_token) => assert_eq!(
+                claims.extra.get("at_hash").and_then(|value| value.as_str()),
+                Some(es384_token_hash(&access_token).as_str()),
+                "response_type={response_type}"
+            ),
+            None => assert!(!claims.extra.contains_key("at_hash")),
+        }
+    }
 }
 
 /// Regression: when the authorization code carries a redirect_uri, the token

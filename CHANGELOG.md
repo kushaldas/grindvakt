@@ -12,9 +12,9 @@
   policy, `azp` validation, public-client PKCE, and UserInfo subject binding.
 - Duplicate protocol parameters and reserved authorization extras are rejected;
   authorization errors preserve the validated response mode.
-- Malformed registered redirect URIs and non-canonical S256 challenges are
-  rejected, and narrowed refresh grants remove standard claims for scopes the
-  client dropped.
+- Malformed registered redirect URIs are rejected, every supplied PKCE tuple
+  must use canonical S256, and narrowed refresh grants remove standard claims
+  for scopes the client dropped.
 - DPoP always fails closed without an atomic replay store, and `DpopProof` is
   opaque so only validation can create it.
 - **Breaking:** `Provider::new` now requires an explicit `TokenUseStore`, and
