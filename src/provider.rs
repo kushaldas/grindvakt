@@ -236,6 +236,12 @@ impl Provider {
     /// process handles every token request. Multi-worker deployments must use
     /// a shared atomic implementation so codes, refresh tokens, and client
     /// assertion identifiers cannot be replayed against another worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::Config`] when `signing_key` uses an
+    /// `HS*` algorithm. OIDC MAC ID tokens are keyed by each client's own
+    /// `client_secret`; this provider currently publishes one asymmetric key.
     pub fn new(
         mut metadata: ProviderMetadata,
         signing_key: SigningKey,
@@ -243,7 +249,15 @@ impl Provider {
         codec: TokenCodec,
         lifetimes: TokenLifetimes,
         token_use_store: Arc<dyn TokenUseStore>,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
+        if matches!(
+            signing_key.alg(),
+            JwsAlgorithm::HS256 | JwsAlgorithm::HS384 | JwsAlgorithm::HS512
+        ) {
+            return Err(crate::error::Error::Config(
+                "provider ID-token signing requires an asymmetric key; HS* algorithms require each client's own client_secret".into(),
+            ));
+        }
         let supports_token_hash = supports_oidc_token_hash(signing_key.alg());
         metadata.id_token_signing_alg_values_supported = vec![signing_key.alg().to_string()];
         metadata.response_types_supported =
@@ -256,8 +270,11 @@ impl Provider {
             ]);
         }
         metadata.response_modes_supported = vec!["query".into(), "fragment".into()];
+        // Discovery clients use this list to decide whether the front-channel
+        // token response types advertised above are actually supported.
         metadata.grant_types_supported = vec![
             "authorization_code".into(),
+            "implicit".into(),
             "client_credentials".into(),
             "refresh_token".into(),
         ];
@@ -271,7 +288,7 @@ impl Provider {
         metadata.code_challenge_methods_supported = vec!["S256".into()];
         metadata.claims_parameter_supported = false;
         metadata.request_parameter_supported = false;
-        Self {
+        Ok(Self {
             metadata,
             signing_key,
             clients,
@@ -279,7 +296,7 @@ impl Provider {
             lifetimes,
             token_use_store,
             client_assertion_max_age: DEFAULT_CLIENT_ASSERTION_MAX_AGE,
-        }
+        })
     }
 
     /// Replace the explicitly selected token-use store.
@@ -444,7 +461,7 @@ impl Provider {
     /// so an array stays an array even with one element. They overwrite any
     /// released claim of the same name — the OP-asserted value wins over anything
     /// an attribute map produced — and reserved registered claims (`iss`, `sub`,
-    /// …) are ignored, exactly as released claims are in [`Self::build_id_token`].
+    /// …) are ignored, exactly as released claims are in `Self::build_id_token`.
     /// The values are sealed into the authorization code, so they survive the
     /// code and refresh-token exchanges unchanged rather than being recomputed.
     pub async fn authorization_redirect_with_claims(
@@ -1080,10 +1097,27 @@ impl Provider {
         auth_header: Option<&str>,
         token_url: &str,
     ) -> Result<Client, OAuthError> {
+        let assertion_present =
+            form.contains_key("client_assertion") || form.contains_key("client_assertion_type");
+        let secret_post_present = form.contains_key("client_secret");
+        let method_count = usize::from(assertion_present)
+            + usize::from(secret_post_present)
+            + usize::from(auth_header.is_some());
+        if method_count > 1 {
+            return Err(OAuthError::invalid_client(
+                "multiple client authentication methods",
+            ));
+        }
+
         // private_key_jwt (RFC 7523).
-        if let Some(assertion) = form.get("client_assertion") {
-            let atype = form.get("client_assertion_type").map(|s| s.as_str());
-            if atype != Some(CLIENT_ASSERTION_TYPE) {
+        if assertion_present {
+            let Some(assertion) = form.get("client_assertion") else {
+                return Err(OAuthError::invalid_client(
+                    "incomplete client assertion authentication",
+                ));
+            };
+            if form.get("client_assertion_type").map(String::as_str) != Some(CLIENT_ASSERTION_TYPE)
+            {
                 return Err(OAuthError::invalid_client("invalid client_assertion_type"));
             }
             return self
@@ -1093,17 +1127,27 @@ impl Provider {
 
         // client_secret_basic.
         if let Some(header) = auth_header {
-            if let Some(b64) = header.strip_prefix("Basic ") {
-                let (id, secret) = decode_basic(b64)
-                    .ok_or_else(|| OAuthError::invalid_client("malformed Basic auth"))?;
-                return self
-                    .check_secret(&id, &secret, AUTH_CLIENT_SECRET_BASIC)
-                    .await;
+            let Some((scheme, credentials)) = header.split_once(' ') else {
+                return Err(OAuthError::invalid_client("malformed Authorization header"));
+            };
+            if !scheme.eq_ignore_ascii_case("Basic") {
+                return Err(OAuthError::invalid_client(
+                    "unsupported Authorization scheme",
+                ));
             }
+            let (id, secret) = decode_basic(credentials)
+                .ok_or_else(|| OAuthError::invalid_client("malformed Basic auth"))?;
+            return self
+                .check_secret(&id, &secret, AUTH_CLIENT_SECRET_BASIC)
+                .await;
         }
 
         // client_secret_post.
-        if let (Some(id), Some(secret)) = (form.get("client_id"), form.get("client_secret")) {
+        if secret_post_present {
+            let id = form
+                .get("client_id")
+                .ok_or_else(|| OAuthError::invalid_client("client_secret missing client_id"))?;
+            let secret = form.get("client_secret").expect("presence checked above");
             return self.check_secret(id, secret, AUTH_CLIENT_SECRET_POST).await;
         }
 
@@ -1578,16 +1622,46 @@ mod tests {
             TokenCodec::new("secret"),
             TokenLifetimes::default(),
             Arc::new(InMemoryTokenUseStore::new()),
-        );
+        )
+        .expect("asymmetric OP signing key");
 
         assert!(provider
             .metadata
             .response_types_supported
             .contains(&"id_token".to_string()));
+        assert!(
+            provider
+                .metadata
+                .grant_types_supported
+                .contains(&"implicit".to_string()),
+            "front-channel token response types require the implicit grant advertisement"
+        );
         assert!(!provider
             .metadata
             .response_types_supported
             .contains(&"code id_token".to_string()));
+    }
+
+    #[test]
+    fn provider_rejects_symmetric_id_token_signing_keys() {
+        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([42_u8; 64]);
+        let jwk = serde_json::json!({ "kty": "oct", "k": secret }).to_string();
+        for algorithm in ["HS256", "HS384", "HS512"] {
+            let key = crate::keys::signing_key_from_jwk_json(&jwk, Some(algorithm), Some("op-hs"))
+                .expect("valid symmetric signing key");
+            let result = Provider::new(
+                ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+                key,
+                Arc::new(crate::client::InMemoryClientStore::new()),
+                TokenCodec::new("secret"),
+                TokenLifetimes::default(),
+                Arc::new(InMemoryTokenUseStore::new()),
+            );
+            assert!(
+                matches!(result, Err(crate::error::Error::Config(_))),
+                "{algorithm} must not be accepted as a provider-wide ID-token key"
+            );
+        }
     }
 
     #[cfg(feature = "redis")]
@@ -1768,7 +1842,8 @@ mod tests {
             TokenCodec::new("op-secret"),
             TokenLifetimes::default(),
             store.clone(),
-        );
+        )
+        .expect("asymmetric OP signing key");
 
         // Fresh assertion, but exp a decade out.
         let now = now_secs();

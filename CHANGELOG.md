@@ -2,6 +2,18 @@
 
 ## unreleased
 
+- Provider discovery metadata now advertises the `implicit` grant alongside
+  the supported implicit and hybrid response types.
+- **Breaking:** `OAuthError::to_redirect` requires the validated response
+  mode, `Provider::new` is fallible so it can reject provider-wide symmetric
+  `HS*` ID-token signing keys, and the direct JWKS/UserInfo fetch helpers
+  require their associated issuer.
+- Remote issuers and federation entities can no longer advertise loopback
+  HTTP service endpoints. The loopback development exception applies only
+  when the issuer/entity is itself a loopback HTTP origin.
+- Token requests that present more than one client-authentication method are
+  rejected with `invalid_client`, as required by RFC 6749 section 2.3.
+
 ## 0.8.0 [2026-09-03]
 
 - Hardened OIDC authorization responses: all advertised standard response

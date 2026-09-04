@@ -45,7 +45,8 @@ let key = signing_key_from_pkcs11(&Pkcs11KeyConfig {
     alg: JwsAlgorithm::ES256,
     kid: Some("op-key-1".into()),
 })?;
- // `key` is a normal SigningKey: Provider::new(metadata, key, …), federation, and rp all work.
+// `key` is an asymmetric SigningKey:
+// Provider::new(metadata, key, ...)?, federation, and rp all work.
 ```
 
 Supported algorithms: RSA (`RS256/384/512`), EC `ES256`/`ES384`, and `EdDSA`

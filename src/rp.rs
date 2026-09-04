@@ -43,14 +43,18 @@ impl ProviderInfo {
     /// Validate every endpoint before it can receive requests or credentials.
     pub fn validate(&self) -> Result<()> {
         validate_issuer(&self.issuer)?;
-        validate_service_endpoint("authorization_endpoint", &self.authorization_endpoint)?;
+        validate_service_endpoint_for_issuer(
+            "authorization_endpoint",
+            &self.authorization_endpoint,
+            &self.issuer,
+        )?;
         validate_authorization_endpoint_query(&self.authorization_endpoint)?;
-        validate_service_endpoint("token_endpoint", &self.token_endpoint)?;
+        validate_service_endpoint_for_issuer("token_endpoint", &self.token_endpoint, &self.issuer)?;
         if let Some(endpoint) = self.userinfo_endpoint.as_deref() {
-            validate_service_endpoint("userinfo_endpoint", endpoint)?;
+            validate_service_endpoint_for_issuer("userinfo_endpoint", endpoint, &self.issuer)?;
         }
         if let Some(endpoint) = self.jwks_uri.as_deref() {
-            validate_service_endpoint("jwks_uri", endpoint)?;
+            validate_service_endpoint_for_issuer("jwks_uri", endpoint, &self.issuer)?;
         }
         Ok(())
     }
@@ -285,9 +289,7 @@ fn is_loopback_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Require an absolute HTTPS endpoint. Plain HTTP is supported only for
-/// loopback development servers, matching the issuer exception.
-pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
+fn validate_endpoint(name: &str, endpoint: &str, allow_loopback_http: bool) -> Result<()> {
     // The URL parser discards some raw whitespace and control characters.
     // Reject them first because callers send or return the original string,
     // and validation must describe the same bytes that reach the sink.
@@ -302,10 +304,17 @@ pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
     let parsed = url::Url::parse(endpoint)
         .map_err(|e| Error::BadRequest(format!("invalid {name} URL {endpoint}: {e}")))?;
     let scheme_ok = parsed.scheme() == "https"
-        || (parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host));
+        || (allow_loopback_http
+            && parsed.scheme() == "http"
+            && parsed.host_str().is_some_and(is_loopback_host));
     if !scheme_ok || parsed.host_str().is_none() {
+        let policy = if allow_loopback_http {
+            "an absolute https URL (http allowed only for loopback hosts)"
+        } else {
+            "an absolute https URL"
+        };
         return Err(Error::BadRequest(format!(
-            "{name} must be an absolute https URL (http allowed only for loopback hosts): {endpoint}"
+            "{name} must be {policy}: {endpoint}"
         )));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -319,6 +328,42 @@ pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Require an absolute HTTPS endpoint.
+///
+/// This context-free validator deliberately does not permit loopback HTTP: a
+/// metadata-derived endpoint can only use the development exception when its
+/// associated issuer or entity identifier is also a loopback HTTP origin.
+pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
+    validate_endpoint(name, endpoint, false)
+}
+
+fn issuer_allows_loopback_http(issuer: &str) -> bool {
+    if issuer
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return false;
+    }
+    url::Url::parse(issuer).is_ok_and(|parsed| {
+        parsed.scheme() == "http"
+            && parsed.host_str().is_some_and(is_loopback_host)
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+    })
+}
+
+/// Validate a metadata endpoint relative to its authenticated issuer/entity.
+/// Loopback HTTP is allowed only for an explicitly loopback HTTP issuer.
+pub(crate) fn validate_service_endpoint_for_issuer(
+    name: &str,
+    endpoint: &str,
+    issuer: &str,
+) -> Result<()> {
+    validate_endpoint(name, endpoint, issuer_allows_loopback_http(issuer))
 }
 
 fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
@@ -351,7 +396,7 @@ fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
 }
 
 fn validate_issuer(issuer: &str) -> Result<()> {
-    validate_service_endpoint("issuer", issuer)?;
+    validate_endpoint("issuer", issuer, true)?;
     let parsed = url::Url::parse(issuer)
         .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
     if parsed.query().is_some() || parsed.fragment().is_some() {
@@ -373,9 +418,17 @@ fn validate_redirect_uri(redirect_uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch a JWKS document.
-pub async fn fetch_jwks(http: &Arc<dyn HttpClient>, jwks_uri: &str) -> Result<JwkSet> {
-    validate_service_endpoint("jwks_uri", jwks_uri)?;
+/// Fetch a JWKS document for an associated issuer.
+///
+/// The issuer context is mandatory because the loopback HTTP development
+/// exception applies only when the issuer itself is a loopback HTTP origin.
+pub async fn fetch_jwks(
+    http: &Arc<dyn HttpClient>,
+    jwks_uri: &str,
+    issuer: &str,
+) -> Result<JwkSet> {
+    validate_issuer(issuer)?;
+    validate_service_endpoint_for_issuer("jwks_uri", jwks_uri, issuer)?;
     let resp = http.get(jwks_uri).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
@@ -528,14 +581,19 @@ pub fn verify_id_token(
     Ok(claims)
 }
 
-/// Fetch userinfo with a Bearer access token.
+/// Fetch UserInfo with a Bearer access token for an associated issuer.
+///
+/// The issuer context is mandatory because the loopback HTTP development
+/// exception applies only when the issuer itself is a loopback HTTP origin.
 pub async fn fetch_userinfo(
     http: &Arc<dyn HttpClient>,
     userinfo_endpoint: &str,
     access_token: &str,
     expected_sub: &str,
+    issuer: &str,
 ) -> Result<serde_json::Value> {
-    validate_service_endpoint("userinfo_endpoint", userinfo_endpoint)?;
+    validate_issuer(issuer)?;
+    validate_service_endpoint_for_issuer("userinfo_endpoint", userinfo_endpoint, issuer)?;
     // The injected client has no per-request header API on GET, so userinfo is
     // fetched via post_form with an empty body carrying the Authorization
     // header. (Most OPs accept GET or POST at userinfo.)
@@ -672,18 +730,60 @@ mod tests {
             );
         }
 
-        // Encoded octets do not create a parser/use mismatch, and the existing
-        // endpoint query and loopback-development policies remain unchanged.
+        // Encoded octets do not create a parser/use mismatch, and endpoint
+        // queries remain valid.
         for endpoint in [
             "https://op.example.org/token?label=hello%20world",
             "https://op.example.org/%09/%0A",
-            "http://localhost:8080/token",
-            "http://127.0.0.1:8080/token",
-            "http://[::1]:8080/token",
         ] {
             validate_service_endpoint("token_endpoint", endpoint)
                 .unwrap_or_else(|error| panic!("valid endpoint {endpoint:?}: {error}"));
         }
+
+        // A context-free URL must never inherit the development exception.
+        for endpoint in [
+            "http://localhost:8080/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+        ] {
+            assert!(validate_service_endpoint("token_endpoint", endpoint).is_err());
+        }
+    }
+
+    #[test]
+    fn loopback_http_endpoints_require_a_loopback_http_issuer() {
+        let (_, provider, _) = client_and_provider();
+        for field in [
+            "authorization_endpoint",
+            "token_endpoint",
+            "userinfo_endpoint",
+            "jwks_uri",
+        ] {
+            let mut contaminated = provider.clone();
+            let endpoint = "http://127.0.0.1:8080/path".to_string();
+            match field {
+                "authorization_endpoint" => contaminated.authorization_endpoint = endpoint,
+                "token_endpoint" => contaminated.token_endpoint = endpoint,
+                "userinfo_endpoint" => contaminated.userinfo_endpoint = Some(endpoint),
+                "jwks_uri" => contaminated.jwks_uri = Some(endpoint),
+                _ => unreachable!(),
+            }
+            assert!(
+                contaminated.validate().is_err(),
+                "remote issuer must not authorize loopback HTTP {field}"
+            );
+        }
+
+        let local = ProviderInfo {
+            issuer: "http://localhost:8080".into(),
+            authorization_endpoint: "http://localhost:8080/authorize".into(),
+            token_endpoint: "http://127.0.0.1:8080/token".into(),
+            userinfo_endpoint: Some("http://[::1]:8080/userinfo".into()),
+            jwks_uri: Some("http://localhost:8080/jwks".into()),
+        };
+        local
+            .validate()
+            .expect("loopback issuer may use loopback HTTP endpoints");
     }
 
     #[test]
@@ -839,6 +939,40 @@ mod tests {
         });
         let metadata = discover(&http, "http://127.0.0.1:8080").await.unwrap();
         assert_eq!(metadata.issuer, "http://127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn fetch_jwks_binds_loopback_http_exception_to_issuer() {
+        let rejected_http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: None,
+            post: None,
+        });
+        let error = fetch_jwks(
+            &rejected_http,
+            "http://127.0.0.1:8080/jwks",
+            "https://remote.example",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("absolute https URL"));
+
+        let (_, _, key) = client_and_provider();
+        let local_http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse {
+                status: 200,
+                body: key.to_public_jwks().to_json().unwrap().into_bytes(),
+                content_type: Some("application/json".into()),
+            }),
+            post: None,
+        });
+        let fetched = fetch_jwks(
+            &local_http,
+            "http://127.0.0.1:8080/jwks",
+            "http://localhost:8080",
+        )
+        .await
+        .expect("loopback issuer may fetch a loopback HTTP JWKS");
+        assert_eq!(fetched.keys.len(), 1);
     }
 
     #[tokio::test]

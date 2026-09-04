@@ -72,6 +72,7 @@ fn provider_with(clients: InMemoryClientStore) -> Provider {
         TokenLifetimes::default(),
         Arc::new(InMemoryTokenUseStore::new()),
     )
+    .expect("asymmetric OP signing key")
 }
 
 fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -1742,6 +1743,56 @@ async fn presented_auth_method_must_match_registered_method() {
     )
     .await
     .expect("registered basic auth method");
+
+    // RFC 6749 section 2.3 forbids using more than one authentication method
+    // in a request. No method receives precedence over the others.
+    for form in [
+        pairs(&[("client_id", "rp-basic"), ("client_secret", "topsecret")]),
+        pairs(&[
+            ("client_id", "rp-basic"),
+            ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+            ("client_assertion", "unverified"),
+        ]),
+    ] {
+        let err = op
+            .authenticate_client(&form, Some(&header), "https://op.example.com/token")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidClient);
+        assert_eq!(
+            err.description.as_deref(),
+            Some("multiple client authentication methods")
+        );
+    }
+
+    let err = op
+        .authenticate_client(
+            &pairs(&[
+                ("client_id", "rp-basic"),
+                ("client_secret", "topsecret"),
+                ("client_assertion_type", CLIENT_ASSERTION_TYPE),
+                ("client_assertion", "unverified"),
+            ]),
+            None,
+            "https://op.example.com/token",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidClient);
+    assert_eq!(
+        err.description.as_deref(),
+        Some("multiple client authentication methods")
+    );
+
+    // HTTP authentication scheme names are case-insensitive.
+    let lowercase_header = format!("basic {b64}");
+    op.authenticate_client(
+        &pairs(&[("client_id", "rp-basic")]),
+        Some(&lowercase_header),
+        "https://op.example.com/token",
+    )
+    .await
+    .expect("case-insensitive Basic scheme");
 }
 
 /// Regression: implicit and hybrid response types require a nonce (OIDC Core
@@ -1936,7 +1987,8 @@ async fn front_channel_id_token_hashes_bind_emitted_artifacts() {
         TokenCodec::new("op-secret"),
         TokenLifetimes::default(),
         Arc::new(InMemoryTokenUseStore::new()),
-    );
+    )
+    .expect("asymmetric OP signing key");
     let jwks = op.jwks_document();
     let validation = jose_rs::jwt::Validation::new()
         .with_issuer("https://op.example.com")

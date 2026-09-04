@@ -25,6 +25,9 @@ the crate:
 - `discover` rejects non-https issuer URLs (plain http is allowed only for
   loopback hosts — localhost, 127.0.0.0/8, ::1 — for local development) and
   rejects metadata whose `issuer` does not match the requested issuer.
+  Metadata endpoints inherit the plain-http exception only when that issuer
+  is itself a loopback HTTP origin; remote issuers cannot redirect requests
+  to local plaintext endpoints.
 - `exchange_code` strips control characters from the upstream error body and
   truncates it to 512 characters before embedding it in the error.
 

@@ -121,15 +121,10 @@ impl OAuthError {
         r
     }
 
-    /// Render an error as a redirect back to the client (authorization endpoint).
-    pub fn to_redirect(&self, redirect_uri: &str) -> Response {
-        self.to_redirect_with_fragment(redirect_uri, false)
-    }
-
-    /// Render an authorization error using the validated response mode.
-    /// Fragment mode is required whenever the corresponding successful
-    /// response would have used the fragment.
-    pub fn to_redirect_with_fragment(&self, redirect_uri: &str, fragment: bool) -> Response {
+    /// Render an authorization error using an explicitly selected, validated
+    /// response mode. `fragment` must come from the validated authorization
+    /// request and must match the corresponding successful response mode.
+    pub fn to_redirect(&self, redirect_uri: &str, fragment: bool) -> Response {
         let mut params = vec![("error", self.code.as_str())];
         if let Some(desc) = self.description.as_deref() {
             params.push(("error_description", desc));
@@ -192,13 +187,13 @@ mod tests {
     #[test]
     fn authorization_errors_preserve_validated_response_mode() {
         let error = OAuthError::invalid_request("bad request").with_state(Some("s".into()));
-        let query = error.to_redirect_with_fragment("https://rp.example/cb#existing", false);
+        let query = error.to_redirect("https://rp.example/cb#existing", false);
         assert_eq!(
             location(&query),
             "https://rp.example/cb?error=invalid_request&error_description=bad+request&state=s#existing"
         );
 
-        let fragment = error.to_redirect_with_fragment("https://rp.example/cb", true);
+        let fragment = error.to_redirect("https://rp.example/cb", true);
         assert_eq!(
             location(&fragment),
             "https://rp.example/cb#error=invalid_request&error_description=bad+request&state=s"
