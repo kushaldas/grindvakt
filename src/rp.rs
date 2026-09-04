@@ -11,9 +11,10 @@ use crate::metadata::ProviderMetadata;
 use crate::oauth_error::urlencode;
 use crate::provider::CLIENT_ASSERTION_TYPE;
 use crate::util::now_secs;
+use jose_rs::algorithm::JwsAlgorithm;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Audience, Claims, Validation};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Minimal upstream provider info the RP needs.
@@ -35,6 +36,27 @@ impl From<ProviderMetadata> for ProviderInfo {
             userinfo_endpoint: Some(m.userinfo_endpoint),
             jwks_uri: Some(m.jwks_uri),
         }
+    }
+}
+
+impl ProviderInfo {
+    /// Validate every endpoint before it can receive requests or credentials.
+    pub fn validate(&self) -> Result<()> {
+        validate_issuer(&self.issuer)?;
+        validate_service_endpoint_for_issuer(
+            "authorization_endpoint",
+            &self.authorization_endpoint,
+            &self.issuer,
+        )?;
+        validate_authorization_endpoint_query(&self.authorization_endpoint)?;
+        validate_service_endpoint_for_issuer("token_endpoint", &self.token_endpoint, &self.issuer)?;
+        if let Some(endpoint) = self.userinfo_endpoint.as_deref() {
+            validate_service_endpoint_for_issuer("userinfo_endpoint", endpoint, &self.issuer)?;
+        }
+        if let Some(endpoint) = self.jwks_uri.as_deref() {
+            validate_service_endpoint_for_issuer("jwks_uri", endpoint, &self.issuer)?;
+        }
+        Ok(())
     }
 }
 
@@ -60,9 +82,9 @@ pub struct RpClient {
 /// The result of a successful token exchange.
 #[derive(Debug, Clone)]
 pub struct TokenSet {
-    pub access_token: Option<String>,
-    pub id_token: Option<String>,
-    pub token_type: Option<String>,
+    pub access_token: String,
+    pub id_token: String,
+    pub token_type: String,
     pub raw: serde_json::Value,
 }
 
@@ -74,7 +96,29 @@ pub fn authorization_url(
     nonce: &str,
     code_challenge: Option<&str>,
     extra: &[(&str, &str)],
-) -> String {
+) -> Result<String> {
+    provider.validate()?;
+    validate_redirect_uri(&client.redirect_uri)?;
+    if !client
+        .scope
+        .split_whitespace()
+        .any(|scope| scope == "openid")
+    {
+        return Err(Error::BadRequest(
+            "OIDC authorization requests require the openid scope".into(),
+        ));
+    }
+    if matches!(&client.auth, ClientAuth::None) && code_challenge.is_none() {
+        return Err(Error::BadRequest(
+            "public clients must use S256 PKCE".into(),
+        ));
+    }
+    if let Some(challenge) = code_challenge {
+        if !crate::pkce::is_valid_s256_challenge(challenge) {
+            return Err(Error::BadRequest("invalid S256 code_challenge".into()));
+        }
+    }
+    validate_authorization_extras(&provider.authorization_endpoint, extra)?;
     let mut params = vec![
         ("response_type", "code"),
         ("client_id", client.client_id.as_str()),
@@ -99,7 +143,44 @@ pub fn authorization_url(
     } else {
         '?'
     };
-    format!("{}{}{}", provider.authorization_endpoint, sep, qs)
+    Ok(format!("{}{}{}", provider.authorization_endpoint, sep, qs))
+}
+
+fn validate_authorization_extras(endpoint: &str, extra: &[(&str, &str)]) -> Result<()> {
+    const RESERVED: &[&str] = &[
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "state",
+        "nonce",
+        "code_challenge",
+        "code_challenge_method",
+    ];
+    // Seed the set from configured endpoint parameters so an application
+    // cannot accidentally append a second, conflicting vendor parameter.
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| Error::BadRequest(format!("invalid authorization_endpoint: {e}")))?;
+    let mut seen = parsed
+        .query_pairs()
+        .filter(|(name, _)| name != "resource")
+        .map(|(name, _)| name.into_owned())
+        .collect::<BTreeSet<_>>();
+    for (name, _) in extra {
+        if RESERVED.contains(name) {
+            return Err(Error::BadRequest(format!(
+                "authorization extra parameter {name} is library-controlled"
+            )));
+        }
+        // RFC 8707 permits repeated resource parameters. Other extension
+        // parameters must remain unambiguous.
+        if *name != "resource" && !seen.insert((*name).to_string()) {
+            return Err(Error::BadRequest(format!(
+                "duplicate authorization extra parameter: {name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Build a signed request object (RFC 9101, "JAR") carrying the
@@ -125,6 +206,27 @@ pub fn signed_request_object(
     nonce: &str,
     code_challenge: Option<&str>,
 ) -> Result<String> {
+    provider.validate()?;
+    validate_redirect_uri(&client.redirect_uri)?;
+    if !client
+        .scope
+        .split_whitespace()
+        .any(|scope| scope == "openid")
+    {
+        return Err(Error::BadRequest(
+            "OIDC authorization requests require the openid scope".into(),
+        ));
+    }
+    if matches!(&client.auth, ClientAuth::None) && code_challenge.is_none() {
+        return Err(Error::BadRequest(
+            "public clients must use S256 PKCE".into(),
+        ));
+    }
+    if let Some(challenge) = code_challenge {
+        if !crate::pkce::is_valid_s256_challenge(challenge) {
+            return Err(Error::BadRequest("invalid S256 code_challenge".into()));
+        }
+    }
     let now = now_secs();
     let mut c = Claims::default();
     c.iss = Some(client.client_id.clone());
@@ -152,17 +254,10 @@ pub fn signed_request_object(
 /// hosts, for local development), and per OIDC Discovery §4.3 the `issuer`
 /// returned in the metadata MUST match the requested issuer exactly.
 pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<ProviderMetadata> {
-    let issuer = issuer.trim_end_matches('/');
-    let parsed = url::Url::parse(issuer)
-        .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
-    let scheme_ok = parsed.scheme() == "https"
-        || (parsed.scheme() == "http" && parsed.host_str().map(is_loopback_host).unwrap_or(false));
-    if !scheme_ok {
-        return Err(Error::BadRequest(format!(
-            "issuer must be an https URL (http allowed only for loopback hosts): {issuer}"
-        )));
-    }
-    let url = format!("{issuer}/.well-known/openid-configuration");
+    let requested_issuer = issuer;
+    validate_issuer(requested_issuer)?;
+    let discovery_prefix = requested_issuer.trim_end_matches('/');
+    let url = format!("{discovery_prefix}/.well-known/openid-configuration");
     let resp = http.get(&url).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
@@ -171,12 +266,13 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
         )));
     }
     let metadata: ProviderMetadata = resp.json()?;
-    if metadata.issuer.trim_end_matches('/') != issuer {
+    if metadata.issuer != requested_issuer {
         return Err(Error::Authn(format!(
-            "discovered issuer {} does not match requested issuer {issuer}",
+            "discovered issuer {} does not match requested issuer {requested_issuer}",
             metadata.issuer
         )));
     }
+    ProviderInfo::from(metadata.clone()).validate()?;
     Ok(metadata)
 }
 
@@ -193,8 +289,146 @@ fn is_loopback_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Fetch a JWKS document.
-pub async fn fetch_jwks(http: &Arc<dyn HttpClient>, jwks_uri: &str) -> Result<JwkSet> {
+fn validate_endpoint(name: &str, endpoint: &str, allow_loopback_http: bool) -> Result<()> {
+    // The URL parser discards some raw whitespace and control characters.
+    // Reject them first because callers send or return the original string,
+    // and validation must describe the same bytes that reach the sink.
+    if endpoint
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(Error::BadRequest(format!(
+            "{name} must not contain whitespace or control characters"
+        )));
+    }
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| Error::BadRequest(format!("invalid {name} URL {endpoint}: {e}")))?;
+    let scheme_ok = parsed.scheme() == "https"
+        || (allow_loopback_http
+            && parsed.scheme() == "http"
+            && parsed.host_str().is_some_and(is_loopback_host));
+    if !scheme_ok || parsed.host_str().is_none() {
+        let policy = if allow_loopback_http {
+            "an absolute https URL (http allowed only for loopback hosts)"
+        } else {
+            "an absolute https URL"
+        };
+        return Err(Error::BadRequest(format!(
+            "{name} must be {policy}: {endpoint}"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::BadRequest(format!(
+            "{name} must not contain userinfo: {endpoint}"
+        )));
+    }
+    if parsed.fragment().is_some() {
+        return Err(Error::BadRequest(format!(
+            "{name} must not contain a fragment: {endpoint}"
+        )));
+    }
+    Ok(())
+}
+
+/// Require an absolute HTTPS endpoint.
+///
+/// This context-free validator deliberately does not permit loopback HTTP: a
+/// metadata-derived endpoint can only use the development exception when its
+/// associated issuer or entity identifier is also a loopback HTTP origin.
+pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
+    validate_endpoint(name, endpoint, false)
+}
+
+fn issuer_allows_loopback_http(issuer: &str) -> bool {
+    if issuer
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return false;
+    }
+    url::Url::parse(issuer).is_ok_and(|parsed| {
+        parsed.scheme() == "http"
+            && parsed.host_str().is_some_and(is_loopback_host)
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+    })
+}
+
+/// Validate a metadata endpoint relative to its authenticated issuer/entity.
+/// Loopback HTTP is allowed only for an explicitly loopback HTTP issuer.
+pub(crate) fn validate_service_endpoint_for_issuer(
+    name: &str,
+    endpoint: &str,
+    issuer: &str,
+) -> Result<()> {
+    validate_endpoint(name, endpoint, issuer_allows_loopback_http(issuer))
+}
+
+fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
+    const RESERVED: &[&str] = &[
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "state",
+        "nonce",
+        "code_challenge",
+        "code_challenge_method",
+    ];
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|e| Error::BadRequest(format!("invalid authorization_endpoint: {e}")))?;
+    let mut seen = BTreeSet::new();
+    for (name, _) in parsed.query_pairs() {
+        if RESERVED.contains(&name.as_ref()) {
+            return Err(Error::BadRequest(format!(
+                "authorization_endpoint query parameter {name} is library-controlled"
+            )));
+        }
+        if name != "resource" && !seen.insert(name.into_owned()) {
+            return Err(Error::BadRequest(
+                "authorization_endpoint contains duplicate query parameters".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_issuer(issuer: &str) -> Result<()> {
+    validate_endpoint("issuer", issuer, true)?;
+    let parsed = url::Url::parse(issuer)
+        .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Error::BadRequest(
+            "issuer URL must not contain a query or fragment".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_redirect_uri(redirect_uri: &str) -> Result<()> {
+    let parsed = url::Url::parse(redirect_uri)
+        .map_err(|e| Error::BadRequest(format!("invalid redirect_uri {redirect_uri}: {e}")))?;
+    if parsed.fragment().is_some() {
+        return Err(Error::BadRequest(
+            "redirect_uri must not contain a fragment".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fetch a JWKS document for an associated issuer.
+///
+/// The issuer context is mandatory because the loopback HTTP development
+/// exception applies only when the issuer itself is a loopback HTTP origin.
+pub async fn fetch_jwks(
+    http: &Arc<dyn HttpClient>,
+    jwks_uri: &str,
+    issuer: &str,
+) -> Result<JwkSet> {
+    validate_issuer(issuer)?;
+    validate_service_endpoint_for_issuer("jwks_uri", jwks_uri, issuer)?;
     let resp = http.get(jwks_uri).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
@@ -213,6 +447,18 @@ pub async fn exchange_code(
     code: &str,
     code_verifier: Option<&str>,
 ) -> Result<TokenSet> {
+    provider.validate()?;
+    validate_redirect_uri(&client.redirect_uri)?;
+    if matches!(&client.auth, ClientAuth::None) && code_verifier.is_none() {
+        return Err(Error::BadRequest(
+            "public clients must supply a PKCE code_verifier".into(),
+        ));
+    }
+    if let Some(verifier) = code_verifier {
+        if !crate::pkce::is_valid_verifier(verifier) {
+            return Err(Error::BadRequest("invalid PKCE code_verifier".into()));
+        }
+    }
     let mut form: Vec<(String, String)> = vec![
         ("grant_type".into(), "authorization_code".into()),
         ("code".into(), code.to_string()),
@@ -237,19 +483,35 @@ pub async fn exchange_code(
         )));
     }
     let raw: serde_json::Value = resp.json()?;
+    let access_token = raw
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .ok_or_else(|| Error::Authn("token response missing access_token".into()))?;
+    let id_token = raw
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .ok_or_else(|| Error::Authn("token response missing id_token".into()))?;
+    let token_type = raw
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+        .ok_or_else(|| Error::Authn("token response missing token_type".into()))?;
+    // This RP currently sends access tokens using the Bearer scheme. RFC 6749
+    // section 7.1 forbids using a token type the client does not understand.
+    if !token_type.eq_ignore_ascii_case("Bearer") {
+        return Err(Error::Authn(format!(
+            "unsupported token_type in token response: {token_type}"
+        )));
+    }
     Ok(TokenSet {
-        access_token: raw
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        id_token: raw
-            .get("id_token")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        token_type: raw
-            .get("token_type")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        access_token,
+        id_token,
+        token_type,
         raw,
     })
 }
@@ -261,13 +523,54 @@ pub fn verify_id_token(
     issuer: &str,
     client_id: &str,
     expected_nonce: Option<&str>,
+    allowed_algorithms: &[JwsAlgorithm],
+    trusted_additional_audiences: &[&str],
 ) -> Result<Claims> {
+    if allowed_algorithms.is_empty() {
+        return Err(Error::BadRequest(
+            "at least one allowed id_token signing algorithm is required".into(),
+        ));
+    }
     let validation = Validation::new()
         .with_issuer(issuer)
         .with_audience(client_id)
         .require_exp()
-        .require_iat();
+        .require_iat()
+        .with_allowed_algorithms(allowed_algorithms.to_vec());
     let claims = jwt::verify_with_jwks(jwks, id_token, &validation)?;
+
+    if claims.sub.as_deref().is_none_or(str::is_empty) {
+        return Err(Error::Authn("id_token missing sub".into()));
+    }
+    if let Some(Audience::Multiple(values)) = claims.aud.as_ref() {
+        let mut seen = BTreeSet::new();
+        for audience in values {
+            if !seen.insert(audience) {
+                return Err(Error::Authn("id_token contains duplicate audiences".into()));
+            }
+            if audience != client_id
+                && !trusted_additional_audiences
+                    .iter()
+                    .any(|trusted| audience == trusted)
+            {
+                return Err(Error::Authn(format!(
+                    "id_token contains untrusted audience: {audience}"
+                )));
+            }
+        }
+        if values.len() > 1
+            && claims.extra.get("azp").and_then(|value| value.as_str()) != Some(client_id)
+        {
+            return Err(Error::Authn(
+                "multi-audience id_token requires azp equal to client_id".into(),
+            ));
+        }
+    }
+    if let Some(azp) = claims.extra.get("azp") {
+        if azp.as_str() != Some(client_id) {
+            return Err(Error::Authn("id_token azp mismatch".into()));
+        }
+    }
 
     if let Some(nonce) = expected_nonce {
         let got = claims.extra.get("nonce").and_then(|v| v.as_str());
@@ -278,12 +581,19 @@ pub fn verify_id_token(
     Ok(claims)
 }
 
-/// Fetch userinfo with a Bearer access token.
+/// Fetch UserInfo with a Bearer access token for an associated issuer.
+///
+/// The issuer context is mandatory because the loopback HTTP development
+/// exception applies only when the issuer itself is a loopback HTTP origin.
 pub async fn fetch_userinfo(
     http: &Arc<dyn HttpClient>,
     userinfo_endpoint: &str,
     access_token: &str,
+    expected_sub: &str,
+    issuer: &str,
 ) -> Result<serde_json::Value> {
+    validate_issuer(issuer)?;
+    validate_service_endpoint_for_issuer("userinfo_endpoint", userinfo_endpoint, issuer)?;
     // The injected client has no per-request header API on GET, so userinfo is
     // fetched via post_form with an empty body carrying the Authorization
     // header. (Most OPs accept GET or POST at userinfo.)
@@ -295,7 +605,13 @@ pub async fn fetch_userinfo(
     if resp.status != 200 {
         return Err(Error::Authn(format!("userinfo returned {}", resp.status)));
     }
-    resp.json()
+    let claims: serde_json::Value = resp.json()?;
+    if claims.get("sub").and_then(|value| value.as_str()) != Some(expected_sub) {
+        return Err(Error::Authn(
+            "userinfo sub does not match the validated id_token subject".into(),
+        ));
+    }
+    Ok(claims)
 }
 
 /// Build a `private_key_jwt` client assertion (RFC 7523) for token-endpoint auth.
@@ -400,10 +716,109 @@ mod tests {
     }
 
     #[test]
+    fn service_endpoints_reject_raw_whitespace_and_controls() {
+        for endpoint in [
+            "https://op.example.\torg/token",
+            "ht\ntps://op.example.org/token",
+            " https://op.example.org/token",
+            "https://op.example.org/token\x1f",
+            "https://op.example.org/token\r\nX-Test: injected",
+        ] {
+            assert!(
+                validate_service_endpoint("token_endpoint", endpoint).is_err(),
+                "unsafe raw endpoint must be rejected: {endpoint:?}"
+            );
+        }
+
+        // Encoded octets do not create a parser/use mismatch, and endpoint
+        // queries remain valid.
+        for endpoint in [
+            "https://op.example.org/token?label=hello%20world",
+            "https://op.example.org/%09/%0A",
+        ] {
+            validate_service_endpoint("token_endpoint", endpoint)
+                .unwrap_or_else(|error| panic!("valid endpoint {endpoint:?}: {error}"));
+        }
+
+        // A context-free URL must never inherit the development exception.
+        for endpoint in [
+            "http://localhost:8080/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+        ] {
+            assert!(validate_service_endpoint("token_endpoint", endpoint).is_err());
+        }
+    }
+
+    #[test]
+    fn loopback_http_endpoints_require_a_loopback_http_issuer() {
+        let (_, provider, _) = client_and_provider();
+        for field in [
+            "authorization_endpoint",
+            "token_endpoint",
+            "userinfo_endpoint",
+            "jwks_uri",
+        ] {
+            let mut contaminated = provider.clone();
+            let endpoint = "http://127.0.0.1:8080/path".to_string();
+            match field {
+                "authorization_endpoint" => contaminated.authorization_endpoint = endpoint,
+                "token_endpoint" => contaminated.token_endpoint = endpoint,
+                "userinfo_endpoint" => contaminated.userinfo_endpoint = Some(endpoint),
+                "jwks_uri" => contaminated.jwks_uri = Some(endpoint),
+                _ => unreachable!(),
+            }
+            assert!(
+                contaminated.validate().is_err(),
+                "remote issuer must not authorize loopback HTTP {field}"
+            );
+        }
+
+        let local = ProviderInfo {
+            issuer: "http://localhost:8080".into(),
+            authorization_endpoint: "http://localhost:8080/authorize".into(),
+            token_endpoint: "http://127.0.0.1:8080/token".into(),
+            userinfo_endpoint: Some("http://[::1]:8080/userinfo".into()),
+            jwks_uri: Some("http://localhost:8080/jwks".into()),
+        };
+        local
+            .validate()
+            .expect("loopback issuer may use loopback HTTP endpoints");
+    }
+
+    #[test]
+    fn provider_info_rejects_controls_in_every_endpoint_field() {
+        let (_, provider, _) = client_and_provider();
+        for field in [
+            "issuer",
+            "authorization_endpoint",
+            "token_endpoint",
+            "userinfo_endpoint",
+            "jwks_uri",
+        ] {
+            let mut contaminated = provider.clone();
+            let endpoint = "https://op.example.org/path\r\nX-Test: injected".to_string();
+            match field {
+                "issuer" => contaminated.issuer = endpoint,
+                "authorization_endpoint" => contaminated.authorization_endpoint = endpoint,
+                "token_endpoint" => contaminated.token_endpoint = endpoint,
+                "userinfo_endpoint" => contaminated.userinfo_endpoint = Some(endpoint),
+                "jwks_uri" => contaminated.jwks_uri = Some(endpoint),
+                _ => unreachable!(),
+            }
+            assert!(
+                contaminated.validate().is_err(),
+                "unsafe {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn signed_request_object_carries_request_params_and_verifies() {
         let (client, provider, key) = client_and_provider();
-        let jar =
-            signed_request_object(&provider, &client, &key, "st-1", "n-1", Some("chal")).unwrap();
+        let challenge = crate::pkce::s256_challenge(&"v".repeat(43));
+        let jar = signed_request_object(&provider, &client, &key, "st-1", "n-1", Some(&challenge))
+            .unwrap();
 
         // Verifies against the RP's published public keys, audience = OP issuer.
         let validation = Validation::new()
@@ -417,7 +832,7 @@ mod tests {
         assert_eq!(claims.extra["scope"], "openid email");
         assert_eq!(claims.extra["state"], "st-1");
         assert_eq!(claims.extra["nonce"], "n-1");
-        assert_eq!(claims.extra["code_challenge"], "chal");
+        assert_eq!(claims.extra["code_challenge"], challenge);
         assert_eq!(claims.extra["code_challenge_method"], "S256");
         assert!(claims.jti.is_some(), "jti for replay detection");
         let (iat, exp) = (claims.iat.unwrap(), claims.exp.unwrap());
@@ -437,6 +852,37 @@ mod tests {
         let claims = jwt::peek_claims_unverified(&jar).unwrap();
         assert!(!claims.extra.contains_key("code_challenge"));
         assert!(!claims.extra.contains_key("code_challenge_method"));
+    }
+
+    #[test]
+    fn authorization_url_rejects_query_collisions_across_configuration_and_extras() {
+        let (client, mut provider, _) = client_and_provider();
+        provider.authorization_endpoint =
+            "https://op.example.org/authorize?tenant=configured".into();
+
+        let err = authorization_url(
+            &provider,
+            &client,
+            "state",
+            "nonce",
+            None,
+            &[("tenant", "override")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate authorization extra"));
+
+        // RFC 8707 deliberately permits repeated resource indicators.
+        let url = authorization_url(
+            &provider,
+            &client,
+            "state",
+            "nonce",
+            None,
+            &[("resource", "https://api.example.org")],
+        )
+        .unwrap();
+        assert!(url.contains("tenant=configured"));
+        assert!(url.contains("resource=https%3A%2F%2Fapi.example.org"));
     }
 
     /// Minimal in-memory [`HttpClient`] for discovery / token-endpoint tests.
@@ -493,6 +939,40 @@ mod tests {
         });
         let metadata = discover(&http, "http://127.0.0.1:8080").await.unwrap();
         assert_eq!(metadata.issuer, "http://127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn fetch_jwks_binds_loopback_http_exception_to_issuer() {
+        let rejected_http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: None,
+            post: None,
+        });
+        let error = fetch_jwks(
+            &rejected_http,
+            "http://127.0.0.1:8080/jwks",
+            "https://remote.example",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("absolute https URL"));
+
+        let (_, _, key) = client_and_provider();
+        let local_http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse {
+                status: 200,
+                body: key.to_public_jwks().to_json().unwrap().into_bytes(),
+                content_type: Some("application/json".into()),
+            }),
+            post: None,
+        });
+        let fetched = fetch_jwks(
+            &local_http,
+            "http://127.0.0.1:8080/jwks",
+            "http://localhost:8080",
+        )
+        .await
+        .expect("loopback issuer may fetch a loopback HTTP JWKS");
+        assert_eq!(fetched.keys.len(), 1);
     }
 
     #[tokio::test]
@@ -561,6 +1041,7 @@ mod tests {
         // No exp -> rejected.
         let mut c = Claims::default();
         c.iss = Some("https://op.example.org".into());
+        c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
         c.iat = Some(now);
         let token = jwt::sign(&key, &c, None).unwrap();
@@ -570,7 +1051,9 @@ mod tests {
                 &token,
                 "https://op.example.org",
                 "https://rp.example.com",
-                None
+                None,
+                &[JwsAlgorithm::ES256],
+                &[],
             )
             .is_err(),
             "id_token without exp must be rejected"
@@ -579,6 +1062,7 @@ mod tests {
         // No iat -> rejected.
         let mut c = Claims::default();
         c.iss = Some("https://op.example.org".into());
+        c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
         c.exp = Some(now + 300);
         let token = jwt::sign(&key, &c, None).unwrap();
@@ -588,7 +1072,9 @@ mod tests {
                 &token,
                 "https://op.example.org",
                 "https://rp.example.com",
-                None
+                None,
+                &[JwsAlgorithm::ES256],
+                &[],
             )
             .is_err(),
             "id_token without iat must be rejected"
@@ -597,6 +1083,7 @@ mod tests {
         // Both present -> accepted.
         let mut c = Claims::default();
         c.iss = Some("https://op.example.org".into());
+        c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
         c.iat = Some(now);
         c.exp = Some(now + 300);
@@ -607,7 +1094,55 @@ mod tests {
             "https://op.example.org",
             "https://rp.example.com",
             None,
+            &[JwsAlgorithm::ES256],
+            &[],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn verify_id_token_accepts_single_element_array_audience_without_azp() {
+        let (_client, _provider, key) = client_and_provider();
+        let jwks = key.to_public_jwks();
+        let now = now_secs();
+        let client_id = "https://rp.example.com";
+
+        let mut claims = Claims {
+            iss: Some("https://op.example.org".into()),
+            sub: Some("subject".into()),
+            aud: Some(Audience::Multiple(vec![client_id.into()])),
+            iat: Some(now),
+            exp: Some(now + 300),
+            ..Default::default()
+        };
+        let token = jwt::sign(&key, &claims, None).unwrap();
+        verify_id_token(
+            &jwks,
+            &token,
+            "https://op.example.org",
+            client_id,
+            None,
+            &[JwsAlgorithm::ES256],
+            &[],
+        )
+        .expect("a one-element aud array does not require azp");
+
+        // An azp claim is optional for one audience, but still must identify
+        // this client when the issuer includes it.
+        claims.extra.insert("azp".into(), "another-client".into());
+        let token = jwt::sign(&key, &claims, None).unwrap();
+        assert!(
+            verify_id_token(
+                &jwks,
+                &token,
+                "https://op.example.org",
+                client_id,
+                None,
+                &[JwsAlgorithm::ES256],
+                &[],
+            )
+            .is_err(),
+            "a supplied azp must match client_id"
+        );
     }
 }

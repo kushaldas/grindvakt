@@ -19,9 +19,11 @@ use crate::request::AuthorizationRequest;
 use crate::tokens::{AccessTokenPayload, AuthCodePayload, RefreshTokenPayload, TokenCodec};
 use crate::util::now_secs;
 use base64::Engine;
+use jose_rs::algorithm::JwsAlgorithm;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
 use serde::Serialize;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
@@ -52,9 +54,9 @@ impl Default for TokenLifetimes {
 
 /// The OpenID Provider engine.
 ///
-/// Construct with [`Provider::new`]; the token-use store is installed via
-/// [`Provider::with_token_use_store`] rather than a public field so adding
-/// stores later does not break struct-literal construction downstream.
+/// Construct with [`Provider::new`] and an explicitly selected token-use
+/// store. [`Provider::with_token_use_store`] can replace that policy without
+/// exposing the store as a mutable public field.
 pub struct Provider {
     pub metadata: ProviderMetadata,
     pub signing_key: SigningKey,
@@ -90,8 +92,8 @@ pub struct TokenResponse {
 ///
 /// The token endpoint uses this to consume authorization codes and refresh
 /// tokens exactly once. Deployments with multiple replicas should supply a
-/// shared implementation; the default in-memory store protects a single
-/// process.
+/// shared implementation; [`InMemoryTokenUseStore`] protects only a single
+/// process and must be selected explicitly.
 #[async_trait::async_trait]
 pub trait TokenUseStore: Send + Sync {
     /// Mark `token_hash` as consumed for `ttl_secs`. Returns `Ok(true)` when
@@ -228,25 +230,76 @@ async fn redis_consume_token_once<C: redis::aio::ConnectionLike>(
 }
 
 impl Provider {
+    /// Construct an OP with an explicitly selected one-time-use store.
+    ///
+    /// Passing [`InMemoryTokenUseStore`] is appropriate only when a single
+    /// process handles every token request. Multi-worker deployments must use
+    /// a shared atomic implementation so codes, refresh tokens, and client
+    /// assertion identifiers cannot be replayed against another worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::Config`] when `signing_key` uses an
+    /// `HS*` algorithm. OIDC MAC ID tokens are keyed by each client's own
+    /// `client_secret`; this provider currently publishes one asymmetric key.
     pub fn new(
-        metadata: ProviderMetadata,
+        mut metadata: ProviderMetadata,
         signing_key: SigningKey,
         clients: Arc<dyn ClientStore>,
         codec: TokenCodec,
         lifetimes: TokenLifetimes,
-    ) -> Self {
-        Self {
+        token_use_store: Arc<dyn TokenUseStore>,
+    ) -> crate::error::Result<Self> {
+        if matches!(
+            signing_key.alg(),
+            JwsAlgorithm::HS256 | JwsAlgorithm::HS384 | JwsAlgorithm::HS512
+        ) {
+            return Err(crate::error::Error::Config(
+                "provider ID-token signing requires an asymmetric key; HS* algorithms require each client's own client_secret".into(),
+            ));
+        }
+        let supports_token_hash = supports_oidc_token_hash(signing_key.alg());
+        metadata.id_token_signing_alg_values_supported = vec![signing_key.alg().to_string()];
+        metadata.response_types_supported =
+            vec!["code".into(), "id_token".into(), "code token".into()];
+        if supports_token_hash {
+            metadata.response_types_supported.extend([
+                "id_token token".into(),
+                "code id_token".into(),
+                "code id_token token".into(),
+            ]);
+        }
+        metadata.response_modes_supported = vec!["query".into(), "fragment".into()];
+        // Discovery clients use this list to decide whether the front-channel
+        // token response types advertised above are actually supported.
+        metadata.grant_types_supported = vec![
+            "authorization_code".into(),
+            "implicit".into(),
+            "client_credentials".into(),
+            "refresh_token".into(),
+        ];
+        metadata.subject_types_supported = vec!["public".into()];
+        metadata.token_endpoint_auth_methods_supported = vec![
+            AUTH_CLIENT_SECRET_BASIC.into(),
+            AUTH_CLIENT_SECRET_POST.into(),
+            AUTH_PRIVATE_KEY_JWT.into(),
+            AUTH_NONE.into(),
+        ];
+        metadata.code_challenge_methods_supported = vec!["S256".into()];
+        metadata.claims_parameter_supported = false;
+        metadata.request_parameter_supported = false;
+        Ok(Self {
             metadata,
             signing_key,
             clients,
             codec,
             lifetimes,
-            token_use_store: Arc::new(InMemoryTokenUseStore::new()),
+            token_use_store,
             client_assertion_max_age: DEFAULT_CLIENT_ASSERTION_MAX_AGE,
-        }
+        })
     }
 
-    /// Replace the default single-process token-use store.
+    /// Replace the explicitly selected token-use store.
     pub fn with_token_use_store(mut self, store: Arc<dyn TokenUseStore>) -> Self {
         self.token_use_store = store;
         self
@@ -292,8 +345,46 @@ impl Provider {
         if !client.allows_redirect(&req.redirect_uri) {
             return Err(OAuthError::invalid_request("redirect_uri not registered"));
         }
+        // Exact registration matching is necessary but not sufficient: a
+        // malformed value can itself have been registered. Parse it before it
+        // can reach a Location header, while retaining absolute custom-scheme
+        // redirect URIs used by native applications.
+        if req
+            .redirect_uri
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(OAuthError::invalid_request(
+                "redirect_uri must not contain whitespace or control characters",
+            ));
+        }
+        let redirect_uri = url::Url::parse(&req.redirect_uri)
+            .map_err(|_| OAuthError::invalid_request("redirect_uri must be an absolute URI"))?;
+        if redirect_uri.fragment().is_some() {
+            return Err(OAuthError::invalid_request(
+                "redirect_uri must not contain a fragment",
+            ));
+        }
+        if client.subject_type != "public" {
+            return Err(OAuthError::new(
+                OAuthErrorCode::UnauthorizedClient,
+                "only public subject identifiers are implemented",
+            )
+            .with_state(req.state.clone()));
+        }
         req.validate_response_type()?;
         req.validate_prompt()?;
+        req.validate_response_mode()?;
+        if req.wants_id_token()
+            && (req.wants_code() || req.wants_access_token())
+            && !supports_oidc_token_hash(self.signing_key.alg())
+        {
+            return Err(OAuthError::new(
+                OAuthErrorCode::UnsupportedResponseType,
+                "the configured signing algorithm does not define OIDC c_hash/at_hash",
+            )
+            .with_state(req.state.clone()));
+        }
         if !client.allows_response_type(&req.response_type) {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnauthorizedClient,
@@ -301,27 +392,32 @@ impl Provider {
             )
             .with_state(req.state.clone()));
         }
-        // OIDC Core §3.2.2.1 / §3.3.2.1: a nonce is REQUIRED for any response
-        // type that returns an id_token from the authorization endpoint
-        // (implicit and hybrid flows).
+        // OIDC Core sections 3.2.2.1 and 3.3.2.1 require a nonce when an ID
+        // token is returned from the authorization endpoint. In particular,
+        // nonce remains optional for the `code token` hybrid response type.
         if req.wants_id_token() && req.nonce.is_none() {
             return Err(
                 OAuthError::invalid_request("nonce is required for implicit/hybrid flows")
                     .with_state(req.state.clone()),
             );
         }
-        if client.token_endpoint_auth_method == AUTH_NONE && req.wants_code() {
-            match (
-                req.code_challenge.as_deref(),
-                req.code_challenge_method.as_deref(),
-            ) {
-                (Some(challenge), Some("S256")) if !challenge.is_empty() => {}
-                _ => {
-                    return Err(
-                        OAuthError::invalid_request("public clients must use S256 PKCE")
-                            .with_state(req.state.clone()),
-                    );
-                }
+        if req.wants_code() {
+            let challenge = req.code_challenge.as_deref();
+            let method = req.code_challenge_method.as_deref();
+            let valid_s256 = matches!(
+                (challenge, method),
+                (Some(challenge), Some("S256")) if pkce::is_valid_s256_challenge(challenge)
+            );
+            let omitted_for_confidential = challenge.is_none()
+                && method.is_none()
+                && client.token_endpoint_auth_method != AUTH_NONE;
+            if !valid_s256 && !omitted_for_confidential {
+                let description = if client.token_endpoint_auth_method == AUTH_NONE {
+                    "public clients must use S256 PKCE"
+                } else {
+                    "PKCE must use a canonical S256 code_challenge and method"
+                };
+                return Err(OAuthError::invalid_request(description).with_state(req.state.clone()));
             }
         }
         // The requested scope must not exceed the client's registered scope set
@@ -344,7 +440,7 @@ impl Provider {
 
     /// Build the authorization response (a redirect carrying `code` and/or
     /// `id_token`) after the user has authenticated and claims were released.
-    pub fn authorization_redirect(
+    pub async fn authorization_redirect(
         &self,
         req: &AuthorizationRequest,
         sub: &str,
@@ -352,6 +448,7 @@ impl Provider {
         acr: Option<String>,
     ) -> Result<crate::http::Response, OAuthError> {
         self.authorization_redirect_with_claims(req, sub, external_claims, acr, &BTreeMap::new())
+            .await
     }
 
     /// Like [`Self::authorization_redirect`], but also emits `extra_claims`:
@@ -364,10 +461,10 @@ impl Provider {
     /// so an array stays an array even with one element. They overwrite any
     /// released claim of the same name — the OP-asserted value wins over anything
     /// an attribute map produced — and reserved registered claims (`iss`, `sub`,
-    /// …) are ignored, exactly as released claims are in [`Self::build_id_token`].
+    /// …) are ignored, exactly as released claims are in `Self::build_id_token`.
     /// The values are sealed into the authorization code, so they survive the
     /// code and refresh-token exchanges unchanged rather than being recomputed.
-    pub fn authorization_redirect_with_claims(
+    pub async fn authorization_redirect_with_claims(
         &self,
         req: &AuthorizationRequest,
         sub: &str,
@@ -375,17 +472,49 @@ impl Provider {
         acr: Option<String>,
         extra_claims: &BTreeMap<String, serde_json::Value>,
     ) -> Result<crate::http::Response, OAuthError> {
-        let mut claims = flatten_claims(external_claims);
+        // Revalidate at the minting boundary. AuthorizationRequest is
+        // serializable so applications can carry it across a login step; a
+        // caller must not be able to deserialize an unvalidated request and
+        // mint artifacts from it.
+        self.validate_authorization_request(req).await?;
+        if sub.is_empty() {
+            return Err(OAuthError::new(
+                OAuthErrorCode::ServerError,
+                "subject identifier must not be empty",
+            ));
+        }
+
+        let mut claims = filter_claims(&req.scope, flatten_claims(external_claims));
         for (k, v) in extra_claims {
             if is_reserved_id_token_claim(k) {
                 continue;
             }
-            claims.insert(k.clone(), v.clone());
+            if claim_allowed_by_scope(&req.scope, k) {
+                claims.insert(k.clone(), v.clone());
+            }
         }
         let auth_time = now_secs();
         let mut out: Vec<(String, String)> = Vec::new();
 
-        if req.wants_code() {
+        let access_token = if req.wants_access_token() {
+            let payload = AccessTokenPayload {
+                client_id: req.client_id.clone(),
+                sub: sub.to_string(),
+                scope: req.scope.clone(),
+                claims: claims.clone(),
+                exp: auth_time + self.lifetimes.access_token_ttl,
+                cnf_jkt: None,
+            };
+            Some(
+                self.codec
+                    .seal_access_token(&payload)
+                    .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        let code = if req.wants_code() {
             let payload = AuthCodePayload {
                 client_id: req.client_id.clone(),
                 redirect_uri: req.redirect_uri.clone(),
@@ -403,8 +532,10 @@ impl Provider {
                 .codec
                 .seal_code(&payload)
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
-            out.push(("code".to_string(), code));
-        }
+            Some(code)
+        } else {
+            None
+        };
 
         if req.wants_id_token() {
             // Implicit / hybrid: mint an id_token directly.
@@ -416,9 +547,23 @@ impl Provider {
                     &claims,
                     acr.as_deref(),
                     auth_time,
+                    code.as_deref(),
+                    access_token.as_deref(),
                 )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
             out.push(("id_token".to_string(), id_token));
+        }
+
+        if let Some(code) = code {
+            out.push(("code".to_string(), code));
+        }
+        if let Some(access_token) = access_token {
+            out.push(("access_token".to_string(), access_token));
+            out.push(("token_type".to_string(), "Bearer".to_string()));
+            out.push((
+                "expires_in".to_string(),
+                self.lifetimes.access_token_ttl.to_string(),
+            ));
         }
 
         if let Some(state) = &req.state {
@@ -430,16 +575,7 @@ impl Provider {
 
     // ── Token endpoint ──────────────────────────────────────────────────
 
-    /// Handle a token request. `auth_header` is the raw Authorization header
-    /// value; `token_url` is this endpoint's absolute URL (for `private_key_jwt`
-    /// audience checking).
-    ///
-    /// `dpop` is an already-validated DPoP proof (RFC 9449) for this request, if
-    /// the client presented one — validate it in the web layer with
-    /// [`crate::dpop::validate_proof`] and thread the result here. When present
-    /// the issued access token is sender-constrained (`token_type: DPoP`,
-    /// `cnf.jkt` bound to the proof key).
-    pub async fn handle_token_request(
+    async fn handle_token_request_map(
         &self,
         form: &BTreeMap<String, String>,
         auth_header: Option<&str>,
@@ -470,6 +606,24 @@ impl Provider {
         }
     }
 
+    /// Handle an ordered token request, rejecting duplicate parameters before
+    /// any grant selection or client-authentication precedence is applied.
+    ///
+    /// `auth_header` is the raw Authorization header value; `token_url` is this
+    /// endpoint's absolute configured URL for `private_key_jwt` audience
+    /// checking. `dpop` is an already-validated proof from the web layer.
+    pub async fn handle_token_request(
+        &self,
+        form: &[(String, String)],
+        auth_header: Option<&str>,
+        token_url: &str,
+        dpop: Option<&crate::dpop::DpopProof>,
+    ) -> Result<TokenResponse, OAuthError> {
+        let form = unique_parameters(form)?;
+        self.handle_token_request_map(&form, auth_header, token_url, dpop)
+            .await
+    }
+
     /// "DPoP" when the request was DPoP-bound, else "Bearer".
     fn token_type(dpop: Option<&crate::dpop::DpopProof>) -> &'static str {
         if dpop.is_some() {
@@ -487,7 +641,7 @@ impl Provider {
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
         let client = self
-            .authenticate_client(form, auth_header, token_url)
+            .authenticate_client_map(form, auth_header, token_url)
             .await?;
 
         // The client must be registered for the authorization_code grant
@@ -553,30 +707,38 @@ impl Provider {
         self.consume_token_once("code", code, payload.exp, "authorization code already used")
             .await?;
 
-        // Mint access token + id_token.
+        // Mint an access token, and an ID token only for an OIDC grant.
         let access_payload = AccessTokenPayload {
             client_id: client.client_id.clone(),
             sub: payload.sub.clone(),
             scope: payload.scope.clone(),
             claims: payload.claims.clone(),
             exp: now_secs() + self.lifetimes.access_token_ttl,
-            cnf_jkt: dpop.map(|d| d.jkt.clone()),
+            cnf_jkt: dpop.map(|d| d.jkt().to_string()),
         };
         let access_token = self
             .codec
             .seal_access_token(&access_payload)
             .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
 
-        let id_token = self
-            .build_id_token(
-                &client.client_id,
-                &payload.sub,
-                payload.nonce.as_deref(),
-                &payload.claims,
-                payload.acr.as_deref(),
-                payload.auth_time,
+        let id_token = if payload.scope.split_whitespace().any(|s| s == "openid") {
+            Some(
+                self.build_id_token(
+                    &client.client_id,
+                    &payload.sub,
+                    payload.nonce.as_deref(),
+                    &payload.claims,
+                    payload.acr.as_deref(),
+                    payload.auth_time,
+                    None,
+                    supports_oidc_token_hash(self.signing_key.alg())
+                        .then_some(access_token.as_str()),
+                )
+                .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
             )
-            .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
+        } else {
+            None
+        };
 
         // Issue a refresh token only when the client is registered for the grant
         // (RFC 6749 §6). It carries the original auth_time/nonce/acr so refreshed
@@ -591,7 +753,7 @@ impl Provider {
                 auth_time: payload.auth_time,
                 exp: now_secs() + self.lifetimes.refresh_token_ttl,
                 acr: payload.acr.clone(),
-                cnf_jkt: dpop.map(|d| d.jkt.clone()),
+                cnf_jkt: dpop.map(|d| d.jkt().to_string()),
             };
             Some(
                 self.codec
@@ -606,7 +768,7 @@ impl Provider {
             access_token,
             token_type: Self::token_type(dpop).to_string(),
             expires_in: self.lifetimes.access_token_ttl,
-            id_token: Some(id_token),
+            id_token,
             scope: Some(payload.scope),
             refresh_token,
         })
@@ -624,7 +786,7 @@ impl Provider {
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
         let client = self
-            .authenticate_client(form, auth_header, token_url)
+            .authenticate_client_map(form, auth_header, token_url)
             .await?;
 
         // RFC 6749 §4.4: client_credentials is for confidential clients only. A
@@ -660,6 +822,15 @@ impl Provider {
                 .collect(),
             None => allowed.clone(),
         };
+        // `openid` turns an authorization request into an OIDC authentication
+        // request. A client-credentials grant has no end user and therefore
+        // cannot legitimately grant that scope or expose UserInfo.
+        if granted.iter().any(|scope| scope == "openid") {
+            return Err(OAuthError::new(
+                OAuthErrorCode::InvalidScope,
+                "openid scope requires end-user authorization",
+            ));
+        }
         if granted.is_empty() {
             return Err(OAuthError::new(
                 OAuthErrorCode::InvalidScope,
@@ -675,7 +846,7 @@ impl Provider {
             scope: scope.clone(),
             claims: BTreeMap::new(),
             exp: now_secs() + self.lifetimes.access_token_ttl,
-            cnf_jkt: dpop.map(|d| d.jkt.clone()),
+            cnf_jkt: dpop.map(|d| d.jkt().to_string()),
         };
         let access_token = self
             .codec
@@ -693,11 +864,12 @@ impl Provider {
     }
 
     /// The `refresh_token` grant (RFC 6749 §6): exchange a refresh token for a
-    /// fresh access token and id_token, optionally narrowing scope. The refresh
-    /// token is a stateless sealed [`RefreshTokenPayload`]; it is rotated on each
-    /// use (a new one is returned) but, with no server-side store, cannot be
-    /// revoked before its own expiry. DPoP binding applies to the new access
-    /// token when a proof is presented.
+    /// fresh access token and, for an OIDC grant, an ID token, optionally
+    /// narrowing scope. The refresh
+    /// token is a stateless sealed [`RefreshTokenPayload`], but every use is
+    /// consumed through the configured [`TokenUseStore`] before a rotated token
+    /// is returned. DPoP binding applies to the new access token when a proof is
+    /// presented.
     async fn handle_refresh_token(
         &self,
         form: &BTreeMap<String, String>,
@@ -706,7 +878,7 @@ impl Provider {
         dpop: Option<&crate::dpop::DpopProof>,
     ) -> Result<TokenResponse, OAuthError> {
         let client = self
-            .authenticate_client(form, auth_header, token_url)
+            .authenticate_client_map(form, auth_header, token_url)
             .await?;
 
         if !client_allows_refresh(&client) {
@@ -732,7 +904,7 @@ impl Provider {
 
         let cnf_jkt = match rt.cnf_jkt.as_deref() {
             Some(bound_jkt) => match dpop {
-                Some(proof) if proof.jkt == bound_jkt => Some(bound_jkt.to_string()),
+                Some(proof) if proof.jkt() == bound_jkt => Some(bound_jkt.to_string()),
                 Some(_) => {
                     return Err(OAuthError::invalid_dpop_proof(
                         "DPoP proof key does not match the refresh token's cnf.jkt",
@@ -744,7 +916,7 @@ impl Provider {
                     ));
                 }
             },
-            None => dpop.map(|proof| proof.jkt.clone()),
+            None => dpop.map(|proof| proof.jkt().to_string()),
         };
 
         // Scope may only be narrowed (RFC 6749 §6): a requested scope must be a
@@ -772,11 +944,16 @@ impl Provider {
         self.consume_token_once("refresh", token, rt.exp, "refresh token already used")
             .await?;
 
+        // A narrowed refresh grant must not retain standard claims belonging
+        // to scopes the client removed. Reuse this one filtered map for every
+        // artifact minted by the refresh so their authorization agrees.
+        let claims = filter_claims(&scope, rt.claims.clone());
+
         let access_payload = AccessTokenPayload {
             client_id: client.client_id.clone(),
             sub: rt.sub.clone(),
             scope: scope.clone(),
-            claims: rt.claims.clone(),
+            claims: claims.clone(),
             exp: now + self.lifetimes.access_token_ttl,
             cnf_jkt: cnf_jkt.clone(),
         };
@@ -785,16 +962,24 @@ impl Provider {
             .seal_access_token(&access_payload)
             .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
 
-        let id_token = self
-            .build_id_token(
-                &client.client_id,
-                &rt.sub,
-                rt.nonce.as_deref(),
-                &rt.claims,
-                rt.acr.as_deref(),
-                rt.auth_time,
+        let id_token = if scope.split_whitespace().any(|s| s == "openid") {
+            Some(
+                self.build_id_token(
+                    &client.client_id,
+                    &rt.sub,
+                    rt.nonce.as_deref(),
+                    &claims,
+                    rt.acr.as_deref(),
+                    rt.auth_time,
+                    None,
+                    supports_oidc_token_hash(self.signing_key.alg())
+                        .then_some(access_token.as_str()),
+                )
+                .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
             )
-            .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
+        } else {
+            None
+        };
 
         // Rotate the refresh token (sliding expiry), carrying the narrowed scope.
         let new_refresh = RefreshTokenPayload {
@@ -802,7 +987,7 @@ impl Provider {
             sub: rt.sub.clone(),
             scope: scope.clone(),
             nonce: rt.nonce.clone(),
-            claims: rt.claims.clone(),
+            claims,
             auth_time: rt.auth_time,
             exp: now + self.lifetimes.refresh_token_ttl,
             acr: rt.acr.clone(),
@@ -817,7 +1002,7 @@ impl Provider {
             access_token,
             token_type: Self::token_type(dpop).to_string(),
             expires_in: self.lifetimes.access_token_ttl,
-            id_token: Some(id_token),
+            id_token,
             scope: Some(scope),
             refresh_token: Some(refresh_token),
         })
@@ -867,6 +1052,17 @@ impl Provider {
             .open_access_token(access_token)
             .map_err(|_| OAuthError::new(OAuthErrorCode::AccessDenied, "invalid access token"))?;
 
+        if !payload
+            .scope
+            .split_whitespace()
+            .any(|scope| scope == "openid")
+        {
+            return Err(OAuthError::new(
+                OAuthErrorCode::AccessDenied,
+                "userinfo requires an access token with openid scope",
+            ));
+        }
+
         if let Some(bound_jkt) = payload.cnf_jkt.as_deref() {
             match presented_jkt {
                 Some(jkt) if jkt == bound_jkt => {}
@@ -895,17 +1091,33 @@ impl Provider {
 
     // ── Client authentication ───────────────────────────────────────────
 
-    /// Authenticate the token-endpoint client across the supported methods.
-    pub async fn authenticate_client(
+    async fn authenticate_client_map(
         &self,
         form: &BTreeMap<String, String>,
         auth_header: Option<&str>,
         token_url: &str,
     ) -> Result<Client, OAuthError> {
+        let assertion_present =
+            form.contains_key("client_assertion") || form.contains_key("client_assertion_type");
+        let secret_post_present = form.contains_key("client_secret");
+        let method_count = usize::from(assertion_present)
+            + usize::from(secret_post_present)
+            + usize::from(auth_header.is_some());
+        if method_count > 1 {
+            return Err(OAuthError::invalid_client(
+                "multiple client authentication methods",
+            ));
+        }
+
         // private_key_jwt (RFC 7523).
-        if let Some(assertion) = form.get("client_assertion") {
-            let atype = form.get("client_assertion_type").map(|s| s.as_str());
-            if atype != Some(CLIENT_ASSERTION_TYPE) {
+        if assertion_present {
+            let Some(assertion) = form.get("client_assertion") else {
+                return Err(OAuthError::invalid_client(
+                    "incomplete client assertion authentication",
+                ));
+            };
+            if form.get("client_assertion_type").map(String::as_str) != Some(CLIENT_ASSERTION_TYPE)
+            {
                 return Err(OAuthError::invalid_client("invalid client_assertion_type"));
             }
             return self
@@ -915,17 +1127,27 @@ impl Provider {
 
         // client_secret_basic.
         if let Some(header) = auth_header {
-            if let Some(b64) = header.strip_prefix("Basic ") {
-                let (id, secret) = decode_basic(b64)
-                    .ok_or_else(|| OAuthError::invalid_client("malformed Basic auth"))?;
-                return self
-                    .check_secret(&id, &secret, AUTH_CLIENT_SECRET_BASIC)
-                    .await;
+            let Some((scheme, credentials)) = header.split_once(' ') else {
+                return Err(OAuthError::invalid_client("malformed Authorization header"));
+            };
+            if !scheme.eq_ignore_ascii_case("Basic") {
+                return Err(OAuthError::invalid_client(
+                    "unsupported Authorization scheme",
+                ));
             }
+            let (id, secret) = decode_basic(credentials)
+                .ok_or_else(|| OAuthError::invalid_client("malformed Basic auth"))?;
+            return self
+                .check_secret(&id, &secret, AUTH_CLIENT_SECRET_BASIC)
+                .await;
         }
 
         // client_secret_post.
-        if let (Some(id), Some(secret)) = (form.get("client_id"), form.get("client_secret")) {
+        if secret_post_present {
+            let id = form
+                .get("client_id")
+                .ok_or_else(|| OAuthError::invalid_client("client_secret missing client_id"))?;
+            let secret = form.get("client_secret").expect("presence checked above");
             return self.check_secret(id, secret, AUTH_CLIENT_SECRET_POST).await;
         }
 
@@ -942,6 +1164,20 @@ impl Provider {
         }
 
         Err(OAuthError::invalid_client("client authentication required"))
+    }
+
+    /// Authenticate a token-endpoint client from an ordered form, rejecting
+    /// duplicate credentials and protocol parameters before authentication
+    /// precedence is applied.
+    pub async fn authenticate_client(
+        &self,
+        form: &[(String, String)],
+        auth_header: Option<&str>,
+        token_url: &str,
+    ) -> Result<Client, OAuthError> {
+        let form = unique_parameters(form)?;
+        self.authenticate_client_map(&form, auth_header, token_url)
+            .await
     }
 
     async fn check_secret(
@@ -1075,6 +1311,9 @@ impl Provider {
 
     // ── id_token construction ───────────────────────────────────────────
 
+    // Keep each protocol-bound value explicit at the call sites; grouping them
+    // into a loosely typed map would make omission and claim confusion easier.
+    #[allow(clippy::too_many_arguments)]
     fn build_id_token(
         &self,
         client_id: &str,
@@ -1083,6 +1322,8 @@ impl Provider {
         claims: &BTreeMap<String, serde_json::Value>,
         acr: Option<&str>,
         auth_time: u64,
+        code: Option<&str>,
+        access_token: Option<&str>,
     ) -> crate::error::Result<String> {
         let now = now_secs();
         let mut c = Claims::default();
@@ -1103,6 +1344,18 @@ impl Provider {
         // carried through code/refresh exchanges rather than reset to now.
         c.extra
             .insert("auth_time".into(), serde_json::json!(auth_time));
+        if let Some(code) = code {
+            c.extra.insert(
+                "c_hash".into(),
+                serde_json::Value::String(oidc_token_hash(self.signing_key.alg(), code)?),
+            );
+        }
+        if let Some(access_token) = access_token {
+            c.extra.insert(
+                "at_hash".into(),
+                serde_json::Value::String(oidc_token_hash(self.signing_key.alg(), access_token)?),
+            );
+        }
         for (k, v) in claims {
             // Released claims must never shadow the registered claims set as
             // typed fields: serde flattens `extra`, so a released `sub`
@@ -1115,6 +1368,64 @@ impl Provider {
         }
         jwt::sign(&self.signing_key, &c, None)
     }
+}
+
+fn unique_parameters(params: &[(String, String)]) -> Result<BTreeMap<String, String>, OAuthError> {
+    let mut unique = BTreeMap::new();
+    for (name, value) in params {
+        if unique.insert(name.clone(), value.clone()).is_some() {
+            return Err(OAuthError::invalid_request(format!(
+                "duplicate token parameter: {name}"
+            )));
+        }
+    }
+    Ok(unique)
+}
+
+fn oidc_token_hash(alg: JwsAlgorithm, value: &str) -> crate::error::Result<String> {
+    let digest = match alg {
+        JwsAlgorithm::RS256
+        | JwsAlgorithm::PS256
+        | JwsAlgorithm::ES256
+        | JwsAlgorithm::ES256K
+        | JwsAlgorithm::HS256 => Sha256::digest(value.as_bytes()).to_vec(),
+        JwsAlgorithm::RS384 | JwsAlgorithm::PS384 | JwsAlgorithm::ES384 | JwsAlgorithm::HS384 => {
+            Sha384::digest(value.as_bytes()).to_vec()
+        }
+        JwsAlgorithm::RS512 | JwsAlgorithm::PS512 | JwsAlgorithm::ES512 | JwsAlgorithm::HS512 => {
+            Sha512::digest(value.as_bytes()).to_vec()
+        }
+        _ => {
+            return Err(crate::error::Error::Crypto(format!(
+                "{} does not define an OIDC token-hash function",
+                alg
+            )))
+        }
+    };
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2]))
+}
+
+/// Whether OIDC Core defines the hash primitive needed for `c_hash` and
+/// `at_hash` from the JWS `alg` name alone. In particular, legacy `EdDSA`
+/// does not identify its curve/hash, so hash-bearing front-channel response
+/// types are not advertised for it.
+fn supports_oidc_token_hash(alg: JwsAlgorithm) -> bool {
+    matches!(
+        alg,
+        JwsAlgorithm::RS256
+            | JwsAlgorithm::PS256
+            | JwsAlgorithm::ES256
+            | JwsAlgorithm::ES256K
+            | JwsAlgorithm::HS256
+            | JwsAlgorithm::RS384
+            | JwsAlgorithm::PS384
+            | JwsAlgorithm::ES384
+            | JwsAlgorithm::HS384
+            | JwsAlgorithm::RS512
+            | JwsAlgorithm::PS512
+            | JwsAlgorithm::ES512
+            | JwsAlgorithm::HS512
+    )
 }
 
 fn token_use_hash(kind: &str, token: &str) -> String {
@@ -1150,7 +1461,19 @@ fn client_allows_refresh(client: &Client) -> bool {
 fn is_reserved_id_token_claim(name: &str) -> bool {
     matches!(
         name,
-        "iss" | "sub" | "aud" | "exp" | "iat" | "nbf" | "jti" | "nonce" | "auth_time" | "acr"
+        "iss"
+            | "sub"
+            | "aud"
+            | "exp"
+            | "iat"
+            | "nbf"
+            | "jti"
+            | "nonce"
+            | "auth_time"
+            | "acr"
+            | "azp"
+            | "at_hash"
+            | "c_hash"
     )
 }
 
@@ -1176,6 +1499,31 @@ pub fn flatten_claims(
             (k.clone(), value)
         })
         .collect()
+}
+
+/// Release standard UserInfo claims only when their defining scope was
+/// granted. Custom claims remain application-defined and are retained.
+fn filter_claims(
+    scope: &str,
+    claims: BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    claims
+        .into_iter()
+        .filter(|(name, _)| claim_allowed_by_scope(scope, name))
+        .collect()
+}
+
+fn claim_allowed_by_scope(scope: &str, name: &str) -> bool {
+    let required_scope = match name {
+        "name" | "family_name" | "given_name" | "middle_name" | "nickname"
+        | "preferred_username" | "profile" | "picture" | "website" | "gender" | "birthdate"
+        | "zoneinfo" | "locale" | "updated_at" => Some("profile"),
+        "email" | "email_verified" => Some("email"),
+        "address" => Some("address"),
+        "phone_number" | "phone_number_verified" => Some("phone"),
+        _ => None,
+    };
+    required_scope.is_none_or(|required| scope.split_whitespace().any(|s| s == required))
 }
 
 /// Coerce the standard OIDC claims whose JSON type is not a string (OIDC Core
@@ -1256,6 +1604,65 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_does_not_advertise_hash_bearing_flows_for_ambiguous_algorithms() {
+        let mut jwk = jose_rs::jwk::generate_ed25519().unwrap();
+        jwk.alg = Some("EdDSA".into());
+        let key = crate::keys::signing_key_from_jwk_json(
+            &jwk.to_json().unwrap(),
+            Some("EdDSA"),
+            Some("ed-key"),
+        )
+        .unwrap();
+        let provider = Provider::new(
+            ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+            key,
+            Arc::new(crate::client::InMemoryClientStore::new()),
+            TokenCodec::new("secret"),
+            TokenLifetimes::default(),
+            Arc::new(InMemoryTokenUseStore::new()),
+        )
+        .expect("asymmetric OP signing key");
+
+        assert!(provider
+            .metadata
+            .response_types_supported
+            .contains(&"id_token".to_string()));
+        assert!(
+            provider
+                .metadata
+                .grant_types_supported
+                .contains(&"implicit".to_string()),
+            "front-channel token response types require the implicit grant advertisement"
+        );
+        assert!(!provider
+            .metadata
+            .response_types_supported
+            .contains(&"code id_token".to_string()));
+    }
+
+    #[test]
+    fn provider_rejects_symmetric_id_token_signing_keys() {
+        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([42_u8; 64]);
+        let jwk = serde_json::json!({ "kty": "oct", "k": secret }).to_string();
+        for algorithm in ["HS256", "HS384", "HS512"] {
+            let key = crate::keys::signing_key_from_jwk_json(&jwk, Some(algorithm), Some("op-hs"))
+                .expect("valid symmetric signing key");
+            let result = Provider::new(
+                ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+                key,
+                Arc::new(crate::client::InMemoryClientStore::new()),
+                TokenCodec::new("secret"),
+                TokenLifetimes::default(),
+                Arc::new(InMemoryTokenUseStore::new()),
+            );
+            assert!(
+                matches!(result, Err(crate::error::Error::Config(_))),
+                "{algorithm} must not be accepted as a provider-wide ID-token key"
+            );
+        }
+    }
 
     #[cfg(feature = "redis")]
     fn redis_set_cmd(key: &str, ttl_secs: u64) -> redis::Cmd {
@@ -1434,8 +1841,9 @@ mod tests {
             ])),
             TokenCodec::new("op-secret"),
             TokenLifetimes::default(),
+            store.clone(),
         )
-        .with_token_use_store(store.clone());
+        .expect("asymmetric OP signing key");
 
         // Fresh assertion, but exp a decade out.
         let now = now_secs();
@@ -1453,14 +1861,13 @@ mod tests {
         header.kid = key.kid().map(str::to_string);
         let assertion = jose_rs::jwt::encode(key.signer(), &header, &claims).unwrap();
 
-        let form: BTreeMap<String, String> = [
+        let form = vec![
             (
                 "client_assertion_type".to_string(),
                 CLIENT_ASSERTION_TYPE.to_string(),
             ),
             ("client_assertion".to_string(), assertion),
-        ]
-        .into();
+        ];
         op.authenticate_client(&form, None, token_url)
             .await
             .expect("assertion authenticates");

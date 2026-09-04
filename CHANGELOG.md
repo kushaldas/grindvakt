@@ -2,6 +2,45 @@
 
 ## unreleased
 
+- Provider discovery metadata now advertises the `implicit` grant alongside
+  the supported implicit and hybrid response types.
+- **Breaking:** `OAuthError::to_redirect` requires the validated response
+  mode, `Provider::new` is fallible so it can reject provider-wide symmetric
+  `HS*` ID-token signing keys, and the direct JWKS/UserInfo fetch helpers
+  require their associated issuer.
+- Remote issuers and federation entities can no longer advertise loopback
+  HTTP service endpoints. The loopback development exception applies only
+  when the issuer/entity is itself a loopback HTTP origin.
+- Token requests that present more than one client-authentication method are
+  rejected with `invalid_client`, as required by RFC 6749 section 2.3.
+
+## 0.8.0 [2026-09-03]
+
+- Hardened OIDC authorization responses: all advertised standard response
+  types are implemented, token-bearing responses use fragments, hybrid hashes
+  are emitted, and response-type order is handled per RFC 6749.
+- Hardened RP validation with exact issuer matching, safe endpoint policy,
+  mandatory token-response fields, explicit signing-algorithm and audience
+  policy, `azp` validation, public-client PKCE, and UserInfo subject binding.
+- **Breaking:** Public authorization and token-endpoint parsers now require
+  ordered parameter pairs so duplicate protocol parameters cannot be erased by
+  a map before validation. Reserved authorization extras are also rejected;
+  authorization errors preserve the validated response mode.
+- Malformed registered redirect URIs and RP/federation service endpoints with
+  raw whitespace or control characters are rejected, every supplied PKCE tuple
+  must use canonical S256, and narrowed refresh grants remove standard claims
+  for scopes the client dropped.
+- RP ID-token validation accepts a one-element JSON array in `aud` without
+  requiring `azp`, while retaining `azp` and trust checks for multiple
+  audiences and for any explicitly supplied `azp` claim.
+- **Breaking:** Authorization requests preserve repeated RFC 8707 `resource`
+  parameters in `AuthorizationRequest::resources` instead of `extra`, while
+  duplicate single-valued parameters remain invalid.
+- DPoP always fails closed without an atomic replay store, and `DpopProof` is
+  opaque so only validation can create it.
+- **Breaking:** `Provider::new` now requires an explicit `TokenUseStore`, and
+  RP token verification / UserInfo APIs require their security-policy inputs.
+
 ## 0.7.2 [2026-08-31]
 
 - Added `Provider::authorization_redirect_with_claims` for OP-asserted claims

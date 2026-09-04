@@ -41,8 +41,8 @@ caller.
 
 ## Consequences
 
-Deployments using the default in-memory `TokenUseStore` get single-process
-replay protection; multi-replica deployments must install a shared store
+Deployments that explicitly select the in-memory `TokenUseStore` get
+single-process replay protection; multi-replica deployments must install a shared store
 (e.g. `RedisStore`, ADR 0002) for the protection to hold across replicas — the
 same caveat that already applies to authorization codes and refresh tokens.
 Assertion issuers must now include `iat`, `exp` (by default at most 300

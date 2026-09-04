@@ -1,7 +1,26 @@
 //! Parsing and validation of OIDC authorization requests.
 
 use crate::oauth_error::{OAuthError, OAuthErrorCode};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Compare OAuth `response_type` values as space-delimited sets.
+///
+/// RFC 6749 section 3.1.1 makes ordering insignificant. Empty members and
+/// duplicate values are rejected so alternate spellings cannot create an
+/// ambiguous authorization policy decision.
+pub(crate) fn response_type_eq(left: &str, right: &str) -> bool {
+    fn values(input: &str) -> Option<BTreeSet<&str>> {
+        let mut result = BTreeSet::new();
+        for value in input.split(' ') {
+            if value.is_empty() || !result.insert(value) {
+                return None;
+            }
+        }
+        (!result.is_empty()).then_some(result)
+    }
+
+    matches!((values(left), values(right)), (Some(a), Some(b)) if a == b)
+}
 
 /// A parsed OIDC authorization request.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -20,13 +39,46 @@ pub struct AuthorizationRequest {
     pub claims: Option<serde_json::Value>,
     /// The raw `request` parameter (RFC 9101 request object JWT), if present.
     pub request_object: Option<String>,
+    /// Target resource indicators from repeated RFC 8707 `resource`
+    /// parameters, preserved in request order for application policy.
+    ///
+    /// Preservation does not enable RFC 8707 token audience restriction; an
+    /// application that accepts these values must validate and enforce its
+    /// resource policy before asking the provider to mint artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
     /// Other parameters preserved verbatim.
     pub extra: BTreeMap<String, String>,
 }
 
 impl AuthorizationRequest {
-    /// Parse from a flat parameter map (query string or merged request object).
-    pub fn from_params(params: &BTreeMap<String, String>) -> Result<Self, OAuthError> {
+    /// Parse an ordered parameter list, rejecting duplicate protocol fields
+    /// before converting it to the single-valued internal representation.
+    pub fn from_pairs(params: &[(String, String)]) -> Result<Self, OAuthError> {
+        let mut unique = BTreeMap::new();
+        let mut resources = Vec::new();
+        for (name, value) in params {
+            // RFC 8707 section 2 permits multiple resource parameters. Every
+            // other supported field is single-valued and remains ambiguous if
+            // repeated, so it must be rejected before map conversion.
+            if name == "resource" {
+                resources.push(value.clone());
+                continue;
+            }
+            if unique.insert(name.clone(), value.clone()).is_some() {
+                return Err(OAuthError::invalid_request(format!(
+                    "duplicate authorization parameter: {name}"
+                )));
+            }
+        }
+        let mut request = Self::from_params(&unique)?;
+        request.resources = resources;
+        Ok(request)
+    }
+
+    /// Parse the internal single-valued representation after the public
+    /// ordered-pair boundary has rejected duplicate parameters.
+    fn from_params(params: &BTreeMap<String, String>) -> Result<Self, OAuthError> {
         let get = |k: &str| params.get(k).cloned();
 
         let client_id =
@@ -59,6 +111,7 @@ impl AuthorizationRequest {
             "acr_values",
             "claims",
             "request",
+            "resource",
         ];
         let extra = params
             .iter()
@@ -80,6 +133,7 @@ impl AuthorizationRequest {
             acr_values: get("acr_values"),
             claims,
             request_object: get("request"),
+            resources: Vec::new(),
             extra,
         })
     }
@@ -143,6 +197,11 @@ impl AuthorizationRequest {
             .any(|t| t == "id_token")
     }
 
+    /// True if the response_type requests an access token directly.
+    pub fn wants_access_token(&self) -> bool {
+        self.response_type.split_whitespace().any(|t| t == "token")
+    }
+
     /// Whether the response should be returned in the fragment.
     pub fn use_fragment(&self) -> bool {
         match self.response_mode.as_deref() {
@@ -152,24 +211,57 @@ impl AuthorizationRequest {
             // returns an id_token from the authorization endpoint (implicit
             // and hybrid, OIDC Core §3.2.2.5 / §3.3.2.5) uses the fragment, so
             // the id_token never leaks into the URL (logs, Referer, history).
-            _ => self.wants_id_token(),
+            _ => self.wants_id_token() || self.wants_access_token(),
         }
     }
 
     /// Validate the response_type is one we support.
     pub fn validate_response_type(&self) -> Result<(), OAuthError> {
-        let supported = matches!(
-            self.response_type.as_str(),
-            "code" | "id_token" | "id_token token" | "code id_token"
-        );
-        if supported {
-            Ok(())
-        } else {
-            Err(OAuthError::new(
+        let supported = [
+            "code",
+            "id_token",
+            "id_token token",
+            "code id_token",
+            "code token",
+            "code id_token token",
+        ]
+        .iter()
+        .any(|supported| response_type_eq(&self.response_type, supported));
+        if !supported {
+            return Err(OAuthError::new(
                 OAuthErrorCode::UnsupportedResponseType,
                 format!("unsupported response_type: {}", self.response_type),
             )
-            .with_state(self.state.clone()))
+            .with_state(self.state.clone()));
+        }
+        // Response types containing `id_token` are valid only for OpenID
+        // Connect requests. `code token` is independently defined as an OAuth
+        // response type by OAuth 2.0 Multiple Response Type Encoding Practices
+        // section 5, so it remains valid without the `openid` scope.
+        if self.wants_id_token() && !self.is_oidc() {
+            return Err(OAuthError::new(
+                OAuthErrorCode::InvalidScope,
+                "response_type containing id_token requires the openid scope",
+            )
+            .with_state(self.state.clone()));
+        }
+        Ok(())
+    }
+
+    /// Validate response-mode syntax and prevent tokens from entering URL
+    /// queries, where they are exposed to logs, history, and referrers.
+    pub fn validate_response_mode(&self) -> Result<(), OAuthError> {
+        match self.response_mode.as_deref() {
+            None | Some("fragment") => Ok(()),
+            Some("query") if !self.wants_id_token() && !self.wants_access_token() => Ok(()),
+            Some("query") => Err(OAuthError::invalid_request(
+                "response_mode=query is not allowed for token-bearing responses",
+            )
+            .with_state(self.state.clone())),
+            Some(other) => Err(OAuthError::invalid_request(format!(
+                "unsupported response_mode: {other}"
+            ))
+            .with_state(self.state.clone())),
         }
     }
 }
@@ -223,6 +315,14 @@ mod tests {
         };
         assert!(hybrid.use_fragment());
 
+        // A front-channel access token also defaults to the fragment, even
+        // when the response has no ID token.
+        let code_token = AuthorizationRequest {
+            response_type: "code token".into(),
+            ..Default::default()
+        };
+        assert!(code_token.use_fragment());
+
         // Pure code flow keeps the query default.
         let code = AuthorizationRequest {
             response_type: "code".into(),
@@ -230,13 +330,136 @@ mod tests {
         };
         assert!(!code.use_fragment());
 
-        // An explicit response_mode still wins.
+        // An explicit unsafe response_mode is represented here, but request
+        // validation rejects it before response construction.
         let explicit = AuthorizationRequest {
             response_type: "code id_token".into(),
             response_mode: Some("query".into()),
             ..Default::default()
         };
         assert!(!explicit.use_fragment());
+        assert!(explicit.validate_response_mode().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_parameters_before_flattening() {
+        let pairs = vec![
+            ("client_id".into(), "first".into()),
+            ("client_id".into(), "second".into()),
+            ("response_type".into(), "code".into()),
+            ("redirect_uri".into(), "https://rp/cb".into()),
+        ];
+        let err = AuthorizationRequest::from_pairs(&pairs).unwrap_err();
+        assert_eq!(err.code, OAuthErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn preserves_repeated_resource_indicators_without_weakening_duplicate_checks() {
+        let pairs = vec![
+            ("client_id".into(), "client".into()),
+            ("response_type".into(), "code".into()),
+            ("redirect_uri".into(), "https://rp.example/cb".into()),
+            ("resource".into(), "https://api-one.example".into()),
+            ("resource".into(), "https://api-two.example".into()),
+        ];
+        let request = AuthorizationRequest::from_pairs(&pairs).unwrap();
+        assert_eq!(
+            request.resources,
+            ["https://api-one.example", "https://api-two.example"]
+        );
+        assert!(!request.extra.contains_key("resource"));
+
+        let serialized = serde_json::to_value(&request).unwrap();
+        let restored: AuthorizationRequest = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.resources, request.resources);
+
+        let mut ambiguous = pairs;
+        ambiguous.push(("scope".into(), "read".into()));
+        ambiguous.push(("scope".into(), "write".into()));
+        assert_eq!(
+            AuthorizationRequest::from_pairs(&ambiguous)
+                .unwrap_err()
+                .code,
+            OAuthErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn validates_standard_response_types_and_modes() {
+        for response_type in [
+            "code",
+            "id_token",
+            "id_token token",
+            "code id_token",
+            "code token",
+            "code id_token token",
+        ] {
+            let req = AuthorizationRequest {
+                response_type: response_type.into(),
+                scope: "openid".into(),
+                ..Default::default()
+            };
+            req.validate_response_type().unwrap();
+            req.validate_response_mode().unwrap();
+        }
+
+        let reordered = AuthorizationRequest {
+            response_type: "token code id_token".into(),
+            scope: "openid".into(),
+            ..Default::default()
+        };
+        reordered.validate_response_type().unwrap();
+
+        let duplicate = AuthorizationRequest {
+            response_type: "code code".into(),
+            scope: "openid".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            duplicate.validate_response_type().unwrap_err().code,
+            OAuthErrorCode::UnsupportedResponseType
+        );
+
+        // RFC 6749's response-type grammar allows exactly one SP between
+        // non-empty response names. Do not normalize malformed spellings.
+        for response_type in [" code", "code ", "code  id_token"] {
+            let malformed = AuthorizationRequest {
+                response_type: response_type.into(),
+                scope: "openid".into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                malformed.validate_response_type().unwrap_err().code,
+                OAuthErrorCode::UnsupportedResponseType,
+                "malformed response_type must be rejected: {response_type:?}"
+            );
+        }
+
+        let missing_openid = AuthorizationRequest {
+            response_type: "id_token".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            missing_openid.validate_response_type().unwrap_err().code,
+            OAuthErrorCode::InvalidScope
+        );
+
+        let oauth_code_token = AuthorizationRequest {
+            response_type: "code token".into(),
+            scope: "read".into(),
+            ..Default::default()
+        };
+        oauth_code_token
+            .validate_response_type()
+            .expect("code token is also a registered OAuth response type");
+
+        let unknown_mode = AuthorizationRequest {
+            response_type: "code".into(),
+            scope: "openid".into(),
+            response_mode: Some("unknown".into()),
+            ..Default::default()
+        };
+        assert!(unknown_mode.validate_response_mode().is_err());
     }
 
     #[test]

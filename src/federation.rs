@@ -417,6 +417,7 @@ pub async fn entity_metadata_jwks(
         return fetch_signed_jwks(http, uri, subject_entity_id, subject_fed_jwks).await;
     }
     if let Some(uri) = metadata.get("jwks_uri").and_then(|v| v.as_str()) {
+        crate::rp::validate_service_endpoint_for_issuer("jwks_uri", uri, subject_entity_id)?;
         let resp = http.get(uri).await?;
         if resp.status != 200 {
             return Err(Error::Internal(format!(
@@ -438,6 +439,14 @@ pub async fn fetch_signed_jwks(
     subject_entity_id: &str,
     subject_fed_jwks: &JwkSet,
 ) -> Result<JwkSet> {
+    // This function is public and can be called without first parsing an
+    // entity metadata document, so enforce the endpoint policy at the direct
+    // network boundary as well.
+    crate::rp::validate_service_endpoint_for_issuer(
+        "signed_jwks_uri",
+        signed_jwks_uri,
+        subject_entity_id,
+    )?;
     let resp = http.get(signed_jwks_uri).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
@@ -672,11 +681,128 @@ pub(crate) fn urlenc(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::keys::signing_key_from_jwk_json;
+    use std::sync::Mutex;
 
     fn key(kid: &str) -> SigningKey {
         let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
         jwk.alg = Some("ES256".into());
         signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), Some(kid)).unwrap()
+    }
+
+    struct RecordingHttp {
+        get_urls: Mutex<Vec<String>>,
+        response: crate::http::HttpFetchResponse,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for RecordingHttp {
+        async fn get(&self, url: &str) -> Result<crate::http::HttpFetchResponse> {
+            self.get_urls.lock().unwrap().push(url.to_string());
+            Ok(self.response.clone())
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _form: &[(String, String)],
+            _headers: &[(String, String)],
+        ) -> Result<crate::http::HttpFetchResponse> {
+            Err(Error::Internal("unexpected POST".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_jwks_endpoints_reject_raw_controls_before_fetch() {
+        let subject_jwks = key("subject").to_public_jwks();
+        let recording = Arc::new(RecordingHttp {
+            get_urls: Mutex::new(Vec::new()),
+            response: crate::http::HttpFetchResponse {
+                status: 200,
+                body: serde_json::to_vec(&subject_jwks).unwrap(),
+                content_type: Some("application/json".into()),
+            },
+        });
+        let http: Arc<dyn HttpClient> = recording.clone();
+        let unsafe_uri = "https://op.example/jwks\r\nX-Test: injected";
+
+        for field in ["jwks_uri", "signed_jwks_uri"] {
+            let metadata = serde_json::json!({ (field): unsafe_uri });
+            assert!(
+                entity_metadata_jwks(&http, &metadata, "https://op.example", &subject_jwks)
+                    .await
+                    .is_err(),
+                "unsafe {field} must be rejected"
+            );
+        }
+        assert!(
+            fetch_signed_jwks(&http, unsafe_uri, "https://op.example", &subject_jwks)
+                .await
+                .is_err(),
+            "direct signed_jwks_uri fetch must validate before HTTP"
+        );
+        assert!(recording.get_urls.lock().unwrap().is_empty());
+
+        let safe_uri = "https://op.example/jwks?tenant=one";
+        let fetched = entity_metadata_jwks(
+            &http,
+            &serde_json::json!({ "jwks_uri": safe_uri }),
+            "https://op.example",
+            &subject_jwks,
+        )
+        .await
+        .expect("valid HTTPS jwks_uri must still be fetched");
+        assert_eq!(fetched.keys.len(), subject_jwks.keys.len());
+        assert_eq!(
+            recording.get_urls.lock().unwrap().as_slice(),
+            &[safe_uri.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_federation_entity_cannot_redirect_jwks_fetch_to_loopback_http() {
+        let subject_jwks = key("subject").to_public_jwks();
+        let recording = Arc::new(RecordingHttp {
+            get_urls: Mutex::new(Vec::new()),
+            response: crate::http::HttpFetchResponse {
+                status: 200,
+                body: serde_json::to_vec(&subject_jwks).unwrap(),
+                content_type: Some("application/json".into()),
+            },
+        });
+        let http: Arc<dyn HttpClient> = recording.clone();
+        let local_uri = "http://127.0.0.1:8080/jwks";
+
+        for field in ["jwks_uri", "signed_jwks_uri"] {
+            let metadata = serde_json::json!({ (field): local_uri });
+            assert!(
+                entity_metadata_jwks(&http, &metadata, "https://remote.example", &subject_jwks,)
+                    .await
+                    .is_err(),
+                "remote entity must not authorize loopback HTTP {field}"
+            );
+        }
+        assert!(
+            fetch_signed_jwks(&http, local_uri, "https://remote.example", &subject_jwks,)
+                .await
+                .is_err()
+        );
+        assert!(
+            recording.get_urls.lock().unwrap().is_empty(),
+            "rejected loopback endpoints must not be fetched"
+        );
+
+        entity_metadata_jwks(
+            &http,
+            &serde_json::json!({ "jwks_uri": local_uri }),
+            "http://localhost:8080",
+            &subject_jwks,
+        )
+        .await
+        .expect("loopback development entity may use a loopback HTTP endpoint");
+        assert_eq!(
+            recording.get_urls.lock().unwrap().as_slice(),
+            &[local_uri.to_string()]
+        );
     }
 
     fn subordinate_statement(
