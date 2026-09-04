@@ -234,10 +234,10 @@ impl AuthorizationRequest {
             )
             .with_state(self.state.clone()));
         }
-        // Only response types that return an ID Token invoke OpenID Connect.
-        // `code token` is independently defined as an OAuth response type by
-        // OAuth 2.0 Multiple Response Type Encoding Practices section 5, so it
-        // remains valid without the `openid` scope.
+        // Response types containing `id_token` are valid only for OpenID
+        // Connect requests. `code token` is independently defined as an OAuth
+        // response type by OAuth 2.0 Multiple Response Type Encoding Practices
+        // section 5, so it remains valid without the `openid` scope.
         if self.wants_id_token() && !self.is_oidc() {
             return Err(OAuthError::new(
                 OAuthErrorCode::InvalidScope,
