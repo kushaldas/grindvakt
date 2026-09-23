@@ -64,6 +64,8 @@ pub struct Provider {
     pub codec: TokenCodec,
     pub lifetimes: TokenLifetimes,
     token_use_store: Arc<dyn TokenUseStore>,
+    /// The embedding application explicitly owns pairwise subject derivation.
+    caller_managed_pairwise_subjects: bool,
     /// Maximum accepted age of a `private_key_jwt` client assertion
     /// (RFC 7523), measured from `iat`. Defaults to
     /// [`DEFAULT_CLIENT_ASSERTION_MAX_AGE`]; see
@@ -295,6 +297,7 @@ impl Provider {
             codec,
             lifetimes,
             token_use_store,
+            caller_managed_pairwise_subjects: false,
             client_assertion_max_age: DEFAULT_CLIENT_ASSERTION_MAX_AGE,
         })
     }
@@ -302,6 +305,34 @@ impl Provider {
     /// Replace the explicitly selected token-use store.
     pub fn with_token_use_store(mut self, store: Arc<dyn TokenUseStore>) -> Self {
         self.token_use_store = store;
+        self
+    }
+
+    /// Accept pairwise client registrations whose subjects the caller derives.
+    ///
+    /// Providers accept and advertise only `public` subjects by default. This
+    /// opt-in also advertises `pairwise` and allows that exact registered
+    /// [`Client::subject_type`]. Unknown subject types remain unsupported.
+    ///
+    /// # Caller responsibilities
+    ///
+    /// Use [`Self::authorization_redirect_with_subject_resolver`] or
+    /// [`Self::authorization_redirect_with_claims_and_subject_resolver`]. The
+    /// trusted application must resolve the supplied client's sector and return
+    /// the final `sub`: stable for the same end-user and sector, different across
+    /// sectors, and not reversible
+    /// by clients. It must validate any sector registration information itself.
+    /// Never enable this solely because an untrusted request asks for pairwise
+    /// subjects, or pass an upstream/global identifier as a pairwise subject.
+    ///
+    /// Grindvakt does not derive, hash, or check sector isolation of this value.
+    /// It preserves the supplied subject unchanged in authorization artifacts,
+    /// code exchanges, refreshes, and UserInfo. Existing deployments should
+    /// retain their derivation algorithm, secret, sector mapping, and stored
+    /// identifiers to preserve account links. See ADR 0008.
+    pub fn with_caller_managed_pairwise_subjects(mut self) -> Self {
+        self.caller_managed_pairwise_subjects = true;
+        self.metadata.subject_types_supported = vec!["public".into(), "pairwise".into()];
         self
     }
 
@@ -365,10 +396,15 @@ impl Provider {
                 "redirect_uri must not contain a fragment",
             ));
         }
-        if client.subject_type != "public" {
+        let subject_type_supported = match client.subject_type.as_str() {
+            "public" => true,
+            "pairwise" => self.caller_managed_pairwise_subjects,
+            _ => false,
+        };
+        if !subject_type_supported {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnauthorizedClient,
-                "only public subject identifiers are implemented",
+                "registered subject identifier type is not supported by this provider",
             )
             .with_state(req.state.clone()));
         }
@@ -440,6 +476,11 @@ impl Provider {
 
     /// Build the authorization response (a redirect carrying `code` and/or
     /// `id_token`) after the user has authenticated and claims were released.
+    ///
+    /// `sub` is the final subject, supplied by the trusted caller and preserved
+    /// unchanged. This method accepts only public-subject registrations. Pairwise
+    /// clients must use [`Self::authorization_redirect_with_subject_resolver`]
+    /// so derivation uses the registration validated at issuance time.
     pub async fn authorization_redirect(
         &self,
         req: &AuthorizationRequest,
@@ -464,6 +505,8 @@ impl Provider {
     /// …) are ignored, exactly as released claims are in `Self::build_id_token`.
     /// The values are sealed into the authorization code, so they survive the
     /// code and refresh-token exchanges unchanged rather than being recomputed.
+    /// The caller's `sub` follows the same subject contract as
+    /// [`Self::authorization_redirect`]; `extra_claims` cannot override it.
     pub async fn authorization_redirect_with_claims(
         &self,
         req: &AuthorizationRequest,
@@ -472,11 +515,123 @@ impl Provider {
         acr: Option<String>,
         extra_claims: &BTreeMap<String, serde_json::Value>,
     ) -> Result<crate::http::Response, OAuthError> {
-        // Revalidate at the minting boundary. AuthorizationRequest is
-        // serializable so applications can carry it across a login step; a
-        // caller must not be able to deserialize an unvalidated request and
-        // mint artifacts from it.
-        self.validate_authorization_request(req).await?;
+        self.authorization_redirect_with_claims_and_subject_resolver(
+            req,
+            |client| {
+                // A precomputed subject is not bound to the registration that
+                // authorized its derivation. Never reinterpret it as pairwise.
+                if client.subject_type != "public" {
+                    return Err(OAuthError::new(
+                        OAuthErrorCode::UnauthorizedClient,
+                        "pairwise subjects require an issuance-time subject resolver",
+                    )
+                    .with_state(req.state.clone()));
+                }
+                Ok(sub.to_owned())
+            },
+            external_claims,
+            acr,
+            extra_claims,
+        )
+        .await
+    }
+
+    /// Build an authorization response using a subject resolved from the client
+    /// registration validated at issuance time.
+    ///
+    /// The synchronous resolver must select/derive the final subject using its
+    /// supplied [`Client`], not a registration cached before login. For pairwise
+    /// clients, [`Self::with_caller_managed_pairwise_subjects`] must be enabled
+    /// and its sector-isolation contract applies. Preload any asynchronous
+    /// application data, then select the subject using this registration.
+    ///
+    /// After resolution, a full registration comparison rejects observed changes
+    /// or removal with `unauthorized_client`. Issuance uses that snapshot; this
+    /// is not a transaction with later store writes or external sector policy.
+    /// Resolver errors propagate unchanged. Empty subjects are rejected.
+    pub async fn authorization_redirect_with_subject_resolver<F>(
+        &self,
+        req: &AuthorizationRequest,
+        resolve_subject: F,
+        external_claims: &BTreeMap<String, Vec<String>>,
+        acr: Option<String>,
+    ) -> Result<crate::http::Response, OAuthError>
+    where
+        F: FnOnce(&Client) -> Result<String, OAuthError>,
+    {
+        self.authorization_redirect_with_claims_and_subject_resolver(
+            req,
+            resolve_subject,
+            external_claims,
+            acr,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    /// Like [`Self::authorization_redirect_with_subject_resolver`], with the
+    /// typed extra-claim semantics of [`Self::authorization_redirect_with_claims`].
+    /// Extra claims cannot override the resolved subject.
+    pub async fn authorization_redirect_with_claims_and_subject_resolver<F>(
+        &self,
+        req: &AuthorizationRequest,
+        resolve_subject: F,
+        external_claims: &BTreeMap<String, Vec<String>>,
+        acr: Option<String>,
+        extra_claims: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<crate::http::Response, OAuthError>
+    where
+        F: FnOnce(&Client) -> Result<String, OAuthError>,
+    {
+        // Revalidate serialized requests at the minting boundary and resolve
+        // against this exact snapshot, rather than a client from before login.
+        let client = self.validate_authorization_request(req).await?;
+        let sub = resolve_subject(&client)?;
+        let current = self.clients.get(&req.client_id).await;
+        // Client contains JWKs without PartialEq. Structural JSON equality
+        // compares every serialized registration field without exposing secrets
+        // in errors or maintaining a security-sensitive partial field list.
+        let registration_value = |client: &Client| {
+            let mut registration = client.clone();
+            // Jwk.extra is flattened during serialization. Keep it separate so
+            // a programmatic extension cannot mask a changed dedicated field.
+            // JSON object equality also ignores HashMap iteration order.
+            let extensions = registration.jwks.as_mut().map(|jwks| {
+                jwks.keys
+                    .iter_mut()
+                    .map(|key| std::mem::take(&mut key.extra))
+                    .collect::<Vec<_>>()
+            });
+            serde_json::to_value((registration, extensions)).map_err(|_| {
+                OAuthError::new(
+                    OAuthErrorCode::ServerError,
+                    "cannot compare client registration",
+                )
+            })
+        };
+        let unchanged = match current {
+            Some(current) => registration_value(&client)? == registration_value(&current)?,
+            None => false,
+        };
+        if !unchanged {
+            return Err(OAuthError::new(
+                OAuthErrorCode::UnauthorizedClient,
+                "client registration changed during subject resolution",
+            )
+            .with_state(req.state.clone()));
+        }
+        // No further lookups reinterpret the subject under another registration.
+        self.mint_authorization_response(req, &sub, external_claims, acr, extra_claims)
+    }
+
+    fn mint_authorization_response(
+        &self,
+        req: &AuthorizationRequest,
+        sub: &str,
+        external_claims: &BTreeMap<String, Vec<String>>,
+        acr: Option<String>,
+        extra_claims: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<crate::http::Response, OAuthError> {
         if sub.is_empty() {
             return Err(OAuthError::new(
                 OAuthErrorCode::ServerError,

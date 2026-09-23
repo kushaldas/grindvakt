@@ -22,6 +22,52 @@ runs under actix-web, axum, or anything else.
 - **Foundational primitives** — `error`, `http`, `keys` (PEM/DER/JWK signing-key
   loading), `mac` and `util`, re-used by downstream crates.
 
+## Caller-managed pairwise subjects
+
+`Provider::new` accepts and advertises only `public` subject identifiers. An
+application that already derives sector-specific subjects can opt in explicitly:
+
+```rust
+// Configure once at startup, after constructing the provider.
+let provider = provider.with_caller_managed_pairwise_subjects();
+```
+
+This adds `pairwise` to `subject_types_supported` and permits clients registered
+with `subject_type = "pairwise"`. Unknown subject types are still rejected.
+Changing discovery metadata alone does not enable this behavior.
+
+The embedding application must use `authorization_redirect_with_subject_resolver`
+or `authorization_redirect_with_claims_and_subject_resolver` for pairwise clients.
+These methods validate the request at issuance time and pass that exact client
+registration to a synchronous callback. Select or derive the final `sub` from
+this supplied client, including its registered subject type; do not reuse a
+subject chosen from a client snapshot cached before login. The existing methods
+that take a precomputed `sub` accept only public-subject registrations.
+
+After resolution, Grindvakt compares the complete registration with the current
+store entry and rejects observed changes or removal with `unauthorized_client`.
+This is snapshot validation, not a transaction with later store writes or the
+application's external sector configuration. Resolver errors propagate unchanged.
+Preload any data requiring asynchronous I/O, then select the appropriate mapping
+inside the callback using the supplied registration.
+
+For pairwise clients, the application owns sector registration validation and
+derivation: the identifier must be stable for an end-user within a sector,
+different across sectors, and non-reversible by clients. An upstream identifier
+or an attribute named `pairwise-id` is insufficient unless the application
+selects the correct derived value as `sub`. Enable the option only when that
+path is wired.
+
+Grindvakt preserves this value unchanged in codes, ID tokens, access tokens,
+refresh tokens, and UserInfo. It does not hash the value again or verify the
+caller's sector isolation. To restore a working integration from before 0.8.0,
+keep its existing derivation algorithm, secret, sector mapping, and identifiers;
+changing the resulting `sub` can break account links. Applications without a
+pairwise implementation should keep the public-only default.
+
+See [ADR 0008](docs/adr/0008-caller-managed-pairwise-subjects.md) for the contract
+and its trust boundary.
+
 ## HSM / PKCS#11 signing (optional)
 
 Enable the `pkcs11` feature to keep signing keys on a hardware token (SoftHSM2,
@@ -31,7 +77,7 @@ request objects — then sign over PKCS#11 (`C_Sign`). Symmetric token sealing
 (access/refresh/authorization codes) stays software-only.
 
 ```toml
-grindvakt = { version = "0.6", features = ["pkcs11"] }
+grindvakt = { version = "0.8.1", features = ["pkcs11"] }
 ```
 
 ```rust

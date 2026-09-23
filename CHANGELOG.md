@@ -1,7 +1,23 @@
 # Changelog
 
-## unreleased
+## 0.8.1 [2026-09-23]
 
+- Require `cryptoki` 0.12.1 or newer in the 0.12 series to fix the
+  `CKA_ALLOWED_MECHANISMS` out-of-bounds read (RUSTSEC-2026-0286) in the optional
+  PKCS#11 backend.
+- Added `Provider::with_caller_managed_pairwise_subjects` for applications that
+  already derive the final OIDC subject (ADR 0008). Providers remain public-only
+  by default; opting in advertises and accepts `pairwise` client registrations
+  while still rejecting unknown subject types. The caller owns sector validation
+  and privacy guarantees. Grindvakt preserves the supplied subject unchanged
+  through authorization, token exchange, refresh rotation, and UserInfo, allowing
+  existing integrations to retain their subject values and account links.
+- Bound caller-managed subject derivation to the client registration validated
+  at issuance through `authorization_redirect_with_subject_resolver` and
+  `authorization_redirect_with_claims_and_subject_resolver`. Observed registration
+  changes or removal during resolution abort issuance. Methods accepting a
+  precomputed subject now accept only public-subject registrations, preventing
+  an earlier public subject from being reused after a switch to pairwise.
 - Provider discovery metadata now advertises the `implicit` grant alongside
   the supported implicit and hybrid response types.
 - **Breaking:** `OAuthError::to_redirect` requires the validated response
