@@ -23,7 +23,7 @@ redis = ["dep:redis", "redis/tokio-comp", "redis/connection-manager"]
 [dependencies]
 jose-rs = { version = "0.7.0", default-features = false }
 kryptering = { version = "0.5", default-features = false }
-cryptoki = { version = "0.12", optional = true }
+cryptoki = { version = "0.12.1", optional = true }
 redis = { version = "1.3", optional = true, default-features = false }
 
 serde = { version = "1", features = ["derive"] }

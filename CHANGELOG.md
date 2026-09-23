@@ -2,6 +2,9 @@
 
 ## 0.8.1 [2026-09-23]
 
+- Require `cryptoki` 0.12.1 or newer in the 0.12 series to fix the
+  `CKA_ALLOWED_MECHANISMS` out-of-bounds read (RUSTSEC-2026-0286) in the optional
+  PKCS#11 backend.
 - Added `Provider::with_caller_managed_pairwise_subjects` for applications that
   already derive the final OIDC subject (ADR 0008). Providers remain public-only
   by default; opting in advertises and accepts `pairwise` client registrations
