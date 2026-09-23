@@ -9,6 +9,12 @@
   and privacy guarantees. Grindvakt preserves the supplied subject unchanged
   through authorization, token exchange, refresh rotation, and UserInfo, allowing
   existing integrations to retain their subject values and account links.
+- Bound caller-managed subject derivation to the client registration validated
+  at issuance through `authorization_redirect_with_subject_resolver` and
+  `authorization_redirect_with_claims_and_subject_resolver`. Observed registration
+  changes or removal during resolution abort issuance. Methods accepting a
+  precomputed subject now accept only public-subject registrations, preventing
+  an earlier public subject from being reused after a switch to pairwise.
 - Provider discovery metadata now advertises the `implicit` grant alongside
   the supported implicit and hybrid response types.
 - **Breaking:** `OAuthError::to_redirect` requires the validated response

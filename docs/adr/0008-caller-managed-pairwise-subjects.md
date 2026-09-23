@@ -25,6 +25,11 @@ persistent subject mapping. Silently accepting `pairwise` for every caller would
 misrepresent the default provider's capabilities. Automatically introducing a
 new derivation would also change existing subjects and could break account links.
 
+Client registrations can be replaced while an interactive login is in progress.
+Revalidating a request against a fresh registration while accepting a subject
+chosen from an earlier registration can reinterpret a public identifier as
+pairwise. Subject derivation and issuance must share the validated registration.
+
 ## Decision
 
 Add `Provider::with_caller_managed_pairwise_subjects()` as an explicit startup
@@ -36,15 +41,27 @@ opt-in for trusted embedding applications.
 - A private provider flag enables the exact registered `pairwise` subject type.
   Discovery metadata is not an authorization switch. Unknown or incorrectly
   cased subject types remain rejected with `unauthorized_client`.
-- Both authorization response methods revalidate the request before minting,
+- All authorization response methods revalidate the request before minting,
   retaining the subject-type gate even when callers skip initial validation.
-- The caller supplies the final subject through the existing `sub` argument.
-  No new hashing or normalization is applied. Empty subjects remain rejected,
-  and released attributes or extra claims cannot overwrite `sub`.
+- Pairwise issuance requires `authorization_redirect_with_subject_resolver` or
+  `authorization_redirect_with_claims_and_subject_resolver`. A synchronous
+  callback receives the registration validated at issuance and returns the
+  final subject. The string-subject methods accept only public registrations,
+  even after opt-in, so they cannot bypass the derivation boundary.
+- After resolution, compare the complete serialized registration with the
+  current store entry. Reject any observed change or removal with
+  `unauthorized_client`; then mint synchronously using the same snapshot without
+  further registration lookups. Structural JSON equality includes JWKs, whose
+  upstream types do not implement equality, and future serialized fields.
+  Compare flattened JWK extensions separately so they cannot mask changes to
+  dedicated fields in programmatically constructed keys.
+- No new hashing or normalization is applied. Empty subjects remain rejected,
+  resolver errors propagate unchanged, and released attributes or extra claims
+  cannot overwrite `sub`.
 - Authorization artifacts, code exchange, refresh rotation, and UserInfo retain
   the supplied subject using the existing token representation.
 
-The application must inspect the validated client's registration and implement
+The application must inspect the resolver's supplied registration and implement
 the appropriate public or pairwise subject policy. For pairwise registrations,
 it owns sector selection and validation, stable derivation or storage, secret
 management, and separation between sectors. A user-controlled request must not
@@ -70,8 +87,18 @@ pairwise. Grindvakt cannot establish that property from the final identifier.
 Correct external implementations can restore pairwise registration acceptance
 without changing their users' subjects. Integrations must retain their original
 algorithm, secret, sector mapping, and stored values when enabling the option.
+Existing public-subject callers can keep their string-subject API. Pairwise
+callers must migrate to a resolver that selects the subject using its supplied
+registration. Applications needing asynchronous mapping lookups must preload
+trusted data and select the mapping inside that synchronous callback.
 The default remains public-only, and the runtime-agnostic library gains no new
 network, storage, or cryptographic dependencies.
+
+The final registration read is a snapshot check, not transactional exclusion of
+later writes. Issued artifacts retain that snapshot's subject; later registration
+changes do not reinterpret it. External sector policy is application-owned and
+is outside this comparison. Even a benign registration edit during resolution
+aborts issuance conservatively; the caller can restart with fresh validation.
 
 Misuse by a trusted embedding application can still disclose a shared identifier
 across sectors. This remains the caller's responsibility and is documented on
@@ -80,7 +107,10 @@ derivation for stability, sector separation, and existing-account continuity.
 
 Grindvakt's regression tests cover default rejection at validation and issuance,
 metadata-only changes not enabling pairwise, explicit opt-in and unknown-type
-rejection, and preservation of supplied subjects across code/implicit/hybrid
+rejection, rejection through the precomputed-subject APIs after registration
+replacement, resolution against the current snapshot, changes/removal during
+resolution (including redirect and JWK changes), resolver errors, and
+preservation of supplied subjects across code/implicit/hybrid
 responses, token exchange, repeated refresh rotation, and UserInfo. These tests
 verify the library contract, not an application's derivation algorithm.
 
