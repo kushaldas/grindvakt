@@ -31,6 +31,9 @@ pub struct Client {
     pub jwks: Option<JwkSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Registered subject identifier type (`public` by default). `pairwise`
+    /// requires [`crate::provider::Provider::with_caller_managed_pairwise_subjects`]
+    /// and application-provided subject derivation; arbitrary values are rejected.
     #[serde(default = "default_subject_type")]
     pub subject_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

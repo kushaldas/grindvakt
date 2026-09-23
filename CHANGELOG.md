@@ -1,7 +1,14 @@
 # Changelog
 
-## unreleased
+## 0.8.1 [2026-09-23]
 
+- Added `Provider::with_caller_managed_pairwise_subjects` for applications that
+  already derive the final OIDC subject (ADR 0008). Providers remain public-only
+  by default; opting in advertises and accepts `pairwise` client registrations
+  while still rejecting unknown subject types. The caller owns sector validation
+  and privacy guarantees. Grindvakt preserves the supplied subject unchanged
+  through authorization, token exchange, refresh rotation, and UserInfo, allowing
+  existing integrations to retain their subject values and account links.
 - Provider discovery metadata now advertises the `implicit` grant alongside
   the supported implicit and hybrid response types.
 - **Breaking:** `OAuthError::to_redirect` requires the validated response

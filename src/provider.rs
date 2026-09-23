@@ -64,6 +64,8 @@ pub struct Provider {
     pub codec: TokenCodec,
     pub lifetimes: TokenLifetimes,
     token_use_store: Arc<dyn TokenUseStore>,
+    /// The embedding application explicitly owns pairwise subject derivation.
+    caller_managed_pairwise_subjects: bool,
     /// Maximum accepted age of a `private_key_jwt` client assertion
     /// (RFC 7523), measured from `iat`. Defaults to
     /// [`DEFAULT_CLIENT_ASSERTION_MAX_AGE`]; see
@@ -295,6 +297,7 @@ impl Provider {
             codec,
             lifetimes,
             token_use_store,
+            caller_managed_pairwise_subjects: false,
             client_assertion_max_age: DEFAULT_CLIENT_ASSERTION_MAX_AGE,
         })
     }
@@ -302,6 +305,33 @@ impl Provider {
     /// Replace the explicitly selected token-use store.
     pub fn with_token_use_store(mut self, store: Arc<dyn TokenUseStore>) -> Self {
         self.token_use_store = store;
+        self
+    }
+
+    /// Accept pairwise client registrations whose subjects the caller derives.
+    ///
+    /// Providers accept and advertise only `public` subjects by default. This
+    /// opt-in also advertises `pairwise` and allows that exact registered
+    /// [`Client::subject_type`]. Unknown subject types remain unsupported.
+    ///
+    /// # Caller responsibilities
+    ///
+    /// Before calling [`Self::authorization_redirect`] or
+    /// [`Self::authorization_redirect_with_claims`], the trusted application must
+    /// resolve the client's sector and supply the final `sub`: stable for the
+    /// same end-user and sector, different across sectors, and not reversible
+    /// by clients. It must validate any sector registration information itself.
+    /// Never enable this solely because an untrusted request asks for pairwise
+    /// subjects, or pass an upstream/global identifier as a pairwise subject.
+    ///
+    /// Grindvakt does not derive, hash, or check sector isolation of this value.
+    /// It preserves the supplied subject unchanged in authorization artifacts,
+    /// code exchanges, refreshes, and UserInfo. Existing deployments should
+    /// retain their derivation algorithm, secret, sector mapping, and stored
+    /// identifiers to preserve account links. See ADR 0008.
+    pub fn with_caller_managed_pairwise_subjects(mut self) -> Self {
+        self.caller_managed_pairwise_subjects = true;
+        self.metadata.subject_types_supported = vec!["public".into(), "pairwise".into()];
         self
     }
 
@@ -365,10 +395,15 @@ impl Provider {
                 "redirect_uri must not contain a fragment",
             ));
         }
-        if client.subject_type != "public" {
+        let subject_type_supported = match client.subject_type.as_str() {
+            "public" => true,
+            "pairwise" => self.caller_managed_pairwise_subjects,
+            _ => false,
+        };
+        if !subject_type_supported {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnauthorizedClient,
-                "only public subject identifiers are implemented",
+                "registered subject identifier type is not supported by this provider",
             )
             .with_state(req.state.clone()));
         }
@@ -440,6 +475,10 @@ impl Provider {
 
     /// Build the authorization response (a redirect carrying `code` and/or
     /// `id_token`) after the user has authenticated and claims were released.
+    ///
+    /// `sub` is the final subject, supplied by the trusted caller and preserved
+    /// unchanged. Pairwise clients require an explicit opt-in and a subject
+    /// derived under [`Self::with_caller_managed_pairwise_subjects`]'s contract.
     pub async fn authorization_redirect(
         &self,
         req: &AuthorizationRequest,
@@ -464,6 +503,8 @@ impl Provider {
     /// …) are ignored, exactly as released claims are in `Self::build_id_token`.
     /// The values are sealed into the authorization code, so they survive the
     /// code and refresh-token exchanges unchanged rather than being recomputed.
+    /// The caller's `sub` follows the same subject contract as
+    /// [`Self::authorization_redirect`]; `extra_claims` cannot override it.
     pub async fn authorization_redirect_with_claims(
         &self,
         req: &AuthorizationRequest,

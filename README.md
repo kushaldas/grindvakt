@@ -22,6 +22,39 @@ runs under actix-web, axum, or anything else.
 - **Foundational primitives** — `error`, `http`, `keys` (PEM/DER/JWK signing-key
   loading), `mac` and `util`, re-used by downstream crates.
 
+## Caller-managed pairwise subjects
+
+`Provider::new` accepts and advertises only `public` subject identifiers. An
+application that already derives sector-specific subjects can opt in explicitly:
+
+```rust
+// Configure once at startup, after constructing the provider.
+let provider = provider.with_caller_managed_pairwise_subjects();
+```
+
+This adds `pairwise` to `subject_types_supported` and permits clients registered
+with `subject_type = "pairwise"`. Unknown subject types are still rejected.
+Changing discovery metadata alone does not enable this behavior.
+
+The embedding application must validate the authorization request, inspect the
+returned client's registered subject type, and supply the final `sub` to
+`authorization_redirect` or `authorization_redirect_with_claims`. For pairwise
+clients, the application owns sector registration validation and derivation:
+the identifier must be stable for an end-user within a sector, different across
+sectors, and non-reversible by clients. An upstream identifier or an attribute
+named `pairwise-id` is insufficient unless the application actually selects the
+correct derived value as `sub`. Enable the option only when that path is wired.
+
+Grindvakt preserves this value unchanged in codes, ID tokens, access tokens,
+refresh tokens, and UserInfo. It does not hash the value again or verify the
+caller's sector isolation. To restore a working integration from before 0.8.0,
+keep its existing derivation algorithm, secret, sector mapping, and identifiers;
+changing the resulting `sub` can break account links. Applications without a
+pairwise implementation should keep the public-only default.
+
+See [ADR 0008](docs/adr/0008-caller-managed-pairwise-subjects.md) for the contract
+and its trust boundary.
+
 ## HSM / PKCS#11 signing (optional)
 
 Enable the `pkcs11` feature to keep signing keys on a hardware token (SoftHSM2,
@@ -31,7 +64,7 @@ request objects — then sign over PKCS#11 (`C_Sign`). Symmetric token sealing
 (access/refresh/authorization codes) stays software-only.
 
 ```toml
-grindvakt = { version = "0.6", features = ["pkcs11"] }
+grindvakt = { version = "0.8.1", features = ["pkcs11"] }
 ```
 
 ```rust

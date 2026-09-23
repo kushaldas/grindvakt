@@ -2161,3 +2161,252 @@ async fn authorization_code_grant_must_be_registered() {
         .unwrap_err();
     assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidGrant);
 }
+
+/// Register a confidential client for the subject-policy and persistence tests.
+fn subject_client(client_id: &str, subject_type: &str) -> Client {
+    // Confidential authentication lets these tests omit PKCE and isolate the
+    // subject policy. The registered flows cover every place sub is persisted.
+    Client {
+        client_id: client_id.into(),
+        client_secret: Some("subject-test-secret".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec![
+            "code".into(),
+            "id_token".into(),
+            "code id_token token".into(),
+        ],
+        grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: subject_type.into(),
+        client_name: None,
+    }
+}
+
+/// Construct a valid request whose response-type-specific nonce keeps codes
+/// distinct when one test exercises multiple flows for the same client.
+fn subject_request(client_id: &str, response_type: &str) -> AuthorizationRequest {
+    AuthorizationRequest {
+        client_id: client_id.into(),
+        redirect_uri: "https://rp.example.com/cb".into(),
+        response_type: response_type.into(),
+        scope: "openid".into(),
+        state: Some("subject-state".into()),
+        nonce: Some(format!("nonce-{response_type}")),
+        ..Default::default()
+    }
+}
+
+/// Pairwise registrations fail at both validation and issuance unless the
+/// application explicitly opts in; editing discovery metadata is insufficient.
+#[tokio::test]
+async fn pairwise_subjects_require_explicit_provider_opt_in() {
+    // A valid pairwise registration alone must not enable application-managed
+    // subjects: the provider must retain its public-only startup policy.
+    let mut op = provider_with(InMemoryClientStore::with_clients(vec![subject_client(
+        "pairwise-rp",
+        "pairwise",
+    )]));
+    assert_eq!(
+        op.discovery_document()["subject_types_supported"],
+        serde_json::json!(["public"])
+    );
+    // Simulate an application changing its advertised capabilities directly.
+    // Authorization must consult the private policy flag, not this mutable list.
+    op.metadata.subject_types_supported.push("pairwise".into());
+    let req = subject_request("pairwise-rp", "code");
+    // Exercise initial validation and both minting entry points independently.
+    // Skipping initial validation must not bypass the check at issuance time.
+    let errors = [
+        op.validate_authorization_request(&req).await.unwrap_err(),
+        op.authorization_redirect(&req, "existing-subject", &BTreeMap::new(), None)
+            .await
+            .unwrap_err(),
+        op.authorization_redirect_with_claims(
+            &req,
+            "existing-subject",
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap_err(),
+    ];
+    for error in errors {
+        // Retain the client's state even when subject policy rejects the flow,
+        // allowing the HTTP adapter to correlate the authorization error.
+        assert_eq!(error.code, grindvakt::OAuthErrorCode::UnauthorizedClient);
+        assert_eq!(error.state.as_deref(), Some("subject-state"));
+    }
+}
+
+/// Opt-in advertises public and pairwise exactly once, accepts both, and still
+/// rejects unknown or incorrectly cased subject types at the issuance boundary.
+#[tokio::test]
+async fn caller_managed_pairwise_policy_matches_discovery() {
+    // Include invalid registrations to prove that opting in enables only the
+    // exact pairwise value, rather than disabling subject-type validation.
+    let op = provider_with(InMemoryClientStore::with_clients(vec![
+        subject_client("public", "public"),
+        subject_client("pairwise", "pairwise"),
+        subject_client("unknown", "unknown"),
+        subject_client("wrong-case", "Pairwise"),
+    ]))
+    .with_caller_managed_pairwise_subjects()
+    .with_caller_managed_pairwise_subjects();
+    // Reapplying startup configuration is idempotent: discovery contains each
+    // supported type once and continues to advertise public subjects.
+    assert_eq!(
+        op.discovery_document()["subject_types_supported"],
+        serde_json::json!(["public", "pairwise"])
+    );
+    for client_id in ["public", "pairwise"] {
+        let req = subject_request(client_id, "code");
+        op.validate_authorization_request(&req).await.unwrap();
+        op.authorization_redirect(&req, "caller-supplied-subject", &BTreeMap::new(), None)
+            .await
+            .unwrap();
+    }
+    for client_id in ["unknown", "wrong-case"] {
+        let req = subject_request(client_id, "code");
+        // Call issuance directly so the test covers revalidation at the point
+        // where a caller could otherwise mint tokens for an unsupported type.
+        let error = op
+            .authorization_redirect(&req, "subject", &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, grindvakt::OAuthErrorCode::UnauthorizedClient);
+    }
+    // Delegating derivation does not relax the basic requirement for a subject.
+    // An empty result is a caller error even with a valid pairwise registration.
+    let error = op
+        .authorization_redirect(
+            &subject_request("pairwise", "code"),
+            "",
+            &BTreeMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, grindvakt::OAuthErrorCode::ServerError);
+}
+
+/// Preserve caller-supplied public and sector-specific subjects byte-for-byte
+/// across code, implicit, and hybrid responses, token exchange, two refresh
+/// rotations, and UserInfo. This tests preservation, not caller-side derivation.
+#[tokio::test]
+async fn caller_managed_subjects_survive_all_artifact_paths() {
+    // These values stand in for identifiers already assigned by an embedding
+    // application. Their spelling must survive an upgrade without rehashing.
+    // The application, not this fixture, must establish actual sector isolation.
+    let identities = [
+        ("public-rp", "public", "existing-public-subject"),
+        ("sector-a-rp", "pairwise", "existing-sector-a-subject"),
+        ("sector-b-rp", "pairwise", "existing-sector-b-subject"),
+    ];
+    let clients = identities
+        .iter()
+        .map(|(id, kind, _)| subject_client(id, kind))
+        .collect();
+    let op = provider_with(InMemoryClientStore::with_clients(clients))
+        .with_caller_managed_pairwise_subjects();
+    let jwks = op.jwks_document();
+    for (client_id, _, subject) in identities {
+        // Inspect verified ID-token claims, binding the signature check to the
+        // expected issuer and recipient as well as checking the subject value.
+        let validation = jose_rs::jwt::Validation::new()
+            .with_issuer("https://op.example.com")
+            .with_audience(client_id);
+        let assert_id_subject = |token: &str| {
+            let claims = jose_rs::jwt::decode_with_jwkset(&jwks, token, &validation).unwrap();
+            assert_eq!(claims.sub.as_deref(), Some(subject));
+        };
+        // Code flow checks deferred issuance; implicit flow checks direct ID
+        // tokens; hybrid flow checks all three authorization artifacts together.
+        for response_type in ["code", "id_token", "code id_token token"] {
+            let req = subject_request(client_id, response_type);
+            // Neither attribute mapping nor OP-asserted extra claims can replace sub.
+            let released = BTreeMap::from([("sub".into(), vec!["wrong-subject".into()])]);
+            let extra = BTreeMap::from([("sub".into(), serde_json::json!("also-wrong"))]);
+            let response = op
+                .authorization_redirect_with_claims(&req, subject, &released, None, &extra)
+                .await
+                .unwrap();
+            let location = &response
+                .headers
+                .iter()
+                .find(|(name, _)| name == "location")
+                .unwrap()
+                .1;
+            if req.wants_id_token() {
+                assert_id_subject(&extract_param(location, "id_token").unwrap());
+            }
+            if req.wants_access_token() {
+                // Check both the sealed payload and the claims exposed through
+                // UserInfo, since these are separate consumers of the subject.
+                let access = extract_param(location, "access_token").unwrap();
+                assert_eq!(op.codec.open_access_token(&access).unwrap().sub, subject);
+                assert_eq!(op.userinfo(&access, None).await.unwrap()["sub"], subject);
+            }
+            if !req.wants_code() {
+                // The implicit-only response has no code to redeem or refresh.
+                continue;
+            }
+            // Verify the persisted code before redeeming it through the real
+            // client-authenticated token endpoint, not a direct token builder.
+            let code = extract_param(location, "code").unwrap();
+            assert_eq!(op.codec.open_code(&code).unwrap().sub, subject);
+            let mut tokens = op
+                .handle_token_request(
+                    &pairs(&[
+                        ("grant_type", "authorization_code"),
+                        ("code", &code),
+                        ("redirect_uri", &req.redirect_uri),
+                        ("client_id", client_id),
+                        ("client_secret", "subject-test-secret"),
+                    ]),
+                    None,
+                    "https://op.example.com/token",
+                    None,
+                )
+                .await
+                .unwrap();
+            // Round 0 checks the code exchange; rounds 1 and 2 check successive
+            // refreshes. Every generation must retain sub in all token types
+            // and UserInfo, including the next refresh token's sealed payload.
+            for round in 0..=2 {
+                assert_id_subject(tokens.id_token.as_deref().unwrap());
+                assert_eq!(
+                    op.codec
+                        .open_access_token(&tokens.access_token)
+                        .unwrap()
+                        .sub,
+                    subject
+                );
+                assert_eq!(
+                    op.userinfo(&tokens.access_token, None).await.unwrap()["sub"],
+                    subject
+                );
+                let refresh = tokens.refresh_token.as_deref().unwrap();
+                assert_eq!(op.codec.open_refresh_token(refresh).unwrap().sub, subject);
+                if round < 2 {
+                    tokens = op
+                        .handle_token_request(
+                            &pairs(&[
+                                ("grant_type", "refresh_token"),
+                                ("refresh_token", refresh),
+                                ("client_id", client_id),
+                                ("client_secret", "subject-test-secret"),
+                            ]),
+                            None,
+                            "https://op.example.com/token",
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    }
+}
