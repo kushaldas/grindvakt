@@ -23,7 +23,6 @@ use jose_rs::algorithm::JwsAlgorithm;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
 use serde::Serialize;
-use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
@@ -260,7 +259,7 @@ impl Provider {
                 "provider ID-token signing requires an asymmetric key; HS* algorithms require each client's own client_secret".into(),
             ));
         }
-        let supports_token_hash = supports_oidc_token_hash(signing_key.alg());
+        let supports_token_hash = jwt::supports_oidc_token_hash(signing_key.alg());
         metadata.id_token_signing_alg_values_supported = vec![signing_key.alg().to_string()];
         metadata.response_types_supported =
             vec!["code".into(), "id_token".into(), "code token".into()];
@@ -376,6 +375,15 @@ impl Provider {
         if !client.allows_redirect(&req.redirect_uri) {
             return Err(OAuthError::invalid_request("redirect_uri not registered"));
         }
+        // `state` is echoed on every response; the request may have been built
+        // directly rather than parsed, so enforce the same bound here.
+        if req
+            .state
+            .as_deref()
+            .is_some_and(|state| !crate::oauth_error::is_valid_state(state))
+        {
+            return Err(OAuthError::invalid_request("invalid state parameter"));
+        }
         // Exact registration matching is necessary but not sufficient: a
         // malformed value can itself have been registered. Parse it before it
         // can reach a Location header, while retaining absolute custom-scheme
@@ -413,7 +421,7 @@ impl Provider {
         req.validate_response_mode()?;
         if req.wants_id_token()
             && (req.wants_code() || req.wants_access_token())
-            && !supports_oidc_token_hash(self.signing_key.alg())
+            && !jwt::supports_oidc_token_hash(self.signing_key.alg())
         {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnsupportedResponseType,
@@ -886,7 +894,7 @@ impl Provider {
                     payload.acr.as_deref(),
                     payload.auth_time,
                     None,
-                    supports_oidc_token_hash(self.signing_key.alg())
+                    jwt::supports_oidc_token_hash(self.signing_key.alg())
                         .then_some(access_token.as_str()),
                 )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
@@ -1127,7 +1135,7 @@ impl Provider {
                     rt.acr.as_deref(),
                     rt.auth_time,
                     None,
-                    supports_oidc_token_hash(self.signing_key.alg())
+                    jwt::supports_oidc_token_hash(self.signing_key.alg())
                         .then_some(access_token.as_str()),
                 )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
@@ -1502,13 +1510,16 @@ impl Provider {
         if let Some(code) = code {
             c.extra.insert(
                 "c_hash".into(),
-                serde_json::Value::String(oidc_token_hash(self.signing_key.alg(), code)?),
+                serde_json::Value::String(jwt::oidc_token_hash(self.signing_key.alg(), code)?),
             );
         }
         if let Some(access_token) = access_token {
             c.extra.insert(
                 "at_hash".into(),
-                serde_json::Value::String(oidc_token_hash(self.signing_key.alg(), access_token)?),
+                serde_json::Value::String(jwt::oidc_token_hash(
+                    self.signing_key.alg(),
+                    access_token,
+                )?),
             );
         }
         for (k, v) in claims {
@@ -1535,52 +1546,6 @@ fn unique_parameters(params: &[(String, String)]) -> Result<BTreeMap<String, Str
         }
     }
     Ok(unique)
-}
-
-fn oidc_token_hash(alg: JwsAlgorithm, value: &str) -> crate::error::Result<String> {
-    let digest = match alg {
-        JwsAlgorithm::RS256
-        | JwsAlgorithm::PS256
-        | JwsAlgorithm::ES256
-        | JwsAlgorithm::ES256K
-        | JwsAlgorithm::HS256 => Sha256::digest(value.as_bytes()).to_vec(),
-        JwsAlgorithm::RS384 | JwsAlgorithm::PS384 | JwsAlgorithm::ES384 | JwsAlgorithm::HS384 => {
-            Sha384::digest(value.as_bytes()).to_vec()
-        }
-        JwsAlgorithm::RS512 | JwsAlgorithm::PS512 | JwsAlgorithm::ES512 | JwsAlgorithm::HS512 => {
-            Sha512::digest(value.as_bytes()).to_vec()
-        }
-        _ => {
-            return Err(crate::error::Error::Crypto(format!(
-                "{} does not define an OIDC token-hash function",
-                alg
-            )))
-        }
-    };
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2]))
-}
-
-/// Whether OIDC Core defines the hash primitive needed for `c_hash` and
-/// `at_hash` from the JWS `alg` name alone. In particular, legacy `EdDSA`
-/// does not identify its curve/hash, so hash-bearing front-channel response
-/// types are not advertised for it.
-fn supports_oidc_token_hash(alg: JwsAlgorithm) -> bool {
-    matches!(
-        alg,
-        JwsAlgorithm::RS256
-            | JwsAlgorithm::PS256
-            | JwsAlgorithm::ES256
-            | JwsAlgorithm::ES256K
-            | JwsAlgorithm::HS256
-            | JwsAlgorithm::RS384
-            | JwsAlgorithm::PS384
-            | JwsAlgorithm::ES384
-            | JwsAlgorithm::HS384
-            | JwsAlgorithm::RS512
-            | JwsAlgorithm::PS512
-            | JwsAlgorithm::ES512
-            | JwsAlgorithm::HS512
-    )
 }
 
 fn token_use_hash(kind: &str, token: &str) -> String {
@@ -2035,5 +2000,44 @@ mod tests {
             *ttl <= DEFAULT_CLIENT_ASSERTION_MAX_AGE + Validation::new().leeway,
             "jti TTL ({ttl}) must be capped at max_age + leeway, not run to exp"
         );
+    }
+
+    #[tokio::test]
+    async fn client_supplied_grant_type_and_parameter_names_are_escaped() {
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let key = crate::keys::signing_key_from_jwk_json(
+            &jwk.to_json().unwrap(),
+            Some("ES256"),
+            Some("op-key"),
+        )
+        .unwrap();
+        let op = Provider::new(
+            ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+            key,
+            Arc::new(crate::client::InMemoryClientStore::with_clients(vec![])),
+            TokenCodec::new("op-secret"),
+            TokenLifetimes::default(),
+            Arc::new(RecordingStore::default()),
+        )
+        .expect("asymmetric OP signing key");
+
+        let mut form = BTreeMap::new();
+        form.insert("grant_type".to_string(), "x\u{202E}y".to_string());
+        let err = op
+            .handle_token_request_map(&form, None, "https://op.example.com/token", None)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+
+        let params = vec![
+            ("a\u{202E}".to_string(), "1".to_string()),
+            ("a\u{202E}".to_string(), "2".to_string()),
+        ];
+        let text = unique_parameters(&params).unwrap_err().to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
     }
 }

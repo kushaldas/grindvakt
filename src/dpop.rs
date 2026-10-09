@@ -15,6 +15,7 @@
 //! nonces are stateless: a base64url HMAC over a timestamp, so no nonce store is
 //! needed either.
 
+use crate::error::display_safe;
 use crate::mac::{constant_time_eq, hmac_sha256, sha256};
 use crate::util::now_secs;
 use async_trait::async_trait;
@@ -233,7 +234,7 @@ fn validate_proof_inner(
     if header.alg != "ES256" {
         return Err(DpopError::Invalid(format!(
             "alg must be ES256, got {}",
-            header.alg
+            display_safe(&header.alg)
         )));
     }
 
@@ -263,14 +264,16 @@ fn validate_proof_inner(
     // 6. htm / htu must match this request.
     if !claims.htm.eq_ignore_ascii_case(htm) {
         return Err(DpopError::Invalid(format!(
-            "htm mismatch: proof={}, request={htm}",
-            claims.htm
+            "htm mismatch: proof={}, request={}",
+            display_safe(&claims.htm),
+            display_safe(htm)
         )));
     }
     if normalize_htu(&claims.htu) != normalize_htu(htu) {
         return Err(DpopError::Invalid(format!(
-            "htu mismatch: proof={}, request={htu}",
-            claims.htu
+            "htu mismatch: proof={}, request={}",
+            display_safe(&claims.htu),
+            display_safe(htu)
         )));
     }
 
@@ -633,5 +636,25 @@ mod tests {
                 .unwrap_err(),
             DpopError::Server(_)
         ));
+    }
+
+    #[test]
+    fn mismatch_messages_escape_bidi_characters() {
+        let cfg = test_config();
+        let htu = "https://as.example/oauth2/token";
+        let (proof, _) = make_proof("POST", htu, now_secs() as i64, None);
+        let err = validate_proof_inner(&cfg, &proof, "GE\u{202E}T", htu, None).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+
+        // The alg check runs before signature verification.
+        let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"dpop+jwt","alg":"ES\u202e256"}"#);
+        let forged = format!("{header}.e30.c2ln");
+        let text = validate_proof_inner(&cfg, &forged, "POST", htu, None)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
     }
 }

@@ -2723,3 +2723,42 @@ async fn subject_snapshot_comparison_keeps_jwk_extensions_separate() {
         }
     }
 }
+
+/// `state` is echoed on both error and success responses, so a hostile value
+/// is refused even when the request was built directly instead of parsed.
+#[tokio::test]
+async fn hostile_state_is_refused_before_any_response() {
+    let client = Client {
+        client_id: "rp-state".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    };
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+    let mut req = AuthorizationRequest::from_pairs(&pairs(&[
+        ("client_id", "rp-state"),
+        ("response_type", "code"),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("state", "ok-state"),
+    ]))
+    .unwrap();
+    op.validate_authorization_request(&req).await.unwrap();
+
+    for bad in ["st\u{202E}ate".to_string(), "x".repeat(5000)] {
+        req.state = Some(bad);
+        let err = op.validate_authorization_request(&req).await.unwrap_err();
+        assert_eq!(err.code, grindvakt::OAuthErrorCode::InvalidRequest);
+        assert_eq!(err.state, None);
+        assert!(op
+            .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .is_err());
+    }
+}

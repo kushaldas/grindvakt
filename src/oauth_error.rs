@@ -51,7 +51,47 @@ impl OAuthErrorCode {
     }
 }
 
+/// Longest `error_description` put on the wire, in characters.
+const MAX_WIRE_DESCRIPTION_CHARS: usize = 256;
+
+/// Normalize a description to the `error_description` character set of RFC
+/// 6749 §§4.1.2.1 and 5.2 (`%x20-21 / %x23-5B / %x5D-7E`: printable ASCII
+/// without `"` and `\`). Every other character becomes `?` and the result is
+/// capped, with no truncation marker, so the decoded wire value stays inside
+/// that set. This is deliberately separate from log escaping
+/// ([`crate::error::display_safe`]), which introduces backslashes.
+pub(crate) fn wire_description(description: &str) -> String {
+    description
+        .chars()
+        .take(MAX_WIRE_DESCRIPTION_CHARS)
+        .map(|c| {
+            if matches!(c, '\u{20}' | '\u{21}' | '\u{23}'..='\u{5B}' | '\u{5D}'..='\u{7E}') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// Longest `state` value accepted or echoed, in characters. RFC 6749 sets no
+/// limit; this bounds the `Location` header and JSON body an unauthenticated
+/// request can make the OP produce.
+pub(crate) const MAX_STATE_CHARS: usize = 1024;
+
+/// Whether `state` can be accepted and echoed: at most [`MAX_STATE_CHARS`]
+/// characters, all from the RFC 6749 §A.5 `VSCHAR` set (`%x20-7E`). This
+/// excludes controls, bidi and line-separator characters, and non-ASCII text.
+pub(crate) fn is_valid_state(state: &str) -> bool {
+    state.chars().count() <= MAX_STATE_CHARS
+        && state.chars().all(|c| matches!(c, '\u{20}'..='\u{7E}'))
+}
+
 /// An OAuth2 error with an optional human-readable description.
+///
+/// `description` holds the raw text. It is normalized to the RFC 6749
+/// character set when serialized by [`OAuthError::to_response`] and
+/// [`OAuthError::to_redirect`], and escaped for logs by `Display`.
 #[derive(Debug, Clone)]
 pub struct OAuthError {
     pub code: OAuthErrorCode,
@@ -63,7 +103,7 @@ pub struct OAuthError {
 struct ErrorBody<'a> {
     error: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_description: Option<&'a str>,
+    error_description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
 }
@@ -90,6 +130,12 @@ impl OAuthError {
         self
     }
 
+    /// The `state` to echo: omitted when it could not have been accepted
+    /// ([`is_valid_state`]), so a hostile value never reaches the wire.
+    fn wire_state(&self) -> Option<&str> {
+        self.state.as_deref().filter(|s| is_valid_state(s))
+    }
+
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         Self::new(OAuthErrorCode::InvalidRequest, msg)
     }
@@ -107,8 +153,8 @@ impl OAuthError {
     pub fn to_response(&self) -> Response {
         let body = ErrorBody {
             error: self.code.as_str(),
-            error_description: self.description.as_deref(),
-            state: self.state.as_deref(),
+            error_description: self.description.as_deref().map(wire_description),
+            state: self.wire_state(),
         };
         let json = serde_json::to_vec(&body).unwrap_or_default();
         let mut r = Response::new(self.code.http_status())
@@ -125,11 +171,12 @@ impl OAuthError {
     /// response mode. `fragment` must come from the validated authorization
     /// request and must match the corresponding successful response mode.
     pub fn to_redirect(&self, redirect_uri: &str, fragment: bool) -> Response {
+        let description = self.description.as_deref().map(wire_description);
         let mut params = vec![("error", self.code.as_str())];
-        if let Some(desc) = self.description.as_deref() {
+        if let Some(desc) = description.as_deref() {
             params.push(("error_description", desc));
         }
-        if let Some(state) = self.state.as_deref() {
+        if let Some(state) = self.wire_state() {
             params.push(("state", state));
         }
         let encoded = params
@@ -159,7 +206,7 @@ impl std::fmt::Display for OAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.code.as_str())?;
         if let Some(d) = &self.description {
-            write!(f, ": {d}")?;
+            write!(f, ": {}", crate::error::display_safe(d))?;
         }
         Ok(())
     }
@@ -173,6 +220,95 @@ pub(crate) fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn rfc6749_ok(s: &str) -> bool {
+        s.chars()
+            .all(|c| matches!(c, '\u{20}' | '\u{21}' | '\u{23}'..='\u{5B}' | '\u{5D}'..='\u{7E}'))
+    }
+
+    #[test]
+    fn wire_description_stays_in_rfc6749_character_set() {
+        // Long ASCII input is capped without a truncation marker.
+        let long = wire_description(&"a".repeat(1000));
+        assert_eq!(long.chars().count(), MAX_WIRE_DESCRIPTION_CHARS);
+        assert!(rfc6749_ok(&long) && !long.contains('\u{2026}'));
+        // Quote, backslash, controls, bidi and non-ASCII are all replaced.
+        let dirty = wire_description("a\"b\\c\n\u{1b}d\u{202E}e\u{e5}f");
+        assert!(rfc6749_ok(&dirty), "{dirty:?}");
+        assert!(!dirty.contains('\\') && !dirty.contains('"'));
+        assert_eq!(dirty, "a?b?c??d?e?f");
+        // Clean text is unchanged.
+        assert_eq!(wire_description("bad request: x=1"), "bad request: x=1");
+    }
+
+    #[test]
+    fn wire_responses_omit_states_that_could_not_have_been_accepted() {
+        let hostile = [
+            format!("st\u{202E}ate{}", "x".repeat(4000)),
+            "a\u{2028}b\u{2029}c".to_string(),
+            "s".repeat(MAX_STATE_CHARS + 1),
+            "a\nb".to_string(),
+        ];
+        for state in hostile {
+            let err = OAuthError::invalid_request("d").with_state(Some(state.clone()));
+            let body = err.to_response().body;
+            let text = String::from_utf8(body.clone()).unwrap();
+            assert!(!text.contains("state"), "{text}");
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(json.get("state").is_none());
+            for fragment in [false, true] {
+                let resp = err.to_redirect("https://rp.example/cb", fragment);
+                let loc = resp
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n == "location")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap();
+                assert!(!loc.contains("state="), "{loc}");
+                assert!(loc.len() < 512, "{}", loc.len());
+            }
+        }
+        // A valid state is echoed unchanged.
+        let ok = OAuthError::invalid_request("d").with_state(Some("a b~!".into()));
+        let json: serde_json::Value = serde_json::from_slice(&ok.to_response().body).unwrap();
+        assert_eq!(json["state"], "a b~!");
+        let max = "s".repeat(MAX_STATE_CHARS);
+        let ok = OAuthError::invalid_request("d").with_state(Some(max.clone()));
+        let json: serde_json::Value = serde_json::from_slice(&ok.to_response().body).unwrap();
+        assert_eq!(json["state"], max.as_str());
+    }
+
+    #[test]
+    fn wire_responses_normalize_descriptions_but_display_escapes() {
+        let raw = format!("unsupported grant_type: {}\u{202E}\\\n\"", "g".repeat(400));
+        let err = OAuthError::invalid_request(raw.clone());
+        // JSON body: decoded error_description is inside the RFC 6749 set.
+        let body: serde_json::Value = serde_json::from_slice(&err.to_response().body).unwrap();
+        let desc = body["error_description"].as_str().unwrap();
+        assert!(rfc6749_ok(desc), "{desc:?}");
+        assert!(desc.chars().count() <= MAX_WIRE_DESCRIPTION_CHARS);
+        // Redirect (query and fragment): decode the parameter and check it.
+        for fragment in [false, true] {
+            let resp = err.to_redirect("https://rp.example/cb", fragment);
+            let location = resp
+                .headers
+                .iter()
+                .find(|(n, _)| n == "location")
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            let encoded = location.split(['?', '#']).nth(1).unwrap();
+            let decoded = form_urlencoded::parse(encoded.as_bytes())
+                .find(|(k, _)| k == "error_description")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            assert!(rfc6749_ok(&decoded), "{decoded:?}");
+            assert!(decoded.chars().count() <= MAX_WIRE_DESCRIPTION_CHARS);
+        }
+        // The field keeps the raw text; Display escapes it for logs.
+        assert_eq!(err.description.as_deref(), Some(raw.as_str()));
+        let shown = err.to_string();
+        assert!(!shown.contains('\u{202E}') && !shown.contains('\n'));
+    }
+
     use super::*;
 
     fn location(response: &Response) -> &str {

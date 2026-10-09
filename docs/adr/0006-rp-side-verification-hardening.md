@@ -28,8 +28,15 @@ the crate:
   Metadata endpoints inherit the plain-http exception only when that issuer
   is itself a loopback HTTP origin; remote issuers cannot redirect requests
   to local plaintext endpoints.
-- `exchange_code` strips control characters from the upstream error body and
-  truncates it to 512 characters before embedding it in the error.
+- `exchange_code` no longer embeds the upstream token-endpoint error body in
+  the error message. The body is exposed only through
+  `UpstreamHttpError::body`, which is escaped (control and bidi/format
+  characters), length-capped, and redacted by `Debug`.
+- Other error messages that quote remote or client-supplied values escape
+  control and bidi characters and cap each value at 256 characters, and
+  endpoint validation rejects bidi characters and other invisible
+  formatting characters (zero-width characters, soft hyphen, BOM, fillers,
+  variation selectors, tag characters) in the raw string.
 
 ## Consequences
 

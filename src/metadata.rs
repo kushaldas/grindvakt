@@ -10,7 +10,8 @@ pub struct ProviderMetadata {
     pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
-    pub userinfo_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userinfo_endpoint: Option<String>,
     pub jwks_uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registration_endpoint: Option<String>,
@@ -57,7 +58,7 @@ impl ProviderMetadata {
         Self {
             authorization_endpoint: format!("{base}/authorization"),
             token_endpoint: format!("{base}/token"),
-            userinfo_endpoint: format!("{base}/userinfo"),
+            userinfo_endpoint: Some(format!("{base}/userinfo")),
             jwks_uri: format!("{base}/jwks"),
             registration_endpoint: None,
             scopes_supported: vec!["openid".into(), "profile".into(), "email".into()],
@@ -114,5 +115,17 @@ mod tests {
             doc["subject_types_supported"],
             serde_json::json!(["public"])
         );
+    }
+
+    #[test]
+    fn userinfo_endpoint_is_optional_in_serialization() {
+        let mut md = ProviderMetadata::new("https://op.example.com", "https://op.example.com");
+        assert_eq!(
+            md.to_json()["userinfo_endpoint"],
+            "https://op.example.com/userinfo"
+        );
+        md.userinfo_endpoint = None;
+        let doc = md.to_json();
+        assert!(!doc.as_object().unwrap().contains_key("userinfo_endpoint"));
     }
 }

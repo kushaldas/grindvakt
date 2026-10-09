@@ -429,6 +429,7 @@ mod tests {
                 status: 200,
                 body: self.body.clone().into_bytes(),
                 content_type: Some("application/entity-statement+jwt".into()),
+                ..Default::default()
             })
         }
         async fn post_form(
@@ -441,6 +442,7 @@ mod tests {
                 status: 404,
                 body: Vec::new(),
                 content_type: None,
+                ..Default::default()
             })
         }
     }
