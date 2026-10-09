@@ -7,7 +7,7 @@
 //! HSM. The public companion JWK (for JWKS publication) is cached at load time.
 //!
 //! Software keys bridge PEM/DER → kryptering `SoftwareKey` → JWK, then build a
-//! `SoftwareSigner`. HSM keys (see [`signing_key_from_pkcs11`]) build a
+//! `SoftwareSigner`. HSM keys (see `signing_key_from_pkcs11`) build a
 //! `Pkcs11Signer` and reconstruct the public JWK from the token's public-key
 //! object.
 

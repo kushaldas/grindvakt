@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.0 [unreleased]
+## 0.9.0 [2026-10-09]
 
 - `rp::validate_issuer`, `rp::validate_service_endpoint_for_issuer` and
   `rp::validate_redirect_uri_syntax` are now public and documented, and so is

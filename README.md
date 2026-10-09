@@ -79,7 +79,7 @@ request objects — then sign over PKCS#11 (`C_Sign`). Symmetric token sealing
 (access/refresh/authorization codes) stays software-only.
 
 ```toml
-grindvakt = { version = "0.8.2", features = ["pkcs11"] }
+grindvakt = { version = "0.9.0", features = ["pkcs11"] }
 ```
 
 ```rust
