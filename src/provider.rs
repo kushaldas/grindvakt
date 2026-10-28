@@ -1571,7 +1571,11 @@ impl Provider {
         let key = assertion_use_hash(&client_id, jti);
         let ttl = claims
             .exp
-            .map(|exp| exp.saturating_sub(now_secs()))
+            // Round a fractional `exp` up so the replay entry never expires
+            // before the assertion does.
+            .map(|exp| {
+                (exp.as_secs() + u64::from(exp.subsec_nanos() > 0)).saturating_sub(now_secs())
+            })
             .unwrap_or(1)
             .min(
                 self.client_assertion_max_age
@@ -1618,8 +1622,8 @@ impl Provider {
         c.iss = Some(self.metadata.issuer.clone());
         c.sub = Some(sub.to_string());
         c.aud = Some(jose_rs::jwt::Audience::Single(client_id.to_string()));
-        c.iat = Some(now);
-        c.exp = Some(now + self.lifetimes.id_token_ttl);
+        c.iat = Some(now.into());
+        c.exp = Some((now + self.lifetimes.id_token_ttl).into());
         if let Some(n) = nonce {
             c.extra
                 .insert("nonce".into(), serde_json::Value::String(n.to_string()));
@@ -2097,8 +2101,8 @@ mod tests {
             iss: Some("rp-pkj".into()),
             sub: Some("rp-pkj".into()),
             aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
-            iat: Some(now),
-            exp: Some(now + 10 * 365 * 24 * 3600),
+            iat: Some(now.into()),
+            exp: Some((now + 10 * 365 * 24 * 3600).into()),
             jti: Some("far-future-jti".into()),
             ..Default::default()
         };

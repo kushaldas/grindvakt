@@ -70,8 +70,8 @@ pub fn build_entity_configuration(
     let mut c = Claims::default();
     c.iss = Some(entity_id.to_string());
     c.sub = Some(entity_id.to_string());
-    c.iat = Some(now);
-    c.exp = Some(now + lifetime);
+    c.iat = Some(now.into());
+    c.exp = Some((now + lifetime).into());
     c.extra
         .insert("jwks".to_string(), serde_json::to_value(public_jwks)?);
     if !authority_hints.is_empty() {
@@ -846,8 +846,8 @@ mod tests {
         let mut c = Claims::default();
         c.iss = Some(iss.to_string());
         c.sub = Some(sub.to_string());
-        c.iat = Some(now);
-        c.exp = Some(now + 3600);
+        c.iat = Some(now.into());
+        c.exp = Some((now + 3600).into());
         c.extra.insert(
             "jwks".to_string(),
             serde_json::to_value(subject_jwks).unwrap(),
@@ -868,8 +868,8 @@ mod tests {
         let mut c = Claims::default();
         c.iss = Some(issuer.to_string());
         c.sub = Some(subject.to_string());
-        c.iat = Some(now);
-        c.exp = Some(now + 3600);
+        c.iat = Some(now.into());
+        c.exp = Some((now + 3600).into());
         c.extra.insert(
             "metadata".to_string(),
             serde_json::json!({ "openid_relying_party": { "client_id": subject } }),
@@ -944,7 +944,7 @@ mod tests {
         let mut c = Claims::default();
         c.iss = Some("https://op.example.com".into());
         c.sub = Some("https://op.example.com".into());
-        c.iat = Some(crate::util::now_secs());
+        c.iat = Some(crate::util::now_secs().into());
         c.extra.insert(
             "jwks".to_string(),
             serde_json::to_value(k.to_public_jwks()).unwrap(),

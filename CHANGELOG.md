@@ -1,7 +1,25 @@
 # Changelog
 
-## 0.9.1 [unreleased]
+## 0.10.0 [2026-10-28]
 
+- **Breaking:** upgraded to `jose-rs` 0.10 and `kryptering` 0.7, which is
+  re-exported as `grindvakt::jose_rs`. `Claims::{iat, exp, nbf}` returned by
+  the `jwt` and `rp` verification functions are now
+  `Option<jose_rs::jwt::NumericDate>` instead of `Option<u64>`; use
+  `.as_secs()` to read whole seconds and `Some(secs.into())` to set them.
+  Expiry now rejects at `now == exp + leeway` (RFC 7519). Signing a JWS whose
+  header carries `jwk`, `jku`, `x5u` or `x5c` needs
+  `SignOptions::with_key_reference_headers(true)`. See the `jose-rs`
+  0.8–0.10 changelogs for the full list.
+- Moved to the current RustCrypto releases used by jose-rs: `sha2` 0.11,
+  `hkdf` 0.13, `p256`/`p384` 0.14, `ed25519-dalek` 3 and `rsa`
+  `=0.10.0-rc.19`. This removes `crypto-bigint` 0.5 from the dependency
+  graph, which fixes RUSTSEC-2026-0387.
+- `redis` minimum is now 1.8, and `getrandom` 0.4 is a direct dependency
+  used for random tokens.
+- MSRV raised to Rust 1.89.
+- The client-assertion replay entry TTL rounds a fractional `exp` up, so it
+  never expires before the assertion does.
 - `display_safe`, `escape_upstream_text` and `is_invisible_format` are now
   public and re-exported from the crate root.
 - New `jwt::JWS_ALGORITHMS` (also at the crate root) lists the JWS algorithms

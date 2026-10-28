@@ -252,8 +252,8 @@ pub fn signed_request_object(
     let mut c = Claims::default();
     c.iss = Some(client.client_id.clone());
     c.aud = Some(Audience::Single(provider.issuer.clone()));
-    c.iat = Some(now);
-    c.exp = Some(now + 300);
+    c.iat = Some(now.into());
+    c.exp = Some((now + 300).into());
     c.jti = Some(crate::util::random_token(16));
     let extra = &mut c.extra;
     extra.insert("client_id".into(), client.client_id.clone().into());
@@ -1531,8 +1531,8 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
     c.iss = Some(client_id.to_string());
     c.sub = Some(client_id.to_string());
     c.aud = Some(Audience::Single(audience.to_string()));
-    c.iat = Some(now);
-    c.exp = Some(now + 300);
+    c.iat = Some(now.into());
+    c.exp = Some((now + 300).into());
     c.jti = Some(crate::util::random_token(16));
     jwt::sign(key, &c, None)
 }
@@ -1847,7 +1847,7 @@ mod tests {
         assert_eq!(claims.extra["code_challenge"], challenge);
         assert_eq!(claims.extra["code_challenge_method"], "S256");
         assert!(claims.jti.is_some(), "jti for replay detection");
-        let (iat, exp) = (claims.iat.unwrap(), claims.exp.unwrap());
+        let (iat, exp) = (claims.iat.unwrap().as_secs(), claims.exp.unwrap().as_secs());
         assert!(exp > iat && exp <= iat + 300);
 
         // Header: alg + kid, no typ (interop with Shibboleth's OIDC plugin,
@@ -3013,7 +3013,7 @@ mod tests {
             iss: Some("https://op.example.org".into()),
             sub: Some("subject".into()),
             aud: Some(Audience::Single("https://rp.example.com".into())),
-            iat: Some(now),
+            iat: Some(now.into()),
             ..Default::default()
         };
         for (k, v) in extra {
@@ -3114,7 +3114,7 @@ mod tests {
                 iss: Some(iss.into()),
                 sub: Some("subject".into()),
                 aud: Some(aud),
-                iat: Some(now_secs()),
+                iat: Some(now_secs().into()),
                 ..Default::default()
             };
             let token = jwt::sign(&key, &c, Some("userinfo+jwt")).unwrap();
@@ -3159,7 +3159,7 @@ mod tests {
             iss: Some("https://op.example.org".into()),
             sub: Some("subject".into()),
             aud: Some(Audience::Single("https://rp.example.com".into())),
-            iat: Some(now_secs()),
+            iat: Some(now_secs().into()),
             ..Default::default()
         };
         let token = jwt::sign(&key, &c, Some("userinfo+jwt")).unwrap();
@@ -3258,13 +3258,13 @@ mod tests {
             };
             // Age bound.
             let (old, jwks) = sign(&|c| {
-                c.iat = Some(now_secs() - 3600);
+                c.iat = Some((now_secs() - 3600).into());
                 c.exp = None;
             });
             assert!(run_userinfo(&old, &jwks, &mode()).is_err());
             run_userinfo(&old, &jwks, &mode().without_max_age()).unwrap();
             let (recent, jwks) = sign(&|c| {
-                c.iat = Some(now_secs() - 200);
+                c.iat = Some((now_secs() - 200).into());
                 c.exp = None;
             });
             run_userinfo(&recent, &jwks, &mode()).unwrap();
@@ -3290,7 +3290,7 @@ mod tests {
 
         // Old iat, no exp: rejected by default, accepted without the bound.
         let (old, jwks) = signed_userinfo(&key, |c| {
-            c.iat = Some(now_secs() - 3600);
+            c.iat = Some((now_secs() - 3600).into());
             c.exp = None;
         });
         assert!(run(&old, &jwks, &o).is_err());
@@ -3306,7 +3306,7 @@ mod tests {
 
         // A custom bound applies.
         let (recent, jwks) = signed_userinfo(&key, |c| {
-            c.iat = Some(now_secs() - 200);
+            c.iat = Some((now_secs() - 200).into());
             c.exp = None;
         });
         run(&recent, &jwks, &o).unwrap();
@@ -3383,7 +3383,7 @@ mod tests {
         c.iss = Some("https://op.example.org".into());
         c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
-        c.iat = Some(now);
+        c.iat = Some(now.into());
         let token = jwt::sign(&key, &c, None).unwrap();
         assert!(
             verify_id_token(
@@ -3404,7 +3404,7 @@ mod tests {
         c.iss = Some("https://op.example.org".into());
         c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
-        c.exp = Some(now + 300);
+        c.exp = Some((now + 300).into());
         let token = jwt::sign(&key, &c, None).unwrap();
         assert!(
             verify_id_token(
@@ -3425,8 +3425,8 @@ mod tests {
         c.iss = Some("https://op.example.org".into());
         c.sub = Some("subject".into());
         c.aud = Some(Audience::Single("https://rp.example.com".into()));
-        c.iat = Some(now);
-        c.exp = Some(now + 300);
+        c.iat = Some(now.into());
+        c.exp = Some((now + 300).into());
         let token = jwt::sign(&key, &c, None).unwrap();
         verify_id_token(
             &jwks,
@@ -3451,8 +3451,8 @@ mod tests {
             iss: Some("https://op.example.org".into()),
             sub: Some("subject".into()),
             aud: Some(Audience::Multiple(vec![client_id.into()])),
-            iat: Some(now),
-            exp: Some(now + 300),
+            iat: Some(now.into()),
+            exp: Some((now + 300).into()),
             ..Default::default()
         };
         let token = jwt::sign(&key, &claims, None).unwrap();
@@ -3500,8 +3500,8 @@ mod tests {
             iss: Some("https://op.example.org".into()),
             sub: Some("subject".into()),
             aud: Some(Audience::Single("https://rp.example.com".into())),
-            iat: Some(now),
-            exp: Some(now + 300),
+            iat: Some(now.into()),
+            exp: Some((now + 300).into()),
             ..Default::default()
         };
         tweak(&mut c);
@@ -3564,7 +3564,7 @@ mod tests {
             iss: Some("https://op.example.org".into()),
             sub: Some("subject".into()),
             aud: Some(Audience::Single("https://rp.example.com".into())),
-            iat: Some(now_secs()),
+            iat: Some(now_secs().into()),
             ..Default::default()
         };
         let token = jwt::sign(&forger, &c, Some("userinfo+jwt")).unwrap();
@@ -3645,7 +3645,7 @@ mod tests {
     fn id_token_options_leeway() {
         let (_c, _p, key) = client_and_provider();
         let now = now_secs();
-        let (token, jwks) = opts_token(&key, |c| c.exp = Some(now - 30));
+        let (token, jwks) = opts_token(&key, |c| c.exp = Some((now - 30).into()));
         let es = JwsAlgorithm::ES256;
         verify_id_token(
             &jwks,
@@ -3693,7 +3693,7 @@ mod tests {
         .unwrap();
 
         // An expired token is not revived by a huge leeway.
-        let (token, jwks) = opts_token(&key, |c| c.exp = Some(now - 86_400 * 365));
+        let (token, jwks) = opts_token(&key, |c| c.exp = Some((now - 86_400 * 365).into()));
         assert!(verify_with(
             &jwks,
             &token,
@@ -3808,8 +3808,8 @@ mod tests {
 
         // Old iat (still within exp) but recent auth_time: max_age is not iat-based.
         let (t, jwks) = opts_token(&key, |c| {
-            c.iat = Some(now - 5000);
-            c.exp = Some(now + 300);
+            c.iat = Some((now - 5000).into());
+            c.exp = Some((now + 300).into());
             c.extra.insert("auth_time".into(), (now - 10).into());
         });
         verify_with(&jwks, &t, es, &opts).unwrap();
@@ -4096,8 +4096,8 @@ mod tests {
                 "https://rp.example.com".into(),
                 "evil\u{202E}".into(),
             ])),
-            iat: Some(now),
-            exp: Some(now + 300),
+            iat: Some(now.into()),
+            exp: Some((now + 300).into()),
             ..Default::default()
         };
         let token = jwt::sign(&key, &claims, None).unwrap();

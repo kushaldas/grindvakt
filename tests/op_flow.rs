@@ -44,9 +44,14 @@ async fn validated_dpop_proof() -> grindvakt::dpop::DpopProof {
         "htu": endpoint,
         "iat": grindvakt::util::now_secs() as i64,
     });
-    let compact =
-        jose_rs::jws::compact::sign_with_jwk(&jwk, &serde_json::to_vec(&claims).unwrap(), &header)
-            .unwrap();
+    let opts = jose_rs::jws::compact::SignOptions::new().with_key_reference_headers(true);
+    let compact = jose_rs::jws::compact::sign_with_jwk_options(
+        &jwk,
+        &serde_json::to_vec(&claims).unwrap(),
+        &header,
+        &opts,
+    )
+    .unwrap();
     grindvakt::dpop::validate_proof(
         &AcceptDpopProof,
         &grindvakt::dpop::DpopConfig::default(),
@@ -1432,7 +1437,7 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
         iss: Some("rp-pkj".into()),
         sub: Some("rp-pkj".into()),
         aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
-        iat: Some(now),
+        iat: Some(now.into()),
         jti: Some("no-exp-jti".into()),
         ..Default::default()
     };
@@ -1463,7 +1468,7 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
         iss: Some("rp-pkj".into()),
         sub: Some("rp-pkj".into()),
         aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
-        exp: Some(now + 300),
+        exp: Some((now + 300).into()),
         jti: Some("no-iat-jti".into()),
         ..Default::default()
     };
@@ -1538,8 +1543,8 @@ async fn private_key_jwt_max_age_is_configurable() {
         iss: Some("rp-pkj-age".into()),
         sub: Some("rp-pkj-age".into()),
         aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
-        iat: Some(now - 600),
-        exp: Some(now + 3000),
+        iat: Some((now - 600).into()),
+        exp: Some((now + 3000).into()),
         jti: Some("old-assertion-jti".into()),
         ..Default::default()
     };
@@ -2330,7 +2335,7 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
             let claims = jose_rs::jwt::decode_with_jwkset(&jwks, token, &validation).unwrap();
             assert_eq!(claims.sub.as_deref(), Some(subject));
             assert_eq!(claims.extra["auth_time"], serde_json::json!(auth_time));
-            assert!(claims.iat.unwrap() > auth_time);
+            assert!(claims.iat.unwrap().as_secs() > auth_time);
         };
         // Code flow checks deferred issuance; implicit flow checks direct ID
         // tokens; hybrid flow checks all three authorization artifacts together.

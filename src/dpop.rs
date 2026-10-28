@@ -457,7 +457,11 @@ mod tests {
             claims["ath"] = serde_json::Value::String(a.to_string());
         }
         let payload = serde_json::to_vec(&claims).unwrap();
-        let proof = jose_rs::jws::compact::sign_with_jwk(&jwk, &payload, &header).unwrap();
+        // DPoP carries the public key in the `jwk` header, which jose-rs only
+        // emits on explicit opt-in.
+        let opts = jose_rs::jws::compact::SignOptions::new().with_key_reference_headers(true);
+        let proof =
+            jose_rs::jws::compact::sign_with_jwk_options(&jwk, &payload, &header, &opts).unwrap();
         (proof, jkt)
     }
 

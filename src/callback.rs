@@ -1089,7 +1089,7 @@ mod tests {
         let mut c = Claims {
             iss: Some(ISS.into()),
             aud: Some(Audience::Single(CLIENT.into())),
-            exp: Some(now_secs() + 300),
+            exp: Some((now_secs() + 300).into()),
             ..Default::default()
         };
         c.extra.insert("code".into(), "the-code".into());
@@ -1209,7 +1209,7 @@ mod tests {
         let k = key(Some("k1"));
         let t = jwt::sign(
             &k,
-            &jarm_claims(|c| c.exp = Some(now_secs() - 3600)),
+            &jarm_claims(|c| c.exp = Some((now_secs() - 3600).into())),
             Some(TYP),
         )
         .unwrap();
@@ -1364,7 +1364,7 @@ mod tests {
             c.extra.clear();
         });
         c.sub = Some("subject".into());
-        c.iat = Some(now_secs());
+        c.iat = Some(now_secs().into());
         let t = jwt::sign(&k, &c, Some(TYP)).unwrap();
         is_bad(verify(&t, &k.to_public_jwks(), &ES));
     }
@@ -1395,7 +1395,7 @@ mod tests {
         let k = key(Some("k1"));
         for mut c in both_shapes() {
             c.sub = Some("subject".into());
-            c.iat = Some(now_secs());
+            c.iat = Some(now_secs().into());
             for typ in [None, Some("JWT"), Some("at+jwt"), Some("id_token+jwt")] {
                 let t = jwt::sign(&k, &c, typ).unwrap();
                 authn(verify_with(&t, &k, |o| o));

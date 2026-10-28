@@ -349,8 +349,8 @@ mod pkcs11 {
         let n = read_attr(session, handle, AttributeType::Modulus)?;
         let e = read_attr(session, handle, AttributeType::PublicExponent)?;
         let public = rsa::RsaPublicKey::new(
-            rsa::BigUint::from_bytes_be(&n),
-            rsa::BigUint::from_bytes_be(&e),
+            rsa::BoxedUint::from_be_slice_vartime(&n),
+            rsa::BoxedUint::from_be_slice_vartime(&e),
         )
         .map_err(|e| Error::Crypto(format!("invalid RSA public key from token: {e}")))?;
         let spki = public
