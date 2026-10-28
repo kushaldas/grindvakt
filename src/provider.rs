@@ -1572,9 +1572,12 @@ impl Provider {
         let ttl = claims
             .exp
             // Round a fractional `exp` up so the replay entry never expires
-            // before the assertion does.
+            // before the assertion does. Saturate: `exp` may be `u64::MAX`
+            // whole seconds plus a fraction.
             .map(|exp| {
-                (exp.as_secs() + u64::from(exp.subsec_nanos() > 0)).saturating_sub(now_secs())
+                exp.as_secs()
+                    .saturating_add(u64::from(exp.subsec_nanos() > 0))
+                    .saturating_sub(now_secs())
             })
             .unwrap_or(1)
             .min(
@@ -2043,12 +2046,9 @@ mod tests {
         }
     }
 
-    /// The jti replay entry must not live until a client-chosen (unbounded)
-    /// `exp`: past `iat + max_age + leeway` the max-age check rejects the
-    /// assertion anyway, so the store TTL is capped at that window. Otherwise
-    /// a hostile client could grow the store with decade-lived entries.
-    #[tokio::test]
-    async fn client_assertion_jti_ttl_is_capped_at_the_acceptance_window() {
+    /// Authenticate a fresh `private_key_jwt` assertion with the given `exp`
+    /// and return the `(store key, ttl)` passed to the token-use store.
+    async fn recorded_assertion_ttl(exp: jose_rs::jwt::NumericDate, jti: &str) -> (String, u64) {
         let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
         jwk.alg = Some("ES256".into());
         let key = crate::keys::signing_key_from_jwk_json(
@@ -2094,16 +2094,14 @@ mod tests {
         )
         .expect("asymmetric OP signing key");
 
-        // Fresh assertion, but exp a decade out.
-        let now = now_secs();
         let token_url = "https://op.example.com/token";
         let claims = Claims {
             iss: Some("rp-pkj".into()),
             sub: Some("rp-pkj".into()),
             aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
-            iat: Some(now.into()),
-            exp: Some((now + 10 * 365 * 24 * 3600).into()),
-            jti: Some("far-future-jti".into()),
+            iat: Some(now_secs().into()),
+            exp: Some(exp),
+            jti: Some(jti.into()),
             ..Default::default()
         };
         let mut header = jose_rs::JoseHeader::for_alg(key.alg());
@@ -2122,12 +2120,66 @@ mod tests {
             .expect("assertion authenticates");
 
         let seen = store.seen.lock().unwrap();
-        let (hash, ttl) = seen.first().expect("consume was called");
+        seen.first().cloned().expect("consume was called")
+    }
+
+    /// The jti replay entry must not live until a client-chosen (unbounded)
+    /// `exp`: past `iat + max_age + leeway` the max-age check rejects the
+    /// assertion anyway, so the store TTL is capped at that window. Otherwise
+    /// a hostile client could grow the store with decade-lived entries.
+    #[tokio::test]
+    async fn client_assertion_jti_ttl_is_capped_at_the_acceptance_window() {
+        // Fresh assertion, but exp a decade out.
+        let exp = (now_secs() + 10 * 365 * 24 * 3600).into();
+        let (hash, ttl) = recorded_assertion_ttl(exp, "far-future-jti").await;
         assert!(hash.starts_with("assertion:"));
         assert!(!hash.contains("far-future-jti"), "raw jti must be hashed");
         assert!(
-            *ttl <= DEFAULT_CLIENT_ASSERTION_MAX_AGE + Validation::new().leeway,
+            ttl <= DEFAULT_CLIENT_ASSERTION_MAX_AGE + Validation::new().leeway,
             "jti TTL ({ttl}) must be capped at max_age + leeway, not run to exp"
+        );
+    }
+
+    /// Below the cap, the TTL runs to `exp`, with a fractional `exp` rounded
+    /// up to the next whole second. `before`/`after` bracket the provider's
+    /// own clock read, allowing for whole seconds elapsing during the test.
+    #[tokio::test]
+    async fn client_assertion_jti_ttl_rounds_fractional_exp_up() {
+        let before = now_secs();
+        let exp = jose_rs::jwt::NumericDate::new(before + 100, 500_000_000).unwrap();
+        let (_, ttl) = recorded_assertion_ttl(exp, "fractional-jti").await;
+        let after = now_secs();
+        let exp_ceil = before + 101;
+        assert!(
+            (exp_ceil - after..=exp_ceil - before).contains(&ttl),
+            "jti TTL ({ttl}) must run to exp rounded up ({exp_ceil}), now in {before}..={after}"
+        );
+    }
+
+    /// Integer-`exp` control for the rounding test: no extra second is added.
+    #[tokio::test]
+    async fn client_assertion_jti_ttl_runs_to_integer_exp() {
+        let before = now_secs();
+        let exp_secs = before + 100;
+        let (_, ttl) = recorded_assertion_ttl(exp_secs.into(), "integer-jti").await;
+        let after = now_secs();
+        assert!(
+            (exp_secs - after..=exp_secs - before).contains(&ttl),
+            "jti TTL ({ttl}) must run to exp ({exp_secs}), now in {before}..={after}"
+        );
+    }
+
+    /// Rounding `u64::MAX` seconds plus a fraction up must saturate instead
+    /// of overflowing (a panic in checked builds, a wrap to a 1-second TTL
+    /// that allows replay in release builds).
+    #[tokio::test]
+    async fn client_assertion_jti_ttl_saturates_at_max_fractional_exp() {
+        let exp = jose_rs::jwt::NumericDate::new(u64::MAX, 500_000_000).unwrap();
+        let (_, ttl) = recorded_assertion_ttl(exp, "max-exp-jti").await;
+        assert_eq!(
+            ttl,
+            DEFAULT_CLIENT_ASSERTION_MAX_AGE + Validation::new().leeway,
+            "jti TTL must saturate to the acceptance-window cap"
         );
     }
 
