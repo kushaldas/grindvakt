@@ -1571,12 +1571,14 @@ impl Provider {
         let key = assertion_use_hash(&client_id, jti);
         let ttl = claims
             .exp
-            // Round a fractional `exp` up so the replay entry never expires
-            // before the assertion does. Saturate: `exp` may be `u64::MAX`
-            // whole seconds plus a fraction.
+            // The assertion is accepted until `exp + leeway`, so the replay
+            // entry must live that long too, with a fractional `exp` rounded
+            // up. Saturate: `exp` may be `u64::MAX` whole seconds plus a
+            // fraction.
             .map(|exp| {
                 exp.as_secs()
                     .saturating_add(u64::from(exp.subsec_nanos() > 0))
+                    .saturating_add(validation.leeway)
                     .saturating_sub(now_secs())
             })
             .unwrap_or(1)
@@ -2046,9 +2048,11 @@ mod tests {
         }
     }
 
-    /// Authenticate a fresh `private_key_jwt` assertion with the given `exp`
-    /// and return the `(store key, ttl)` passed to the token-use store.
-    async fn recorded_assertion_ttl(exp: jose_rs::jwt::NumericDate, jti: &str) -> (String, u64) {
+    const ASSERTION_TOKEN_URL: &str = "https://op.example.com/token";
+
+    /// A provider with one `private_key_jwt` client (`rp-pkj`) backed by
+    /// `store`, plus that client's signing key.
+    fn assertion_provider(store: Arc<dyn TokenUseStore>) -> (Provider, crate::keys::SigningKey) {
         let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
         jwk.alg = Some("ES256".into());
         let key = crate::keys::signing_key_from_jwk_json(
@@ -2070,7 +2074,6 @@ mod tests {
             subject_type: "public".into(),
             client_name: None,
         };
-        let store = Arc::new(RecordingStore::default());
         let op = Provider::new(
             ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
             crate::keys::signing_key_from_jwk_json(
@@ -2090,15 +2093,22 @@ mod tests {
             ])),
             TokenCodec::new("op-secret"),
             TokenLifetimes::default(),
-            store.clone(),
+            store,
         )
         .expect("asymmetric OP signing key");
+        (op, key)
+    }
 
-        let token_url = "https://op.example.com/token";
+    /// The token-endpoint form for a fresh `rp-pkj` client assertion.
+    fn assertion_form(
+        key: &crate::keys::SigningKey,
+        exp: jose_rs::jwt::NumericDate,
+        jti: &str,
+    ) -> Vec<(String, String)> {
         let claims = Claims {
             iss: Some("rp-pkj".into()),
             sub: Some("rp-pkj".into()),
-            aud: Some(jose_rs::jwt::Audience::Single(token_url.into())),
+            aud: Some(jose_rs::jwt::Audience::Single(ASSERTION_TOKEN_URL.into())),
             iat: Some(now_secs().into()),
             exp: Some(exp),
             jti: Some(jti.into()),
@@ -2107,15 +2117,21 @@ mod tests {
         let mut header = jose_rs::JoseHeader::for_alg(key.alg());
         header.kid = key.kid().map(str::to_string);
         let assertion = jose_rs::jwt::encode(key.signer(), &header, &claims).unwrap();
-
-        let form = vec![
+        vec![
             (
                 "client_assertion_type".to_string(),
                 CLIENT_ASSERTION_TYPE.to_string(),
             ),
             ("client_assertion".to_string(), assertion),
-        ];
-        op.authenticate_client(&form, None, token_url)
+        ]
+    }
+
+    /// Authenticate a fresh `private_key_jwt` assertion with the given `exp`
+    /// and return the `(store key, ttl)` passed to the token-use store.
+    async fn recorded_assertion_ttl(exp: jose_rs::jwt::NumericDate, jti: &str) -> (String, u64) {
+        let store = Arc::new(RecordingStore::default());
+        let (op, key) = assertion_provider(store.clone());
+        op.authenticate_client(&assertion_form(&key, exp, jti), None, ASSERTION_TOKEN_URL)
             .await
             .expect("assertion authenticates");
 
@@ -2140,19 +2156,20 @@ mod tests {
         );
     }
 
-    /// Below the cap, the TTL runs to `exp`, with a fractional `exp` rounded
-    /// up to the next whole second. `before`/`after` bracket the provider's
-    /// own clock read, allowing for whole seconds elapsing during the test.
+    /// Below the cap, the TTL runs to `exp + leeway`, with a fractional `exp`
+    /// rounded up to the next whole second. `before`/`after` bracket the
+    /// provider's own clock read, allowing for whole seconds elapsing during
+    /// the test.
     #[tokio::test]
     async fn client_assertion_jti_ttl_rounds_fractional_exp_up() {
         let before = now_secs();
         let exp = jose_rs::jwt::NumericDate::new(before + 100, 500_000_000).unwrap();
         let (_, ttl) = recorded_assertion_ttl(exp, "fractional-jti").await;
         let after = now_secs();
-        let exp_ceil = before + 101;
+        let until = before + 101 + Validation::new().leeway;
         assert!(
-            (exp_ceil - after..=exp_ceil - before).contains(&ttl),
-            "jti TTL ({ttl}) must run to exp rounded up ({exp_ceil}), now in {before}..={after}"
+            (until - after..=until - before).contains(&ttl),
+            "jti TTL ({ttl}) must run to exp rounded up plus leeway ({until}), now in {before}..={after}"
         );
     }
 
@@ -2163,9 +2180,70 @@ mod tests {
         let exp_secs = before + 100;
         let (_, ttl) = recorded_assertion_ttl(exp_secs.into(), "integer-jti").await;
         let after = now_secs();
+        let until = exp_secs + Validation::new().leeway;
         assert!(
-            (exp_secs - after..=exp_secs - before).contains(&ttl),
-            "jti TTL ({ttl}) must run to exp ({exp_secs}), now in {before}..={after}"
+            (until - after..=until - before).contains(&ttl),
+            "jti TTL ({ttl}) must run to exp plus leeway ({until}), now in {before}..={after}"
+        );
+    }
+
+    /// A [`TokenUseStore`] with a test-controlled clock, so a test can let
+    /// entries expire without sleeping.
+    #[derive(Default)]
+    struct ManualClockStore {
+        now: std::sync::atomic::AtomicU64,
+        entries: std::sync::Mutex<HashMap<String, u64>>,
+    }
+
+    impl ManualClockStore {
+        fn advance(&self, secs: u64) {
+            self.now
+                .fetch_add(secs, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenUseStore for ManualClockStore {
+        async fn consume(
+            &self,
+            token_hash: &str,
+            ttl_secs: u64,
+        ) -> std::result::Result<bool, String> {
+            let now = self.now.load(std::sync::atomic::Ordering::SeqCst);
+            let mut entries = self.entries.lock().unwrap();
+            if entries.get(token_hash).is_some_and(|&until| until > now) {
+                return Ok(false);
+            }
+            entries.insert(token_hash.to_string(), now + ttl_secs);
+            Ok(true)
+        }
+    }
+
+    /// An assertion past `exp` but inside the expiration leeway still
+    /// validates, so its jti must still be marked as used: replaying it after
+    /// the old `exp - now` TTL (here the 1-second floor) has elapsed must fail.
+    #[tokio::test]
+    async fn client_assertion_replay_rejected_within_expiration_leeway() {
+        let leeway = Validation::new().leeway;
+        let store = Arc::new(ManualClockStore::default());
+        let (op, key) = assertion_provider(store.clone());
+        // Expired 10 seconds ago, so accepted for another `leeway - 10`.
+        let exp = (now_secs() - 10).into();
+        let form = assertion_form(&key, exp, "leeway-jti");
+
+        op.authenticate_client(&form, None, ASSERTION_TOKEN_URL)
+            .await
+            .expect("assertion inside the leeway authenticates");
+
+        // Well past `exp - now`, still well inside `exp + leeway`.
+        store.advance(leeway / 2);
+        let err = op
+            .authenticate_client(&form, None, ASSERTION_TOKEN_URL)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already used"),
+            "replay inside the leeway window must be rejected, got: {err}"
         );
     }
 

@@ -18,8 +18,11 @@
 - `redis` minimum is now 1.8, and `getrandom` 0.4 is a direct dependency
   used for random tokens.
 - MSRV raised to Rust 1.89.
-- The client-assertion replay entry TTL rounds a fractional `exp` up, so it
-  never expires before the assertion does.
+- Fixed: a `private_key_jwt` client assertion could be replayed during the
+  expiration leeway, because its jti replay entry expired at `exp` while the
+  assertion was still accepted until `exp + leeway`. The entry now lives until
+  `exp + leeway` (a fractional `exp` rounded up), still capped at
+  `max_age + leeway`.
 - `display_safe`, `escape_upstream_text` and `is_invisible_format` are now
   public and re-exported from the crate root.
 - New `jwt::JWS_ALGORITHMS` (also at the crate root) lists the JWS algorithms
