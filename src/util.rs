@@ -26,12 +26,7 @@ pub fn random_token(n: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-/// Fill a buffer with OS randomness via jose-rs's transitive `rand`.
+/// Fill a buffer with OS randomness.
 fn fill_random(buf: &mut [u8]) {
-    use rand_core::RngCore;
-    rand_core::OsRng.fill_bytes(buf);
+    getrandom::fill(buf).expect("OS random number generator failed");
 }
-
-// Re-export the rand_core used by our crypto deps so random_token works without
-// adding a separate dependency line.
-use p256::elliptic_curve::rand_core;
