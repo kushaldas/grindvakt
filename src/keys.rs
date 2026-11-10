@@ -183,8 +183,8 @@ fn parse_private_key(bytes: &[u8]) -> Result<SoftwareKey> {
 fn rsa_from_der(der: &[u8]) -> Result<SoftwareKey> {
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
-    let priv_key = rsa::RsaPrivateKey::from_pkcs8_der(der)
-        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_der(der))
+    let priv_key = rsa::PrivateKey::from_pkcs8_der(der)
+        .or_else(|_| rsa::PrivateKey::from_pkcs1_der(der))
         .map_err(|e| Error::Crypto(format!("not an RSA key: {e}")))?;
     let pkcs8 = priv_key
         .to_pkcs8_der()
@@ -348,7 +348,7 @@ mod pkcs11 {
 
         let n = read_attr(session, handle, AttributeType::Modulus)?;
         let e = read_attr(session, handle, AttributeType::PublicExponent)?;
-        let public = rsa::RsaPublicKey::new(
+        let public = rsa::PublicKey::new(
             rsa::BoxedUint::from_be_slice_vartime(&n),
             rsa::BoxedUint::from_be_slice_vartime(&e),
         )
