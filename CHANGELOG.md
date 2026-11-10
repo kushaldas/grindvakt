@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0 [2026-11-10]
+
+- Updated `redis` to 1.8.1 and refreshed all compatible transitive
+  dependencies, including `aes`, `crypto-bigint`, `ml-dsa`, `ml-kem`,
+  `pkcs1` and `syn`.
+- Upgraded `jose-rs` to 0.11.0, `kryptering` to 0.7.1 and `rsa` to
+  stable 0.10.0, replacing the RSA release candidate and removing the
+  duplicate base64 version. All direct dependencies are at their latest
+  stable releases.
+- Dependency security audit passes with no advisories or warnings.
+
 ## 0.10.0 [2026-10-28]
 
 - **Breaking:** upgraded to `jose-rs` 0.10 and `kryptering` 0.7, which is
