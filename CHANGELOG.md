@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 [2026-11-10]
 
 - Added `HttpClient::post_json` for `application/json` POSTs. It has a
   default implementation that returns an error, so existing implementors
