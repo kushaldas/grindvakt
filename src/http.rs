@@ -144,6 +144,8 @@ impl Response {
 ///   dropping the body only on a method change (`301`/`302`/`303`) is **not**
 ///   enough. The simplest correct policy is to not follow redirects for
 ///   `post_form`.
+/// - **`post_json`** has the same exposure as `post_form`: do not follow
+///   redirects to a different origin.
 /// - **`get_with_headers`** may carry `Authorization: Bearer`. Either do not
 ///   follow redirects or strip `Authorization` (and any other credential
 ///   header) when a redirect crosses origins.
@@ -180,6 +182,26 @@ pub trait HttpClient: Send + Sync {
         let _ = (url, headers);
         Err(crate::error::Error::Config(
             "this HttpClient does not implement get_with_headers".into(),
+        ))
+    }
+
+    /// Issue a POST with an `application/json` body.
+    ///
+    /// The default implementation returns an error; override it to enable
+    /// JSON POSTs (for example to an AuthZEN policy decision point).
+    /// Implementations must set `Content-Type: application/json` and, like
+    /// `post_form`, must not follow cross-origin redirects, including `307`
+    /// and `308`, because the body and headers can hold credentials (see the
+    /// trait documentation).
+    async fn post_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        headers: &[(String, String)],
+    ) -> crate::error::Result<HttpFetchResponse> {
+        let _ = (url, body, headers);
+        Err(crate::error::Error::Config(
+            "this HttpClient does not implement post_json".into(),
         ))
     }
 }
@@ -335,6 +357,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingClient {
         seen: Mutex<Vec<(String, String)>>,
+        body: Mutex<Option<serde_json::Value>>,
     }
 
     #[async_trait::async_trait]
@@ -360,6 +383,30 @@ mod tests {
             *self.seen.lock().unwrap() = headers.to_vec();
             Ok(HttpFetchResponse::new(200, "headers"))
         }
+
+        async fn post_json(
+            &self,
+            _url: &str,
+            body: &serde_json::Value,
+            headers: &[(String, String)],
+        ) -> crate::error::Result<HttpFetchResponse> {
+            *self.seen.lock().unwrap() = headers.to_vec();
+            *self.body.lock().unwrap() = Some(body.clone());
+            Ok(HttpFetchResponse::new(200, "json"))
+        }
+    }
+
+    #[tokio::test]
+    async fn post_json_defaults_to_error() {
+        let err = BasicClient
+            .post_json(
+                "https://pdp.example/evaluation",
+                &serde_json::json!({}),
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("post_json"), "{err}");
     }
 
     #[tokio::test]
@@ -369,6 +416,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("get_with_headers"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn post_json_override_receives_body_and_headers() {
+        let c = RecordingClient::default();
+        let h = vec![("Authorization".to_string(), "Bearer t".to_string())];
+        let body = serde_json::json!({"a": 1});
+        let r = c
+            .post_json("https://pdp.example/evaluation", &body, &h)
+            .await
+            .unwrap();
+        assert_eq!(r.body, b"json");
+        assert_eq!(*c.seen.lock().unwrap(), h);
+        assert_eq!(c.body.lock().unwrap().as_ref(), Some(&body));
     }
 
     #[tokio::test]

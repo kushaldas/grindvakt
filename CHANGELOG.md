@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added `HttpClient::post_json` for `application/json` POSTs. It has a
+  default implementation that returns an error, so existing implementors
+  keep compiling. If your client type already has an inherent `post_json`,
+  implement the trait method explicitly: otherwise calls through
+  `dyn HttpClient` or a generic bound reach the trait default, not your
+  inherent method.
+
 ## 0.11.0 [2026-11-10]
 
 - Updated `redis` to 1.8.1 and refreshed all compatible transitive
