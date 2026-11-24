@@ -43,7 +43,9 @@ pub struct Client {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
     /// JOSE preferences and sector metadata from the client's registration.
-    /// Registrations written before this field was added use the empty policy.
+    /// Registrations written before 0.13 deserialize with the empty policy.
+    /// Add `response_policy: Default::default()` to an existing Rust struct
+    /// literal to select the same defaults.
     #[serde(default, skip_serializing_if = "ResponsePolicy::is_empty")]
     pub response_policy: ResponsePolicy,
 }
@@ -52,6 +54,29 @@ pub struct Client {
 ///
 /// Populate these fields from a trusted registration. Each response type has its
 /// own JWE settings. Omitting both settings leaves that response signed only.
+/// ID token settings apply at authorization, code exchange and refresh.
+/// UserInfo settings apply to [`crate::Provider::signed_userinfo`].
+/// [`crate::Provider::userinfo`] returns JSON claims.
+///
+/// Register `ECDH-ES` or `RSA-OAEP-256` for key management. Legacy `RSA-OAEP`
+/// also requires the `jose-rs/rsa-oaep` Cargo feature. The default content
+/// encryption is `A128CBC-HS256` when only the key management algorithm is set.
+/// During rollover the provider tries keys from [`Client::jwks`] in order,
+/// skipping unusable recipients. The protected JWE header names the successful
+/// key in `kid`. An unsupported combination, a lone `enc`, or a registration
+/// with no usable encryption key causes issuance to return `server_error`.
+///
+/// ```
+/// use grindvakt::client::ResponsePolicy;
+///
+/// // Encrypt ID tokens using the default enc and signed UserInfo using A256GCM.
+/// let policy = ResponsePolicy {
+///     id_token_encrypted_response_alg: Some("ECDH-ES".into()),
+///     userinfo_encrypted_response_alg: Some("RSA-OAEP-256".into()),
+///     userinfo_encrypted_response_enc: Some("A256GCM".into()),
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResponsePolicy {
     /// Registered URI of the redirect-URI list used to establish a pairwise sector.

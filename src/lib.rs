@@ -26,6 +26,34 @@
 //! request/response types and the outbound [`http::HttpClient`] trait),
 //! [`keys`] (PEM/DER/JWK signing-key loading via `kryptering`), [`mac`]
 //! (HMAC/SHA-256/constant-time helpers) and [`util`].
+//!
+//! ## Upgrading from 0.12 to 0.13
+//!
+//! Existing JSON client registrations deserialize with an empty
+//! [`client::ResponsePolicy`]. Their ID tokens are signed, and
+//! [`Provider::userinfo`] returns JSON claims. To serve signed UserInfo, call
+//! [`Provider::signed_userinfo`]. To encrypt either signed response, set the
+//! corresponding policy in the client's registration.
+//!
+//! Authorization codes issued by 0.13 carry a [`Client::registration_fingerprint`].
+//! If the registration changes before code exchange, an authenticated client
+//! receives `invalid_grant` and can start a new authorization. The
+//! [`tokens`] module describes how existing codes and tokens survive an upgrade.
+//!
+//! Applications that make separate claim release decisions can pass
+//! [`provider::AuthorizedClaims`] to [`Provider::authorization_redirect_with_authorized_claims`].
+//! Existing authorization methods apply the scope filter to one shared set
+//! of application claims. Both paths reserve names such as `acr` and
+//! `auth_time` for the provider. Supply those values as ID token authentication
+//! parameters if a relying party needs them.
+//!
+//! When updating Rust code, add `response_policy: Default::default()` to
+//! [`Client`] literals and handle [`OAuthErrorCode::UnmetAuthenticationRequirements`]
+//! in exhaustive matches. Direct constructors of [`federation::ResolvedEntity`]
+//! now supply `trust_marks` (an empty vector when no marks were returned).
+//! [`tokens::AuthCodePayload`] and [`tokens::RefreshTokenPayload`] document
+//! their new optional fields. The re-exported [`jose_rs`] 0.13 uses sorted
+//! maps for `Claims.extra` and `JoseHeader.extra`.
 
 // The `jose_rs::jwt::Claims` builder pattern (default + field assignment) is the
 // ergonomic way to construct claims; silence the lint crate-wide.

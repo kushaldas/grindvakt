@@ -2,9 +2,72 @@
 
 ## 0.13.0 [2026-11-24]
 
-- Updated the jose-rs dependency to 0.13.0.
-- Added structured signed authorization requests, separate typed ID token and UserInfo claims, signed and encrypted responses, and resolver-endorsed trust marks.
-- Added Redis-backed federation registration storage. Authorization codes bind to the registered client snapshot. Previously issued codes remain readable.
+### Added
+
+- `rp::signed_request_object_with` signs structured claim requests, prompts,
+  UI locales, ACR values, maximum authentication age and the Swedish
+  `signRequest` extension. The existing `signed_request_object` builder
+  uses the default parameters.
+- `Provider::authorization_redirect_with_authorized_claims` accepts separate
+  ID token and UserInfo claim maps and preserves their JSON types through
+  code exchange and refresh. Existing authorization methods continue to
+  release the same scope-filtered application claims to both destinations.
+- `Provider::signed_userinfo` issues a JWT with the protected type
+  `userinfo+jwt`. Relying parties can require that type even when the provider
+  also uses its ID token signing key for UserInfo. `Provider::userinfo`
+  continues to return JSON claims.
+- Clients can register separate encryption policies for ID tokens and signed
+  UserInfo. Registering only `alg` selects `A128CBC-HS256` as the content
+  encryption algorithm. During key rollover the provider tries eligible
+  recipients in order. An unsupported policy or exhausted key set returns
+  `server_error`. Registrations without encryption settings keep signed ID
+  tokens. Round-trip tests decrypt ID tokens from authorization, code
+  exchange and refresh, and verify the signature inside encrypted UserInfo.
+- Federation resolution exposes trust marks from the anchor's signed resolve
+  response. The `redis` feature adds `RedisClientStore` for sharing expiring
+  dynamic registrations across replicas.
+
+### Security
+
+- New authorization codes bind to the client's registration fingerprint.
+  Changing the registration between issuance and redemption, including a
+  key or secret rotation, causes `invalid_grant` after client authentication.
+  The client can start a new authorization with the current registration.
+- `Provider::consume_request_id` lets an OP enforce one-time use of a verified
+  Request Object's `jti` per client. A registered `private_key_jwt` signing
+  algorithm also pins assertion verification to that algorithm and requires
+  a `kid`.
+- Federation cache deadlines now use the earliest expiry of the resolve
+  response and its validated trust chain.
+
+### Changed
+
+- **Rust API migration.** Add `response_policy: Default::default()` to
+  `Client` literals. Existing JSON registrations receive this default on
+  deserialization. Code that constructs `ResolvedEntity`, `AuthCodePayload`
+  or `RefreshTokenPayload` directly must also supply their new fields.
+  Exhaustive matches on `OAuthErrorCode` need an
+  `UnmetAuthenticationRequirements` arm.
+- Upgraded the re-exported `jose-rs` from 0.11 to 0.13.0. Code constructing
+  `Claims.extra` or `JoseHeader.extra` now supplies a `BTreeMap`. Exhaustive
+  matches on `JwsAlgorithm` must handle `Ed448`.
+- Application mappings to provider-owned names such as `acr` and `auth_time`
+  are filtered from newly issued UserInfo grants. Applications can supply
+  these values through the ID token authentication context and time parameters.
+- The 0.13 codec can open unexpired 0.12 authorization codes, access tokens
+  and refresh tokens with the same secret. Older codes have no registration
+  fingerprint. Older codes and refresh tokens reuse their original claim
+  map for both destinations.
+
+### Fixed
+
+- Refresh preserves individually approved claims in their original
+  destinations. Removing a previously granted scope still removes the
+  standard claims associated with that scope.
+- A zero TTL deletes the dynamic registration from Redis immediately, so
+  all replicas see the invalidation on their next lookup.
+- `Error::is_auth_failure` recognizes `UnmetAuthenticationRequirements`
+  when the OP cannot meet a requested authentication requirement.
 
 ## 0.12.0 [2026-11-10]
 
