@@ -3245,3 +3245,207 @@ async fn typed_claim_destinations_and_registration_survive_code_exchange() {
     assert!(claims.get("id_only").is_none());
     assert_eq!(claims["sub"].as_str(), id.sub.as_deref());
 }
+
+mod registered_response_encryption {
+    use super::*;
+    use grindvakt::provider::TokenResponse;
+    use jose_rs::jwk::{generate_ec, generate_rsa, Jwk, JwkSet};
+    use jose_rs::jwt::{decode_with_jwkset, Validation};
+
+    const TOKEN_ENDPOINT: &str = "https://op.example.com/token";
+
+    /// Bind a test recipient key to the algorithm and key ID its registration advertises.
+    fn recipient(mut key: Jwk, alg: &str, kid: &str) -> Jwk {
+        key.alg = Some(alg.into());
+        key.kid = Some(kid.into());
+        key.use_ = Some("enc".into());
+        key
+    }
+
+    /// Exchange the code from either a code-only or hybrid authorization response.
+    async fn exchange_code(op: &Provider, location: &str) -> Result<TokenResponse, OAuthError> {
+        let code = extract_param(location, "code").unwrap();
+        let form = pairs(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", "rp-iss"),
+            ("client_secret", "s"),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("code", &code),
+        ]);
+        op.handle_token_request(&form, None, TOKEN_ENDPOINT, None)
+            .await
+    }
+
+    /// Check the authenticated JWE headers before handing the inner JWT to its verifier.
+    fn decrypt_response(token: &str, recipient: &Jwk, expected_enc: &str) -> String {
+        let jwe = jose_rs::jwe::compact::decrypt_with_jwk_authenticated(recipient, token).unwrap();
+        assert_eq!(Some(jwe.algorithm()), recipient.alg.as_deref());
+        assert_eq!(jwe.protected.kid, recipient.kid);
+        assert_eq!(jwe.protected.enc.as_deref(), Some(expected_enc));
+        assert_eq!(jwe.protected.cty.as_deref(), Some("JWT"));
+        String::from_utf8(jwe.value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn round_trip_uses_each_registered_policy_and_rolls_over_keys() {
+        let id_key = recipient(generate_ec("P-256").unwrap(), "ECDH-ES", "id");
+        let ui_key = recipient(generate_rsa(2048).unwrap(), "RSA-OAEP-256", "userinfo");
+        // This key passes the metadata checks, but lacks a coordinate needed for
+        // encryption. Issuance must continue to the next recipient during rollover.
+        let mut retired = id_key.to_public_jwk();
+        retired.kid = Some("retired".into());
+        retired.x = None;
+        let mut client = iss_client();
+        client.jwks = Some(JwkSet {
+            keys: vec![retired, id_key.to_public_jwk(), ui_key.to_public_jwk()],
+        });
+        client.grant_types.push("refresh_token".into());
+        client.response_policy.id_token_encrypted_response_alg = id_key.alg.clone();
+        client.response_policy.userinfo_encrypted_response_alg = ui_key.alg.clone();
+        client.response_policy.userinfo_encrypted_response_enc = Some("A256GCM".into());
+
+        // Exercise the default on each response independently. The other response
+        // uses an explicit enc so accidentally sharing either setting is observable.
+        check_round_trip(client.clone(), &id_key, "A128CBC-HS256", &ui_key, "A256GCM").await;
+        client.response_policy.id_token_encrypted_response_enc = Some("A128GCM".into());
+        client.response_policy.userinfo_encrypted_response_enc = None;
+        check_round_trip(client, &id_key, "A128GCM", &ui_key, "A128CBC-HS256").await;
+    }
+
+    /// Verify nested signatures and recipient policies through all four issuance paths.
+    async fn check_round_trip(
+        client: Client,
+        id_key: &Jwk,
+        id_enc: &str,
+        ui_key: &Jwk,
+        ui_enc: &str,
+    ) {
+        let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+        let redirect = op
+            .authorization_redirect(
+                &iss_request("code id_token"),
+                "subject",
+                &BTreeMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let location = location_of(&redirect);
+        let front_id = extract_param(&location, "id_token").unwrap();
+        let tokens = exchange_code(&op, &location).await.unwrap();
+        let refresh = pairs(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "rp-iss"),
+            ("client_secret", "s"),
+            ("refresh_token", tokens.refresh_token.as_deref().unwrap()),
+        ]);
+        let refreshed = op
+            .handle_token_request(&refresh, None, TOKEN_ENDPOINT, None)
+            .await
+            .unwrap();
+
+        let jwks = op.jwks_document();
+        let validation = Validation::new()
+            .with_issuer("https://op.example.com")
+            .with_audience("rp-iss")
+            .with_allowed_algorithms(vec![jose_rs::JwsAlgorithm::ES256]);
+        for token in [
+            &front_id,
+            tokens.id_token.as_ref().unwrap(),
+            refreshed.id_token.as_ref().unwrap(),
+        ] {
+            let inner = decrypt_response(token, id_key, id_enc);
+            let claims = decode_with_jwkset(&jwks, &inner, &validation).unwrap();
+            assert_eq!(claims.sub.as_deref(), Some("subject"));
+            assert_eq!(claims.extra["nonce"], "n-1");
+        }
+
+        let ui = op
+            .signed_userinfo(&tokens.access_token, None)
+            .await
+            .unwrap();
+        let inner = decrypt_response(&ui, ui_key, ui_enc);
+        let claims =
+            decode_with_jwkset(&jwks, &inner, &validation.with_typ("userinfo+jwt")).unwrap();
+        assert_eq!(claims.sub.as_deref(), Some("subject"));
+    }
+
+    #[tokio::test]
+    async fn invalid_policies_and_unusable_recipients_fail_issuance() {
+        let op = provider_with(InMemoryClientStore::with_clients(vec![iss_client()]));
+        // Obtain a valid access token before changing the registration so that
+        // UserInfo exercises encryption even when ID-token issuance later fails.
+        let redirect = op
+            .authorization_redirect(&iss_request("code"), "subject", &BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let access = exchange_code(&op, &location_of(&redirect))
+            .await
+            .unwrap()
+            .access_token;
+        let key = recipient(generate_ec("P-256").unwrap(), "ECDH-ES", "client").to_public_jwk();
+        let mut unusable = key.clone();
+        unusable.x = None;
+        let mut signing_only = key.clone();
+        signing_only.use_ = Some("sig".into());
+        let mut unnamed = key.clone();
+        unnamed.kid = None;
+        let mut mismatched = key.clone();
+        mismatched.alg = Some("ES256".into());
+        // This EC key can also perform the wrapped ECDH variant. Only the OP's
+        // registered algorithm allowlist should rule out that policy.
+        let mut wrapped = key.clone();
+        wrapped.alg = Some("ECDH-ES+A128KW".into());
+        let valid = Some(vec![key]);
+        let alg = Some("ECDH-ES");
+        for (case, alg, enc, keys) in [
+            ("enc without alg", None, Some("A256GCM"), valid.clone()),
+            (
+                "unsupported alg",
+                Some("ECDH-ES+A128KW"),
+                None,
+                Some(vec![wrapped]),
+            ),
+            ("unsupported enc", alg, Some("unknown"), valid),
+            ("missing JWKS", alg, None, None),
+            ("empty JWKS", alg, None, Some(vec![])),
+            (
+                "ineligible recipients",
+                alg,
+                None,
+                Some(vec![signing_only, unnamed, mismatched]),
+            ),
+            ("unusable recipient", alg, None, Some(vec![unusable])),
+        ] {
+            let mut client = iss_client();
+            client.jwks = keys.map(|keys| JwkSet { keys });
+            let policy = &mut client.response_policy;
+            policy.id_token_encrypted_response_alg = alg.map(str::to_owned);
+            policy.id_token_encrypted_response_enc = enc.map(str::to_owned);
+            policy.userinfo_encrypted_response_alg = alg.map(str::to_owned);
+            policy.userinfo_encrypted_response_enc = enc.map(str::to_owned);
+            op.clients.put(client).await;
+
+            let id_error = op
+                .authorization_redirect(
+                    &iss_request("code id_token"),
+                    "subject",
+                    &BTreeMap::new(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                id_error.code,
+                OAuthErrorCode::ServerError,
+                "ID token: {case}"
+            );
+            let ui_error = op.signed_userinfo(&access, None).await.unwrap_err();
+            assert_eq!(
+                ui_error.code,
+                OAuthErrorCode::ServerError,
+                "UserInfo: {case}"
+            );
+        }
+    }
+}
