@@ -95,11 +95,12 @@ pub struct RefreshTokenPayload {
     pub scope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
-    /// ID token claims retained for refresh, filtered by the effective scope.
+    /// Approved ID token claims. Narrowing the grant removes standard claims
+    /// whose corresponding scope was present and is now withdrawn.
     #[serde(default)]
     pub claims: BTreeMap<String, serde_json::Value>,
-    /// UserInfo grant retained across rotations. Refresh filters this map by the
-    /// effective scope independently of the ID token claims. Older tokens with
+    /// UserInfo grant retained across rotations. Refresh applies the same scope
+    /// removals independently to this destination's claims. Older tokens with
     /// `None` reuse [`Self::claims`]. An explicitly empty map stays empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub userinfo_claims: Option<BTreeMap<String, serde_json::Value>>,

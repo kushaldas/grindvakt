@@ -234,7 +234,8 @@ impl ClientStore for InMemoryClientStore {
 /// [`ClientStore::put`] installs a process-local registration that takes
 /// precedence on lookup. Use [`ClientStore::put_with_ttl`] for a verified
 /// dynamic registration and bound its TTL in seconds by the remaining trust
-/// lifetime. Missing, unreadable and expired Redis values all yield a cache miss.
+/// lifetime. A zero TTL removes the shared entry immediately. Missing,
+/// unreadable and expired Redis values all yield a cache miss.
 #[cfg(feature = "redis")]
 pub struct RedisClientStore {
     conn: redis::aio::ConnectionManager,
@@ -281,9 +282,22 @@ impl ClientStore for RedisClientStore {
         self.local.put(client).await;
     }
     async fn put_with_ttl(&self, client: Client, ttl: u64) {
+        let key = format!("{}{}", self.prefix, client.client_id);
+        if ttl == 0 {
+            // Redis rejects SET with EX 0, which would leave the previous grant live.
+            if redis::cmd("DEL")
+                .arg(key)
+                .query_async::<i64>(&mut self.conn.clone())
+                .await
+                .is_err()
+            {
+                tracing::error!("could not expire verified client registration");
+            }
+            return;
+        }
         if let Ok(bytes) = serde_json::to_vec(&client) {
             let result = redis::cmd("SET")
-                .arg(format!("{}{}", self.prefix, client.client_id))
+                .arg(key)
                 .arg(bytes)
                 .arg("EX")
                 .arg(ttl)

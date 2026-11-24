@@ -413,13 +413,12 @@ impl Error {
         }
     }
 
-    /// Whether this error is an authentication failure: [`Error::Authn`], or an
-    /// [`Error::UpstreamHttp`] from a token or UserInfo request (which 0.8
-    /// reported as `Authn`). Prefer this to matching variant identity at
-    /// re-authentication, session-teardown and alerting decision points.
+    /// Includes [`Error::Authn`], [`Error::UnmetAuthenticationRequirements`]
+    /// and upstream token or UserInfo failures. Use this classification when
+    /// deciding whether to re-authenticate or tear down a session.
     pub fn is_auth_failure(&self) -> bool {
         match self {
-            Error::Authn(_) => true,
+            Error::Authn(_) | Error::UnmetAuthenticationRequirements => true,
             Error::UpstreamHttp(e) => e.is_auth_failure(),
             _ => false,
         }
@@ -458,6 +457,13 @@ mod tests {
 
     fn upstream(status: Option<u16>) -> UpstreamHttpError {
         UpstreamHttpError::new(status, None, None, None, "m".into(), false)
+    }
+
+    #[test]
+    fn unmet_requirements_are_an_authentication_failure() {
+        let error = Error::UnmetAuthenticationRequirements;
+        assert_eq!(error.status_hint(), 401);
+        assert!(error.is_auth_failure());
     }
 
     #[test]

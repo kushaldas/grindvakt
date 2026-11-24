@@ -23,7 +23,7 @@ use jose_rs::algorithm::JwsAlgorithm;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// The JWT-bearer client assertion type (RFC 7523).
@@ -1243,7 +1243,7 @@ impl Provider {
         let token = form
             .get("refresh_token")
             .ok_or_else(|| OAuthError::invalid_request("missing refresh_token"))?;
-        let rt = self
+        let mut rt = self
             .codec
             .open_refresh_token(token)
             .map_err(|_| OAuthError::invalid_grant("invalid or expired refresh_token"))?;
@@ -1274,43 +1274,43 @@ impl Provider {
 
         // Scope may only be narrowed (RFC 6749 §6): a requested scope must be a
         // subset of what was originally granted. Absent, the full grant carries.
-        let scope = match form.get("scope") {
+        let (scope, removed_scopes) = match form.get("scope") {
             Some(requested) => {
                 let requested_scopes: Vec<&str> = requested.split_whitespace().collect();
-                let original_scopes: Vec<&str> = rt.scope.split_whitespace().collect();
-                if requested_scopes.is_empty()
-                    || requested_scopes
-                        .iter()
-                        .any(|scope| !original_scopes.iter().any(|original| original == scope))
-                {
+                let retained: HashSet<_> = requested_scopes.iter().copied().collect();
+                let original: HashSet<_> = rt.scope.split_whitespace().collect();
+                if retained.is_empty() || !retained.is_subset(&original) {
                     return Err(OAuthError::new(
                         OAuthErrorCode::InvalidScope,
                         "requested scope exceeds original grant",
                     ));
                 }
-                requested_scopes.join(" ")
+                (requested_scopes.join(" "), &original - &retained)
             }
-            None => rt.scope.clone(),
+            None => (rt.scope.clone(), HashSet::new()),
         };
 
         let now = now_secs();
         self.consume_token_once("refresh", token, rt.exp, "refresh token already used")
             .await?;
 
-        // Apply the narrowed scope to each destination's original grant. Older
-        // refresh tokens carry one shared map, so their UserInfo uses this same
-        // filtered set. Rotation carries the narrowed grants into the next refresh.
-        let claims = filter_claims(&scope, rt.claims.clone());
+        // A grant may include email even if the email scope was never granted.
+        // Only a scope actually withdrawn by this refresh can revoke its claims.
+        if !removed_scopes.is_empty() {
+            let still_granted = |name: &String, _: &mut serde_json::Value| {
+                standard_claim_scope(name).is_none_or(|s| !removed_scopes.contains(s))
+            };
+            rt.claims.retain(still_granted);
+            if let Some(userinfo) = &mut rt.userinfo_claims {
+                userinfo.retain(still_granted);
+            }
+        }
 
         let access_payload = AccessTokenPayload {
             client_id: client.client_id.clone(),
             sub: rt.sub.clone(),
             scope: scope.clone(),
-            claims: rt
-                .userinfo_claims
-                .clone()
-                .map(|values| filter_claims(&scope, values))
-                .unwrap_or_else(|| claims.clone()),
+            claims: rt.userinfo_claims.as_ref().unwrap_or(&rt.claims).clone(),
             exp: now + self.lifetimes.access_token_ttl,
             cnf_jkt: cnf_jkt.clone(),
         };
@@ -1325,7 +1325,7 @@ impl Provider {
                     &client.client_id,
                     &rt.sub,
                     rt.nonce.as_deref(),
-                    &claims,
+                    &rt.claims,
                     rt.acr.as_deref(),
                     rt.auth_time,
                     None,
@@ -1361,10 +1361,8 @@ impl Provider {
             sub: rt.sub.clone(),
             scope: scope.clone(),
             nonce: rt.nonce.clone(),
-            claims,
-            userinfo_claims: rt
-                .userinfo_claims
-                .map(|values| filter_claims(&scope, values)),
+            claims: rt.claims,
+            userinfo_claims: rt.userinfo_claims,
             auth_time: rt.auth_time,
             exp: now + self.lifetimes.refresh_token_ttl,
             acr: rt.acr.clone(),

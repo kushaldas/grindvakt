@@ -3079,6 +3079,84 @@ async fn iss_collision_ignored_without_opt_in() {
 }
 
 #[tokio::test]
+async fn refresh_preserves_individually_approved_claims_in_their_destinations() {
+    use grindvakt::provider::AuthorizedClaims;
+    use serde_json::json;
+
+    let mut client = iss_client();
+    client.grant_types.push("refresh_token".into());
+    client.scope = Some("openid profile".into());
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+    let mut req = iss_request("code");
+    req.scope = "openid profile".into();
+    req.claims = Some(json!({"id_token": {"email": null}, "userinfo": {"email_verified": null}}));
+    let approved = AuthorizedClaims {
+        id_token: BTreeMap::from([("email".into(), json!("user@example.org"))]),
+        userinfo: BTreeMap::from([
+            ("email_verified".into(), json!(true)),
+            ("name".into(), json!("Example User")),
+        ]),
+    };
+    let response = op
+        .authorization_redirect_with_authorized_claims(
+            &req,
+            |_| Ok("subject".into()),
+            approved,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let code = extract_param(&location_of(&response), "code").unwrap();
+    let endpoint = "https://op.example.com/token";
+    let auth = pairs(&[("client_id", "rp-iss"), ("client_secret", "s")]);
+    let mut exchange = auth.clone();
+    exchange.extend(pairs(&[
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", &req.redirect_uri),
+        ("code", &code),
+    ]));
+    let mut tokens = op
+        .handle_token_request(&exchange, None, endpoint, None)
+        .await
+        .unwrap();
+
+    let keys = op.jwks_document();
+    let validation = jose_rs::jwt::Validation::new()
+        .with_issuer("https://op.example.com")
+        .with_audience("rp-iss");
+    // First retain the entire grant, then drop profile, then use the rotated grant.
+    for (scope, expect_name) in [
+        (None, true),
+        (Some("profile openid"), true),
+        (Some("openid"), false),
+        (None, false),
+    ] {
+        let mut form = auth.clone();
+        form.extend(pairs(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", tokens.refresh_token.as_ref().unwrap()),
+        ]));
+        if let Some(scope) = scope {
+            form.push(("scope".into(), scope.into()));
+        }
+        tokens = op
+            .handle_token_request(&form, None, endpoint, None)
+            .await
+            .unwrap();
+        let id =
+            jose_rs::jwt::decode_with_jwkset(&keys, tokens.id_token.as_ref().unwrap(), &validation)
+                .unwrap();
+        let ui = op.userinfo(&tokens.access_token, None).await.unwrap();
+        assert_eq!(id.extra.get("email"), Some(&json!("user@example.org")));
+        assert!(!id.extra.contains_key("email_verified"));
+        assert!(ui.get("email").is_none());
+        assert_eq!(ui["email_verified"], true);
+        assert_eq!(ui.get("name").is_some(), expect_name);
+    }
+}
+
+#[tokio::test]
 async fn typed_claim_destinations_and_registration_survive_code_exchange() {
     use grindvakt::provider::AuthorizedClaims;
 
