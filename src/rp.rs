@@ -218,6 +218,13 @@ fn validate_authorization_extras(endpoint: &str, extra: &[(&str, &str)]) -> Resu
 ///
 /// `key` must be (one of) the RP's published client keys; for a federation
 /// RP that is the `private_key_jwt` key from its entity configuration.
+/// Use [`signed_request_object_with`] to include claim requests, prompts or
+/// a localized signature approval message in the same signature.
+///
+/// # Errors
+///
+/// Applies the same provider, client and PKCE checks as [`signed_request_object_with`]
+/// and propagates signing failures.
 #[allow(clippy::too_many_arguments)]
 pub fn signed_request_object(
     provider: &ProviderInfo,
@@ -226,6 +233,79 @@ pub fn signed_request_object(
     state: &str,
     nonce: &str,
     code_challenge: Option<&str>,
+) -> Result<String> {
+    signed_request_object_with(
+        provider,
+        client,
+        key,
+        state,
+        nonce,
+        code_challenge,
+        &RequestObjectParameters::default(),
+    )
+}
+
+/// Optional authorization parameters covered by the Request Object signature.
+///
+/// [`signed_request_object_with`] omits fields set to `None`. The caller
+/// selects the requested authentication and approval policy. The builder
+/// encodes the parameters and binds them to the RP, OP and transaction.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RequestObjectParameters {
+    /// OIDC `claims` object, with requests grouped by `id_token` or `userinfo`.
+    pub claims: Option<serde_json::Value>,
+    /// Space-separated OP interaction directives, such as `login consent`.
+    pub prompt: Option<String>,
+    /// Space-separated language tags for the UI, in preference order.
+    pub ui_locales: Option<String>,
+    /// Space-separated authentication context class references, in preference order.
+    pub acr_values: Option<String>,
+    /// Maximum acceptable age of the user's authentication, in seconds.
+    pub max_age: Option<u64>,
+    /// Swedish signature extension object sent as `https://id.oidc.se/param/signRequest`.
+    /// Localized message fields are included verbatim in the signed JSON.
+    pub sign_request: Option<serde_json::Value>,
+}
+
+/// Build a compact signed Request Object for the authorization endpoint's `request` parameter.
+///
+/// The JWT identifies the client as issuer and the provider as audience, has a fresh
+/// `jti`, and expires after five minutes. Supply the transaction's `state`, `nonce`
+/// and optional S256 challenge. Structured parameters retain their JSON types.
+///
+/// # Errors
+///
+/// Returns an error for invalid provider or redirect metadata, a missing `openid`
+/// scope, an invalid S256 challenge, or a public client without a challenge.
+/// Both `claims` and `sign_request` must be JSON objects when supplied. Errors
+/// from the signing key also propagate.
+///
+/// # Examples
+///
+/// ```
+/// # use grindvakt::{Result, SigningKey, rp::{ProviderInfo, RpClient}};
+/// use grindvakt::rp::{signed_request_object_with, RequestObjectParameters};
+/// use serde_json::json;
+///
+/// # fn make_request(op: &ProviderInfo, rp: &RpClient, key: &SigningKey,
+/// #                 state: &str, nonce: &str, challenge: &str) -> Result<String> {
+/// let params = RequestObjectParameters {
+///     claims: Some(json!({"id_token": {"auth_time": {"essential": true}}})),
+///     prompt: Some("login".into()),
+///     max_age: Some(0),
+///     ..Default::default()
+/// };
+/// signed_request_object_with(op, rp, key, state, nonce, Some(challenge), &params)
+/// # }
+/// ```
+pub fn signed_request_object_with(
+    provider: &ProviderInfo,
+    client: &RpClient,
+    key: &SigningKey,
+    state: &str,
+    nonce: &str,
+    code_challenge: Option<&str>,
+    params: &RequestObjectParameters,
 ) -> Result<String> {
     provider.validate()?;
     validate_redirect_uri_syntax(&client.redirect_uri)?;
@@ -265,6 +345,29 @@ pub fn signed_request_object(
     if let Some(cc) = code_challenge {
         extra.insert("code_challenge".into(), cc.into());
         extra.insert("code_challenge_method".into(), "S256".into());
+    }
+    for (name, value) in [
+        ("claims", &params.claims),
+        ("https://id.oidc.se/param/signRequest", &params.sign_request),
+    ] {
+        if let Some(value) = value {
+            if !value.is_object() {
+                return Err(Error::BadRequest(format!("{name} must be an object")));
+            }
+            extra.insert(name.into(), value.clone());
+        }
+    }
+    for (name, value) in [
+        ("prompt", &params.prompt),
+        ("ui_locales", &params.ui_locales),
+        ("acr_values", &params.acr_values),
+    ] {
+        if let Some(value) = value {
+            extra.insert(name.into(), value.clone().into());
+        }
+    }
+    if let Some(max_age) = params.max_age {
+        extra.insert("max_age".into(), max_age.into());
     }
     jwt::sign(key, &c, None)
 }
@@ -1855,6 +1958,41 @@ mod tests {
         let header = jwt::peek_header(&jar).unwrap();
         assert_eq!(header.kid.as_deref(), Some("rp-1"));
         assert!(header.typ.is_none());
+    }
+
+    #[test]
+    fn structured_request_preserves_localized_approval_and_types() {
+        let (client, provider, key) = client_and_provider();
+        let mut params = RequestObjectParameters {
+            prompt: Some("login consent".into()),
+            ui_locales: Some("sv en".into()),
+            claims: Some(
+                serde_json::json!({"id_token":{"acr":{"essential":true,"values":["loa3"]}}}),
+            ),
+            sign_request: Some(
+                serde_json::json!({"sign_message":{"message#sv":"QQ==","message#en":"Qg=="}}),
+            ),
+            ..Default::default()
+        };
+        let sign = |p: &RequestObjectParameters| {
+            signed_request_object_with(&provider, &client, &key, "state", "nonce", None, p)
+        };
+        let jar = sign(&params).unwrap();
+        let claims = jwt::verify_with_jwks(
+            &key.to_public_jwks(),
+            &jar,
+            &Validation::new().with_audience(&provider.issuer),
+        )
+        .unwrap();
+        assert_eq!(claims.extra["claims"], params.claims.take().unwrap());
+        assert_eq!(
+            claims.extra["https://id.oidc.se/param/signRequest"],
+            params.sign_request.take().unwrap()
+        );
+        assert_eq!(claims.extra["ui_locales"], "sv en");
+        assert_eq!(claims.extra["prompt"], "login consent");
+        params.claims = Some(serde_json::json!(["unexpected"]));
+        assert!(sign(&params).is_err());
     }
 
     #[test]

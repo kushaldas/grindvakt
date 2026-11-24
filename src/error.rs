@@ -26,6 +26,11 @@ pub enum Error {
     #[error("authentication error: {0}")]
     Authn(String),
 
+    /// The authentication result cannot satisfy a required assurance or signer constraint.
+    /// An OIDC frontend can report [`crate::OAuthErrorCode::UnmetAuthenticationRequirements`].
+    #[error("authentication requirements were not met")]
+    UnmetAuthenticationRequirements,
+
     /// State cookie could not be sealed/unsealed.
     #[error("state error: {0}")]
     State(String),
@@ -440,7 +445,7 @@ impl Error {
             Error::NoBoundEndpoint(_) => 404,
             Error::BadRequest(_) => 400,
             Error::UnknownModule(_) => 404,
-            Error::Authn(_) => 401,
+            Error::Authn(_) | Error::UnmetAuthenticationRequirements => 401,
             Error::Config(_) | Error::Crypto(_) | Error::State(_) => 500,
             _ => 500,
         }

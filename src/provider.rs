@@ -1,9 +1,9 @@
 //! The OpenID Provider engine — pure protocol logic for the OP (frontend) side.
 //!
-//! Authorization codes, access tokens, and refresh tokens carry their own state
-//! (sealed via [`crate::tokens::TokenCodec`]); id_tokens are signed JWTs. A
-//! small token-use store is still required for one-time authorization-code use
-//! and refresh-token rotation.
+//! Authorization codes, access tokens and refresh tokens carry their grants in
+//! [`crate::tokens::TokenCodec`] payloads. ID tokens and signed UserInfo can be
+//! encrypted to the client's registered recipient key. [`TokenUseStore`] records
+//! one-time use across requests.
 
 use crate::client::{
     Client, ClientStore, AUTH_CLIENT_SECRET_BASIC, AUTH_CLIENT_SECRET_POST, AUTH_NONE,
@@ -93,10 +93,10 @@ pub struct TokenResponse {
 
 /// Atomic store for one-time token use.
 ///
-/// The token endpoint uses this to consume authorization codes and refresh
-/// tokens exactly once. Deployments with multiple replicas should supply a
-/// shared implementation; [`InMemoryTokenUseStore`] protects only a single
-/// process and must be selected explicitly.
+/// The provider uses distinct replay keys for authorization codes, refresh
+/// tokens, client assertions and verified Request Object identifiers. Replicas
+/// need a shared implementation to detect reuse across processes.
+/// [`InMemoryTokenUseStore`] provides single-process protection.
 #[async_trait::async_trait]
 pub trait TokenUseStore: Send + Sync {
     /// Mark `token_hash` as consumed for `ttl_secs`. Returns `Ok(true)` when
@@ -698,6 +698,8 @@ impl Provider {
     /// an original authentication time in Unix seconds (`None` uses issuance time).
     /// The resolver must select the subject using its supplied [`Client`], as
     /// required by [`Self::authorization_redirect_with_subject_resolver`].
+    /// The filtered claims are released to both destinations. For separate ID
+    /// token and UserInfo release decisions, use [`Self::authorization_redirect_with_authorized_claims`].
     pub async fn authorization_redirect_with_claims_subject_resolver_and_auth_time<F>(
         &self,
         req: &AuthorizationRequest,
@@ -710,64 +712,6 @@ impl Provider {
     where
         F: FnOnce(&Client) -> Result<String, OAuthError>,
     {
-        // Revalidate serialized requests at the minting boundary and resolve
-        // against this exact snapshot, rather than a client from before login.
-        let client = self.validate_authorization_request(req).await?;
-        let sub = resolve_subject(&client)?;
-        let current = self.clients.get(&req.client_id).await;
-        // Client contains JWKs without PartialEq. Structural JSON equality
-        // compares every serialized registration field without exposing secrets
-        // in errors or maintaining a security-sensitive partial field list.
-        let registration_value = |client: &Client| {
-            let mut registration = client.clone();
-            // Jwk.extra is flattened during serialization. Keep it separate so
-            // a programmatic extension cannot mask a changed dedicated field.
-            // JSON object equality also ignores HashMap iteration order.
-            let extensions = registration.jwks.as_mut().map(|jwks| {
-                jwks.keys
-                    .iter_mut()
-                    .map(|key| std::mem::take(&mut key.extra))
-                    .collect::<Vec<_>>()
-            });
-            serde_json::to_value((registration, extensions)).map_err(|_| {
-                OAuthError::new(
-                    OAuthErrorCode::ServerError,
-                    "cannot compare client registration",
-                )
-            })
-        };
-        let unchanged = match current {
-            Some(current) => registration_value(&client)? == registration_value(&current)?,
-            None => false,
-        };
-        if !unchanged {
-            return Err(OAuthError::new(
-                OAuthErrorCode::UnauthorizedClient,
-                "client registration changed during subject resolution",
-            )
-            .with_state(req.state.clone()));
-        }
-        // No further lookups reinterpret the subject under another registration.
-        self.mint_authorization_response(req, &sub, external_claims, acr, extra_claims, auth_time)
-    }
-
-    fn mint_authorization_response(
-        &self,
-        req: &AuthorizationRequest,
-        sub: &str,
-        external_claims: &BTreeMap<String, Vec<String>>,
-        acr: Option<String>,
-        extra_claims: &BTreeMap<String, serde_json::Value>,
-        auth_time: Option<u64>,
-    ) -> Result<crate::http::Response, OAuthError> {
-        self.check_iss_redirect_collision(req)?;
-        if sub.is_empty() {
-            return Err(OAuthError::new(
-                OAuthErrorCode::ServerError,
-                "subject identifier must not be empty",
-            ));
-        }
-
         let mut claims = filter_claims(&req.scope, flatten_claims(external_claims));
         for (k, v) in extra_claims {
             if is_reserved_id_token_claim(k) {
@@ -777,6 +721,80 @@ impl Provider {
                 claims.insert(k.clone(), v.clone());
             }
         }
+        self.authorization_redirect_with_authorized_claims(
+            req,
+            resolve_subject,
+            AuthorizedClaims {
+                id_token: claims.clone(),
+                userinfo: claims,
+            },
+            acr,
+            auth_time,
+        )
+        .await
+    }
+
+    /// Issue an authorization response using the caller's per-destination release decisions.
+    ///
+    /// Apply the client's request, granted scopes and application release policy
+    /// before constructing [`AuthorizedClaims`]. JSON values retain their types.
+    /// The provider discards reserved token fields from both maps and sets the
+    /// subject from `resolve_subject`, using the registration validated at issuance.
+    /// Pairwise subjects follow the contract of [`Self::authorization_redirect_with_subject_resolver`].
+    ///
+    /// Pass the achieved authentication context in `acr` and the original
+    /// authentication time in Unix seconds in `auth_time`. With `None`, the
+    /// authentication time defaults to issuance time. An authorization code
+    /// carries both claim sets and the registration fingerprint through redemption.
+    ///
+    /// # Errors
+    ///
+    /// Propagates request validation and subject resolution errors. A changed or
+    /// missing registration after subject resolution yields `unauthorized_client`.
+    /// An empty subject or a failure to seal, sign or encrypt a response also
+    /// prevents issuance.
+    pub async fn authorization_redirect_with_authorized_claims<F>(
+        &self,
+        req: &AuthorizationRequest,
+        resolve_subject: F,
+        mut claims: AuthorizedClaims,
+        acr: Option<String>,
+        auth_time: Option<u64>,
+    ) -> Result<crate::http::Response, OAuthError>
+    where
+        F: FnOnce(&Client) -> Result<String, OAuthError>,
+    {
+        // Revalidate serialized requests at the minting boundary and resolve
+        // against this exact snapshot, rather than a client from before login.
+        let client = self.validate_authorization_request(req).await?;
+        let sub = resolve_subject(&client)?;
+        let current = self.clients.get(&req.client_id).await;
+        let registration = registration_digest(&client)?;
+        let unchanged = match current {
+            Some(current) => registration == registration_digest(&current)?,
+            None => false,
+        };
+        if !unchanged {
+            return Err(OAuthError::new(
+                OAuthErrorCode::UnauthorizedClient,
+                "client registration changed during subject resolution",
+            )
+            .with_state(req.state.clone()));
+        }
+        claims
+            .id_token
+            .retain(|name, _| !is_reserved_id_token_claim(name));
+        claims
+            .userinfo
+            .retain(|name, _| !is_reserved_id_token_claim(name));
+        self.check_iss_redirect_collision(req)?;
+        if sub.is_empty() {
+            return Err(OAuthError::new(
+                OAuthErrorCode::ServerError,
+                "subject identifier must not be empty",
+            ));
+        }
+        let sub = sub.as_str();
         let now = now_secs();
         let auth_time = auth_time.unwrap_or(now);
         let mut out: Vec<(String, String)> = Vec::new();
@@ -786,7 +804,7 @@ impl Provider {
                 client_id: req.client_id.clone(),
                 sub: sub.to_string(),
                 scope: req.scope.clone(),
-                claims: claims.clone(),
+                claims: claims.userinfo.clone(),
                 exp: now + self.lifetimes.access_token_ttl,
                 cnf_jkt: None,
             };
@@ -801,6 +819,7 @@ impl Provider {
 
         let code = if req.wants_code() {
             let payload = AuthCodePayload {
+                registration_digest: Some(registration),
                 client_id: req.client_id.clone(),
                 redirect_uri: req.redirect_uri.clone(),
                 scope: req.scope.clone(),
@@ -808,7 +827,8 @@ impl Provider {
                 nonce: req.nonce.clone(),
                 code_challenge: req.code_challenge.clone(),
                 code_challenge_method: req.code_challenge_method.clone(),
-                claims: claims.clone(),
+                claims: claims.id_token.clone(),
+                userinfo_claims: Some(claims.userinfo),
                 auth_time,
                 exp: now + self.lifetimes.code_ttl,
                 acr: acr.clone(),
@@ -829,14 +849,28 @@ impl Provider {
                     &req.client_id,
                     sub,
                     req.nonce.as_deref(),
-                    &claims,
+                    &claims.id_token,
                     acr.as_deref(),
                     auth_time,
                     code.as_deref(),
                     access_token.as_deref(),
                 )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?;
-            out.push(("id_token".to_string(), id_token));
+            out.push((
+                "id_token".to_string(),
+                encrypt_registered_response(
+                    id_token,
+                    &client,
+                    client
+                        .response_policy
+                        .id_token_encrypted_response_alg
+                        .as_deref(),
+                    client
+                        .response_policy
+                        .id_token_encrypted_response_enc
+                        .as_deref(),
+                )?,
+            ));
         }
 
         if let Some(code) = code {
@@ -955,6 +989,16 @@ impl Provider {
             ));
         }
 
+        // Check the snapshot before consuming the code. A replacement registration
+        // under the same ID could specify a different sector or recipient key.
+        if let Some(expected) = &payload.registration_digest {
+            if registration_digest(&client)? != *expected {
+                return Err(OAuthError::invalid_grant(
+                    "client registration changed after authorization",
+                ));
+            }
+        }
+
         // RFC 6749 §4.1.3: when the authorization request carried a
         // redirect_uri, the token request MUST echo it and it MUST match.
         if !payload.redirect_uri.is_empty() {
@@ -1000,7 +1044,10 @@ impl Provider {
             client_id: client.client_id.clone(),
             sub: payload.sub.clone(),
             scope: payload.scope.clone(),
-            claims: payload.claims.clone(),
+            claims: payload
+                .userinfo_claims
+                .clone()
+                .unwrap_or_else(|| payload.claims.clone()),
             exp: now_secs() + self.lifetimes.access_token_ttl,
             cnf_jkt: dpop.map(|d| d.jkt().to_string()),
         };
@@ -1028,6 +1075,23 @@ impl Provider {
             None
         };
 
+        let id_token = id_token
+            .map(|jwt| {
+                encrypt_registered_response(
+                    jwt,
+                    &client,
+                    client
+                        .response_policy
+                        .id_token_encrypted_response_alg
+                        .as_deref(),
+                    client
+                        .response_policy
+                        .id_token_encrypted_response_enc
+                        .as_deref(),
+                )
+            })
+            .transpose()?;
+
         // Issue a refresh token only when the client is registered for the grant
         // (RFC 6749 §6). It carries the original auth_time/nonce/acr so refreshed
         // id_tokens stay faithful to the initial authentication.
@@ -1038,6 +1102,7 @@ impl Provider {
                 scope: payload.scope.clone(),
                 nonce: payload.nonce.clone(),
                 claims: payload.claims.clone(),
+                userinfo_claims: payload.userinfo_claims,
                 auth_time: payload.auth_time,
                 exp: now_secs() + self.lifetimes.refresh_token_ttl,
                 acr: payload.acr.clone(),
@@ -1232,16 +1297,20 @@ impl Provider {
         self.consume_token_once("refresh", token, rt.exp, "refresh token already used")
             .await?;
 
-        // A narrowed refresh grant must not retain standard claims belonging
-        // to scopes the client removed. Reuse this one filtered map for every
-        // artifact minted by the refresh so their authorization agrees.
+        // Apply the narrowed scope to each destination's original grant. Older
+        // refresh tokens carry one shared map, so their UserInfo uses this same
+        // filtered set. Rotation carries the narrowed grants into the next refresh.
         let claims = filter_claims(&scope, rt.claims.clone());
 
         let access_payload = AccessTokenPayload {
             client_id: client.client_id.clone(),
             sub: rt.sub.clone(),
             scope: scope.clone(),
-            claims: claims.clone(),
+            claims: rt
+                .userinfo_claims
+                .clone()
+                .map(|values| filter_claims(&scope, values))
+                .unwrap_or_else(|| claims.clone()),
             exp: now + self.lifetimes.access_token_ttl,
             cnf_jkt: cnf_jkt.clone(),
         };
@@ -1269,6 +1338,23 @@ impl Provider {
             None
         };
 
+        let id_token = id_token
+            .map(|jwt| {
+                encrypt_registered_response(
+                    jwt,
+                    &client,
+                    client
+                        .response_policy
+                        .id_token_encrypted_response_alg
+                        .as_deref(),
+                    client
+                        .response_policy
+                        .id_token_encrypted_response_enc
+                        .as_deref(),
+                )
+            })
+            .transpose()?;
+
         // Rotate the refresh token (sliding expiry), carrying the narrowed scope.
         let new_refresh = RefreshTokenPayload {
             client_id: client.client_id.clone(),
@@ -1276,6 +1362,9 @@ impl Provider {
             scope: scope.clone(),
             nonce: rt.nonce.clone(),
             claims,
+            userinfo_claims: rt
+                .userinfo_claims
+                .map(|values| filter_claims(&scope, values)),
             auth_time: rt.auth_time,
             exp: now + self.lifetimes.refresh_token_ttl,
             acr: rt.acr.clone(),
@@ -1375,6 +1464,94 @@ impl Provider {
         // (e.g. mapped from eduPersonPrincipalName) must not override it.
         map.insert("sub".to_string(), serde_json::Value::String(payload.sub));
         Ok(serde_json::Value::Object(map))
+    }
+
+    /// Return a signed UserInfo JWT for the client identified by the access token.
+    ///
+    /// Supply the thumbprint of a DPoP proof already validated for this request
+    /// in `jkt`, or `None` for a bearer token. [`Self::userinfo`] checks the
+    /// binding and supplies the granted claims and subject. The JWT names this
+    /// provider as issuer and the client as audience. Its lifetime ends at the
+    /// earlier of access-token expiry and five minutes from issuance.
+    ///
+    /// The client's current registration determines whether the signed JWT is
+    /// returned directly or wrapped in a compact JWE.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid token, missing `openid` scope, or failed DPoP binding.
+    /// An unavailable registration or unusable claim set yields `invalid_grant`.
+    /// Signing and encryption failures yield `server_error`.
+    pub async fn signed_userinfo(
+        &self,
+        token: &str,
+        jkt: Option<&str>,
+    ) -> Result<String, OAuthError> {
+        let value = self.userinfo(token, jkt).await?;
+        let grant = self
+            .codec
+            .open_access_token(token)
+            .map_err(|_| OAuthError::invalid_grant("invalid access token"))?;
+        let client = self
+            .clients
+            .get(&grant.client_id)
+            .await
+            .ok_or_else(|| OAuthError::invalid_grant("registration expired"))?;
+        let mut claims: Claims = serde_json::from_value(value)
+            .map_err(|_| OAuthError::invalid_grant("invalid UserInfo claims"))?;
+        let now = now_secs();
+        claims.iss = Some(self.metadata.issuer.clone());
+        claims.aud = Some(jose_rs::jwt::Audience::Single(grant.client_id));
+        claims.iat = Some(now.into());
+        claims.exp = Some(grant.exp.min(now + 300).into());
+        let jwt = jwt::sign(&self.signing_key, &claims, Some("JWT"))
+            .map_err(|_| OAuthError::new(OAuthErrorCode::ServerError, "could not sign UserInfo"))?;
+        encrypt_registered_response(
+            jwt,
+            &client,
+            client
+                .response_policy
+                .userinfo_encrypted_response_alg
+                .as_deref(),
+            client
+                .response_policy
+                .userinfo_encrypted_response_enc
+                .as_deref(),
+        )
+    }
+
+    /// Record a verified Request Object identifier for one-time use by this client.
+    ///
+    /// Call after verifying the signature and binding the object to `client`.
+    /// Set `expiry` to the request's acceptance deadline in Unix seconds. Concurrent
+    /// submissions of the same client and identifier share one replay entry.
+    /// Replicas need a shared [`TokenUseStore`] to enforce this across processes.
+    ///
+    /// # Errors
+    ///
+    /// An empty identifier, an identifier over 512 bytes, or a deadline in the
+    /// past or present yields `invalid_request`. Reuse yields `invalid_grant`,
+    /// and a store failure yields `server_error`.
+    pub async fn consume_request_id(
+        &self,
+        client: &str,
+        jti: &str,
+        expiry: u64,
+    ) -> Result<(), OAuthError> {
+        if jti.is_empty() || jti.len() > 512 || expiry <= now_secs() {
+            return Err(OAuthError::invalid_request(
+                "invalid request object identifier or expiry",
+            ));
+        }
+        // Tuple encoding keeps the two strings distinct even if either contains a delimiter.
+        let binding = serde_json::to_string(&(client, jti)).expect("string tuple");
+        self.consume_token_once(
+            "request",
+            &binding,
+            expiry,
+            "request identifier already used",
+        )
+        .await
     }
 
     // ── Client authentication ───────────────────────────────────────────
@@ -1540,6 +1717,15 @@ impl Provider {
             .require_exp()
             .require_iat()
             .with_max_age(self.client_assertion_max_age);
+        let validation = if let Some(pin) = &client.response_policy.token_endpoint_auth_signing_alg
+        {
+            let alg = pin.parse::<JwsAlgorithm>().map_err(|_| {
+                OAuthError::invalid_client("unsupported registered assertion algorithm")
+            })?;
+            validation.with_allowed_algorithms(vec![alg]).require_kid()
+        } else {
+            validation
+        };
         let claims = jwt::verify_with_jwks(jwks, assertion, &validation).map_err(|e| {
             // The jose-rs detail can carry internals; keep it for the logs and
             // hand the client only a generic description.
@@ -1716,11 +1902,8 @@ fn client_allows_refresh(client: &Client) -> bool {
     client.grant_types.iter().any(|g| g == "refresh_token")
 }
 
-/// Flatten a multi-valued external claim map into JSON values: single-element
-/// lists become scalars, multi-element lists become arrays.
-/// Registered claims that `build_id_token` sets as typed [`Claims`] fields (or
-/// inserts itself). Released attribute claims carrying these names are dropped
-/// so the flattened `extra` map cannot emit a duplicate JSON key.
+/// Names owned by the provider when it constructs a token. Removing them from
+/// application claim maps prevents conflicting subjects, timestamps and hashes.
 fn is_reserved_id_token_claim(name: &str) -> bool {
     matches!(
         name,
@@ -1740,6 +1923,91 @@ fn is_reserved_id_token_claim(name: &str) -> bool {
     )
 }
 
+/// Map registration serialization failures to a client-safe protocol error.
+fn registration_digest(client: &Client) -> Result<String, OAuthError> {
+    client
+        .registration_fingerprint()
+        .map_err(|_| OAuthError::new(OAuthErrorCode::ServerError, "invalid client registration"))
+}
+
+/// Wrap a signed JWT according to the recipient's registration. With no JWE
+/// parameters, return the signed JWT. A registered `alg` alone selects the OIDC
+/// default `enc` of `A128CBC-HS256`. A lone `enc` is an invalid registration.
+fn encrypt_registered_response(
+    jwt: String,
+    client: &Client,
+    alg: Option<&str>,
+    enc: Option<&str>,
+) -> Result<String, OAuthError> {
+    use jose_rs::{JoseHeader, JweAlgorithm, JweEncryption};
+    let failed = || {
+        OAuthError::new(
+            OAuthErrorCode::ServerError,
+            "unsupported or unusable registered encryption policy",
+        )
+    };
+    let (alg, enc) = match (alg, enc) {
+        (None, None) => return Ok(jwt),
+        (Some(alg @ ("RSA-OAEP" | "RSA-OAEP-256" | "ECDH-ES")), enc) => {
+            (alg, enc.unwrap_or("A128CBC-HS256"))
+        }
+        _ => return Err(failed()),
+    };
+    let algorithm = alg.parse::<JweAlgorithm>().map_err(|_| failed())?;
+    let encryption = enc.parse::<JweEncryption>().map_err(|_| failed())?;
+    // During rollover several recipient keys can be registered. Try eligible
+    // encryption keys in order and identify the successful one by its kid.
+    // Exhausting them must fail issuance: the client requested encryption.
+    for key in &client.jwks.as_ref().ok_or_else(failed)?.keys {
+        if key.use_.as_deref() != Some("enc")
+            || key.kid.as_deref().is_none_or(str::is_empty)
+            || key.alg.as_deref().is_some_and(|pin| pin != alg)
+        {
+            continue;
+        }
+        let mut recipient = key.clone();
+        recipient.alg = Some(alg.into());
+        let mut header = JoseHeader::for_jwe(algorithm, encryption);
+        header.kid = key.kid.clone();
+        header.cty = Some("JWT".into());
+        if let Ok(token) = jose_rs::jwe::compact::encrypt_with_jwk_header(
+            &recipient,
+            header,
+            jwt.as_bytes(),
+            encryption,
+        ) {
+            return Ok(token);
+        }
+    }
+    Err(failed())
+}
+
+/// JSON claims the application has approved for one authorization request.
+///
+/// [`Provider::authorization_redirect_with_authorized_claims`] preserves the
+/// two release decisions through code exchange. Add a claim to both maps only
+/// when both destinations are authorized to receive it.
+///
+/// ```
+/// use grindvakt::provider::AuthorizedClaims;
+/// use serde_json::json;
+///
+/// // The RP may receive email verification status only through UserInfo.
+/// let mut approved = AuthorizedClaims::default();
+/// approved.userinfo.insert("email_verified".into(), json!(true));
+/// assert!(approved.id_token.is_empty());
+/// ```
+#[derive(Default)]
+pub struct AuthorizedClaims {
+    /// Application claims for the ID token, alongside the provider's protocol claims.
+    pub id_token: BTreeMap<String, serde_json::Value>,
+    /// Claims released by UserInfo when the client presents the access token.
+    pub userinfo: BTreeMap<String, serde_json::Value>,
+}
+
+/// Convert mapped attribute lists to JSON claims. A single value becomes a
+/// scalar, with type conversion for recognized standard claims. Empty and
+/// multi-valued lists become arrays of strings.
 pub fn flatten_claims(
     external: &BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, serde_json::Value> {
@@ -1777,7 +2045,17 @@ fn filter_claims(
 }
 
 fn claim_allowed_by_scope(scope: &str, name: &str) -> bool {
-    let required_scope = match name {
+    standard_claim_scope(name)
+        .is_none_or(|required| scope.split_whitespace().any(|s| s == required))
+}
+
+/// Look up the OIDC Core scope associated with a standard UserInfo claim.
+///
+/// For example, `email_verified` maps to `email`. A result of `None` means
+/// this table supplies no scope mapping. The application decides whether a
+/// custom claim may be released.
+pub fn standard_claim_scope(name: &str) -> Option<&'static str> {
+    match name {
         "name" | "family_name" | "given_name" | "middle_name" | "nickname"
         | "preferred_username" | "profile" | "picture" | "website" | "gender" | "birthdate"
         | "zoneinfo" | "locale" | "updated_at" => Some("profile"),
@@ -1785,8 +2063,7 @@ fn claim_allowed_by_scope(scope: &str, name: &str) -> bool {
         "address" => Some("address"),
         "phone_number" | "phone_number_verified" => Some("phone"),
         _ => None,
-    };
-    required_scope.is_none_or(|required| scope.split_whitespace().any(|s| s == required))
+    }
 }
 
 /// Coerce the standard OIDC claims whose JSON type is not a string (OIDC Core
@@ -2081,6 +2358,7 @@ mod tests {
             jwks: Some(key.to_public_jwks()),
             scope: Some("read".into()),
             subject_type: "public".into(),
+            response_policy: Default::default(),
             client_name: None,
         };
         let op = Provider::new(

@@ -163,6 +163,7 @@ async fn authorization_code_pkce_flow() {
         jwks: None,
         scope: Some("openid email".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -285,6 +286,7 @@ async fn oauth_code_token_without_openid_remains_valid() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -346,6 +348,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -509,6 +512,7 @@ async fn refresh_token_grant_flow() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -673,6 +677,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -795,6 +800,7 @@ async fn refresh_token_denied_when_grant_not_registered() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -869,6 +875,7 @@ async fn pkce_mismatch_rejected() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -927,6 +934,7 @@ async fn public_code_flow_requires_s256_pkce() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -983,6 +991,7 @@ async fn confidential_code_flow_validates_supplied_pkce_tuple() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1050,6 +1059,7 @@ async fn private_key_jwt_client_auth() {
         jwks: Some(jwks),
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1131,6 +1141,7 @@ async fn client_credentials_flow() {
         jwks: None,
         scope: Some("read write admin".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1180,6 +1191,7 @@ async fn client_credentials_disallowed_grant_rejected() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1214,6 +1226,7 @@ async fn client_credentials_empty_scope_intersection_rejected() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1251,6 +1264,7 @@ async fn client_credentials_public_client_rejected() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1285,6 +1299,7 @@ async fn client_credentials_dpop_bound() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1327,6 +1342,7 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
         jwks: None,
         scope: Some("openid email".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1422,6 +1438,7 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
         jwks: Some(client_key.to_public_jwks()),
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1530,6 +1547,7 @@ async fn private_key_jwt_max_age_is_configurable() {
         jwks: Some(client_key.to_public_jwks()),
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let token_url = "https://op.example.com/token";
@@ -1586,6 +1604,7 @@ async fn authorization_request_scope_checked_against_registered_scope() {
         jwks: None,
         scope: Some("openid email".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1631,6 +1650,7 @@ async fn client_without_registered_scope_is_unrestricted() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1668,6 +1688,7 @@ async fn authorization_request_rejects_malformed_registered_redirect_uri() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1724,6 +1745,7 @@ async fn presented_auth_method_must_match_registered_method() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1820,6 +1842,7 @@ async fn implicit_and_hybrid_flows_require_nonce() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1881,6 +1904,7 @@ async fn authorization_request_validates_prompt_none_combinations() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1933,6 +1957,7 @@ async fn hybrid_flow_defaults_to_fragment_response_mode() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1980,6 +2005,7 @@ async fn front_channel_id_token_hashes_bind_emitted_artifacts() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let mut jwk = jose_rs::jwk::generate_ec("P-384").unwrap();
@@ -2072,6 +2098,7 @@ async fn token_request_must_echo_redirect_uri() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -2128,6 +2155,7 @@ async fn authorization_code_grant_must_be_registered() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -2187,6 +2215,7 @@ fn subject_client(client_id: &str, subject_type: &str) -> Client {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: subject_type.into(),
+        response_policy: Default::default(),
         client_name: None,
     }
 }
@@ -2783,6 +2812,7 @@ async fn hostile_state_is_refused_before_any_response() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -2821,6 +2851,7 @@ fn iss_client() -> Client {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     }
 }
@@ -3045,4 +3076,66 @@ async fn iss_collision_ignored_without_opt_in() {
     let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
     let loc = location_of(&op.authorization_error_redirect(&req, &err).unwrap());
     assert!(loc.contains("iss=old"), "{loc}");
+}
+
+#[tokio::test]
+async fn typed_claim_destinations_and_registration_survive_code_exchange() {
+    use grindvakt::provider::AuthorizedClaims;
+
+    let client = iss_client();
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client.clone()]));
+    let request = iss_request("code");
+    let authorized = AuthorizedClaims {
+        id_token: BTreeMap::from([("id_only".into(), serde_json::json!(true))]),
+        userinfo: BTreeMap::from([("ui_only".into(), serde_json::json!([1, "001"]))]),
+    };
+    let redirect = op
+        .authorization_redirect_with_authorized_claims(
+            &request,
+            |_| Ok("original".into()),
+            authorized,
+            Some("loa".into()),
+            Some(1234),
+        )
+        .await
+        .unwrap();
+    let code = extract_param(&location_of(&redirect), "code").unwrap();
+    let form = pairs(&[
+        ("client_id", "rp-iss"),
+        ("client_secret", "s"),
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", &request.redirect_uri),
+    ]);
+    let mut replacement = client.clone();
+    // Changing only the sector invalidates the snapshot used to choose the subject.
+    replacement.response_policy.sector_identifier_uri =
+        Some("https://other.example/sector.json".into());
+    op.clients.put(replacement).await;
+    assert_eq!(
+        op.handle_token_request(&form, None, "https://op.example.com/token", None)
+            .await
+            .unwrap_err()
+            .code,
+        grindvakt::OAuthErrorCode::InvalidGrant
+    );
+    // The mismatch was detected before the code was consumed. Restoring the
+    // original registration lets us inspect both destinations for the same grant.
+    op.clients.put(client).await;
+    let result = op
+        .handle_token_request(&form, None, "https://op.example.com/token", None)
+        .await
+        .unwrap();
+    let id = grindvakt::jwt::peek_claims_unverified(&result.id_token.unwrap()).unwrap();
+    let ui = op
+        .signed_userinfo(&result.access_token, None)
+        .await
+        .unwrap();
+    let claims = grindvakt::jwt::peek_claims_unverified(&ui).unwrap();
+    assert_eq!(id.extra["id_only"], true);
+    assert_eq!(id.extra["auth_time"], 1234);
+    assert!(!id.extra.contains_key("ui_only"));
+    assert_eq!(claims.extra["ui_only"], serde_json::json!([1, "001"]));
+    assert!(!claims.extra.contains_key("id_only"));
+    assert_eq!(claims.sub, id.sub);
 }

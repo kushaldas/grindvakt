@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.0 [2026-11-24]
+
+- Updated the jose-rs dependency to 0.13.0.
+- Added structured signed authorization requests, separate typed ID token and UserInfo claims, signed and encrypted responses, and resolver-endorsed trust marks.
+- Added Redis-backed federation registration storage. Authorization codes bind to the registered client snapshot. Previously issued codes remain readable.
+
 ## 0.12.0 [2026-11-10]
 
 - Added `HttpClient::post_json` for `application/json` POSTs. It has a

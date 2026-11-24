@@ -15,6 +15,9 @@ pub enum OAuthErrorCode {
     InvalidScope,
     AccessDenied,
     LoginRequired,
+    /// Authorization error returned when the OP cannot meet the requested
+    /// authentication requirements, such as an essential `acr` value.
+    UnmetAuthenticationRequirements,
     ServerError,
     TemporarilyUnavailable,
     /// RFC 9449 §5.2 / §7.1 — a presented DPoP proof was malformed or invalid.
@@ -32,6 +35,7 @@ impl OAuthErrorCode {
             Self::UnsupportedResponseType => "unsupported_response_type",
             Self::InvalidScope => "invalid_scope",
             Self::AccessDenied => "access_denied",
+            Self::UnmetAuthenticationRequirements => "unmet_authentication_requirements",
             Self::LoginRequired => "login_required",
             Self::ServerError => "server_error",
             Self::TemporarilyUnavailable => "temporarily_unavailable",
@@ -82,6 +86,7 @@ impl std::str::FromStr for OAuthErrorCode {
             "unsupported_response_type" => Self::UnsupportedResponseType,
             "invalid_scope" => Self::InvalidScope,
             "access_denied" => Self::AccessDenied,
+            "unmet_authentication_requirements" => Self::UnmetAuthenticationRequirements,
             "login_required" => Self::LoginRequired,
             "server_error" => Self::ServerError,
             "temporarily_unavailable" => Self::TemporarilyUnavailable,
@@ -274,7 +279,7 @@ pub(crate) fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    const ALL_CODES: [OAuthErrorCode; 12] = [
+    const ALL_CODES: [OAuthErrorCode; 13] = [
         OAuthErrorCode::InvalidRequest,
         OAuthErrorCode::InvalidClient,
         OAuthErrorCode::InvalidGrant,
@@ -287,6 +292,7 @@ mod tests {
         OAuthErrorCode::ServerError,
         OAuthErrorCode::TemporarilyUnavailable,
         OAuthErrorCode::InvalidDpopProof,
+        OAuthErrorCode::UnmetAuthenticationRequirements,
     ];
 
     /// Exhaustive match: a new variant fails to compile here, forcing an
@@ -305,6 +311,7 @@ mod tests {
             OAuthErrorCode::ServerError => 9,
             OAuthErrorCode::TemporarilyUnavailable => 10,
             OAuthErrorCode::InvalidDpopProof => 11,
+            OAuthErrorCode::UnmetAuthenticationRequirements => 12,
         }
     }
 

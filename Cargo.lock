@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "grindvakt"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -890,9 +890,9 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "jose-rs"
-version = "0.11.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a9a8daf2a72f3ec5324347a4859356187dfc9acc3ad559b932e72a3f4dfb48"
+checksum = "1d6ebddd6aa3fb294f9bda66f3c40cff14bc685ef94598c4f39fec57652a804b"
 dependencies = [
  "aes",
  "aes-gcm",
