@@ -3158,7 +3158,10 @@ async fn refresh_preserves_individually_approved_claims_in_their_destinations() 
 
 #[tokio::test]
 async fn typed_claim_destinations_and_registration_survive_code_exchange() {
+    use grindvakt::http::HttpFetchResponse;
     use grindvakt::provider::AuthorizedClaims;
+    use grindvakt::rp::{userinfo_signed_claims, UserinfoJwtOptions};
+    use jose_rs::algorithm::JwsAlgorithm;
 
     let client = iss_client();
     let op = provider_with(InMemoryClientStore::with_clients(vec![client.clone()]));
@@ -3204,16 +3207,41 @@ async fn typed_claim_destinations_and_registration_survive_code_exchange() {
         .handle_token_request(&form, None, "https://op.example.com/token", None)
         .await
         .unwrap();
-    let id = grindvakt::jwt::peek_claims_unverified(&result.id_token.unwrap()).unwrap();
+    let id_token = result.id_token.unwrap();
+    let id = grindvakt::jwt::peek_claims_unverified(&id_token).unwrap();
     let ui = op
         .signed_userinfo(&result.access_token, None)
         .await
         .unwrap();
-    let claims = grindvakt::jwt::peek_claims_unverified(&ui).unwrap();
+    let keys = op.jwks_document();
+    let verify_userinfo = |token: String| {
+        let response =
+            HttpFetchResponse::new(200, token).with_header("Content-Type", "application/jwt");
+        userinfo_signed_claims(
+            &keys,
+            &response,
+            "https://op.example.com",
+            "rp-iss",
+            "original",
+            &[JwsAlgorithm::ES256],
+            &UserinfoJwtOptions::typed("userinfo+jwt"),
+        )
+    };
+    let claims = verify_userinfo(ui).unwrap();
+    // Both tokens have the same issuer, audience and subject. The RP must
+    // reject the ID token on its header even before checking individual claims.
+    let err = verify_userinfo(id_token).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            grindvakt::Error::Jose(jose_rs::JoseError::InvalidHeader(_))
+        ),
+        "{err}"
+    );
     assert_eq!(id.extra["id_only"], true);
     assert_eq!(id.extra["auth_time"], 1234);
     assert!(!id.extra.contains_key("ui_only"));
-    assert_eq!(claims.extra["ui_only"], serde_json::json!([1, "001"]));
-    assert!(!claims.extra.contains_key("id_only"));
-    assert_eq!(claims.sub, id.sub);
+    assert_eq!(claims["ui_only"], serde_json::json!([1, "001"]));
+    assert!(claims.get("id_only").is_none());
+    assert_eq!(claims["sub"].as_str(), id.sub.as_deref());
 }

@@ -1472,8 +1472,9 @@ impl Provider {
     /// provider as issuer and the client as audience. Its lifetime ends at the
     /// earlier of access-token expiry and five minutes from issuance.
     ///
-    /// The client's current registration determines whether the signed JWT is
-    /// returned directly or wrapped in a compact JWE.
+    /// The signed JWT carries the JOSE type `userinfo+jwt`. Relying parties can
+    /// require this type with [`crate::rp::UserinfoJwtOptions::typed`], including
+    /// after decryption when the client's registration requests a compact JWE.
     ///
     /// # Errors
     ///
@@ -1502,7 +1503,9 @@ impl Provider {
         claims.aud = Some(jose_rs::jwt::Audience::Single(grant.client_id));
         claims.iat = Some(now.into());
         claims.exp = Some(grant.exp.min(now + 300).into());
-        let jwt = jwt::sign(&self.signing_key, &claims, Some("JWT"))
+        // ID tokens use this signing key too. The protected type lets the RP
+        // distinguish UserInfo even when the two tokens carry the same claims.
+        let jwt = jwt::sign(&self.signing_key, &claims, Some("userinfo+jwt"))
             .map_err(|_| OAuthError::new(OAuthErrorCode::ServerError, "could not sign UserInfo"))?;
         encrypt_registered_response(
             jwt,
