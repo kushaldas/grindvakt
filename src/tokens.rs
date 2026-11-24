@@ -5,6 +5,15 @@
 //! secret can open a token. The provider separately checks client registrations
 //! and uses a [`crate::provider::TokenUseStore`] for code redemption and refresh
 //! rotation.
+//!
+//! ## Reading grants issued by 0.12
+//!
+//! With the same OP secret, 0.13 can open unexpired 0.12 authorization codes,
+//! access tokens and refresh tokens. An old code has no registration fingerprint,
+//! so redemption skips the snapshot comparison. For old codes and refresh tokens,
+//! the provider reads the original `claims` map for both ID token and UserInfo
+//! issuance. In a new grant, `userinfo_claims: Some(empty_map)` explicitly
+//! grants zero application claims to UserInfo.
 
 use crate::error::{Error, Result};
 use crate::util::now_secs;

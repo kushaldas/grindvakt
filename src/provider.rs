@@ -934,6 +934,11 @@ impl Provider {
     /// `auth_header` is the raw Authorization header value; `token_url` is this
     /// endpoint's absolute configured URL for `private_key_jwt` audience
     /// checking. `dpop` is an already-validated proof from the web layer.
+    ///
+    /// Codes issued since 0.13 bind to the authenticated client's registration.
+    /// If its [fingerprint](Client::registration_fingerprint) changed, redemption
+    /// returns `invalid_grant` before consuming the code. For example, a client
+    /// that rotated its keys can start a new authorization under the new registration.
     pub async fn handle_token_request(
         &self,
         form: &[(String, String)],
@@ -1417,6 +1422,11 @@ impl Provider {
     /// access token is DPoP-bound (`cnf.jkt` sealed in), the binding is enforced
     /// here per RFC 9449 §7.1: the proof key must match, and a bound token
     /// presented without a proof (i.e. as plain Bearer) is rejected.
+    ///
+    /// This method returns a JSON object. Use [`Self::signed_userinfo`] for a
+    /// signed or encrypted response. For grants issued by 0.13, application
+    /// mappings of reserved names such as `acr` and `auth_time` are excluded.
+    /// The `sub` always comes from the authenticated subject in the access token.
     pub async fn userinfo(
         &self,
         access_token: &str,
@@ -1988,6 +1998,9 @@ fn encrypt_registered_response(
 /// [`Provider::authorization_redirect_with_authorized_claims`] preserves the
 /// two release decisions through code exchange. Add a claim to both maps only
 /// when both destinations are authorized to receive it.
+/// Refresh preserves an individually approved claim even if its standard scope
+/// was never granted. If the client drops a previously granted scope, refresh
+/// removes the corresponding standard claims from both destinations.
 ///
 /// ```
 /// use grindvakt::provider::AuthorizedClaims;
