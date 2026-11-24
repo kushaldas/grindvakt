@@ -163,6 +163,7 @@ async fn authorization_code_pkce_flow() {
         jwks: None,
         scope: Some("openid email".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -285,6 +286,7 @@ async fn oauth_code_token_without_openid_remains_valid() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -346,6 +348,7 @@ async fn extra_claims_keep_json_type_and_win_over_released() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -509,6 +512,7 @@ async fn refresh_token_grant_flow() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -673,6 +677,7 @@ async fn dpop_bound_refresh_token_requires_matching_proof() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -795,6 +800,7 @@ async fn refresh_token_denied_when_grant_not_registered() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -869,6 +875,7 @@ async fn pkce_mismatch_rejected() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -927,6 +934,7 @@ async fn public_code_flow_requires_s256_pkce() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -983,6 +991,7 @@ async fn confidential_code_flow_validates_supplied_pkce_tuple() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1050,6 +1059,7 @@ async fn private_key_jwt_client_auth() {
         jwks: Some(jwks),
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1131,6 +1141,7 @@ async fn client_credentials_flow() {
         jwks: None,
         scope: Some("read write admin".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1180,6 +1191,7 @@ async fn client_credentials_disallowed_grant_rejected() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1214,6 +1226,7 @@ async fn client_credentials_empty_scope_intersection_rejected() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1251,6 +1264,7 @@ async fn client_credentials_public_client_rejected() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1285,6 +1299,7 @@ async fn client_credentials_dpop_bound() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let store = InMemoryClientStore::with_clients(vec![client]);
@@ -1327,6 +1342,7 @@ async fn released_sub_claim_does_not_duplicate_id_token_subject() {
         jwks: None,
         scope: Some("openid email".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1422,6 +1438,7 @@ async fn private_key_jwt_requires_exp_and_tracks_jti_replay() {
         jwks: Some(client_key.to_public_jwks()),
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1530,6 +1547,7 @@ async fn private_key_jwt_max_age_is_configurable() {
         jwks: Some(client_key.to_public_jwks()),
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let token_url = "https://op.example.com/token";
@@ -1586,6 +1604,7 @@ async fn authorization_request_scope_checked_against_registered_scope() {
         jwks: None,
         scope: Some("openid email".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1631,6 +1650,7 @@ async fn client_without_registered_scope_is_unrestricted() {
         jwks: None,
         scope: None,
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1668,6 +1688,7 @@ async fn authorization_request_rejects_malformed_registered_redirect_uri() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1724,6 +1745,7 @@ async fn presented_auth_method_must_match_registered_method() {
         jwks: None,
         scope: Some("read".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1820,6 +1842,7 @@ async fn implicit_and_hybrid_flows_require_nonce() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1881,6 +1904,7 @@ async fn authorization_request_validates_prompt_none_combinations() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1933,6 +1957,7 @@ async fn hybrid_flow_defaults_to_fragment_response_mode() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -1980,6 +2005,7 @@ async fn front_channel_id_token_hashes_bind_emitted_artifacts() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let mut jwk = jose_rs::jwk::generate_ec("P-384").unwrap();
@@ -2072,6 +2098,7 @@ async fn token_request_must_echo_redirect_uri() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -2128,6 +2155,7 @@ async fn authorization_code_grant_must_be_registered() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -2187,6 +2215,7 @@ fn subject_client(client_id: &str, subject_type: &str) -> Client {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: subject_type.into(),
+        response_policy: Default::default(),
         client_name: None,
     }
 }
@@ -2783,6 +2812,7 @@ async fn hostile_state_is_refused_before_any_response() {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     };
     let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
@@ -2821,6 +2851,7 @@ fn iss_client() -> Client {
         jwks: None,
         scope: Some("openid".into()),
         subject_type: "public".into(),
+        response_policy: Default::default(),
         client_name: None,
     }
 }
@@ -3045,4 +3076,376 @@ async fn iss_collision_ignored_without_opt_in() {
     let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
     let loc = location_of(&op.authorization_error_redirect(&req, &err).unwrap());
     assert!(loc.contains("iss=old"), "{loc}");
+}
+
+#[tokio::test]
+async fn refresh_preserves_individually_approved_claims_in_their_destinations() {
+    use grindvakt::provider::AuthorizedClaims;
+    use serde_json::json;
+
+    let mut client = iss_client();
+    client.grant_types.push("refresh_token".into());
+    client.scope = Some("openid profile".into());
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+    let mut req = iss_request("code");
+    req.scope = "openid profile".into();
+    req.claims = Some(json!({"id_token": {"email": null}, "userinfo": {"email_verified": null}}));
+    let approved = AuthorizedClaims {
+        id_token: BTreeMap::from([("email".into(), json!("user@example.org"))]),
+        userinfo: BTreeMap::from([
+            ("email_verified".into(), json!(true)),
+            ("name".into(), json!("Example User")),
+        ]),
+    };
+    let response = op
+        .authorization_redirect_with_authorized_claims(
+            &req,
+            |_| Ok("subject".into()),
+            approved,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let code = extract_param(&location_of(&response), "code").unwrap();
+    let endpoint = "https://op.example.com/token";
+    let auth = pairs(&[("client_id", "rp-iss"), ("client_secret", "s")]);
+    let mut exchange = auth.clone();
+    exchange.extend(pairs(&[
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", &req.redirect_uri),
+        ("code", &code),
+    ]));
+    let mut tokens = op
+        .handle_token_request(&exchange, None, endpoint, None)
+        .await
+        .unwrap();
+
+    let keys = op.jwks_document();
+    let validation = jose_rs::jwt::Validation::new()
+        .with_issuer("https://op.example.com")
+        .with_audience("rp-iss");
+    // First retain the entire grant, then drop profile, then use the rotated grant.
+    for (scope, expect_name) in [
+        (None, true),
+        (Some("profile openid"), true),
+        (Some("openid"), false),
+        (None, false),
+    ] {
+        let mut form = auth.clone();
+        form.extend(pairs(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", tokens.refresh_token.as_ref().unwrap()),
+        ]));
+        if let Some(scope) = scope {
+            form.push(("scope".into(), scope.into()));
+        }
+        tokens = op
+            .handle_token_request(&form, None, endpoint, None)
+            .await
+            .unwrap();
+        let id =
+            jose_rs::jwt::decode_with_jwkset(&keys, tokens.id_token.as_ref().unwrap(), &validation)
+                .unwrap();
+        let ui = op.userinfo(&tokens.access_token, None).await.unwrap();
+        assert_eq!(id.extra.get("email"), Some(&json!("user@example.org")));
+        assert!(!id.extra.contains_key("email_verified"));
+        assert!(ui.get("email").is_none());
+        assert_eq!(ui["email_verified"], true);
+        assert_eq!(ui.get("name").is_some(), expect_name);
+    }
+}
+
+#[tokio::test]
+async fn typed_claim_destinations_and_registration_survive_code_exchange() {
+    use grindvakt::http::HttpFetchResponse;
+    use grindvakt::provider::AuthorizedClaims;
+    use grindvakt::rp::{userinfo_signed_claims, UserinfoJwtOptions};
+    use jose_rs::algorithm::JwsAlgorithm;
+
+    let client = iss_client();
+    let op = provider_with(InMemoryClientStore::with_clients(vec![client.clone()]));
+    let request = iss_request("code");
+    let authorized = AuthorizedClaims {
+        id_token: BTreeMap::from([("id_only".into(), serde_json::json!(true))]),
+        userinfo: BTreeMap::from([("ui_only".into(), serde_json::json!([1, "001"]))]),
+    };
+    let redirect = op
+        .authorization_redirect_with_authorized_claims(
+            &request,
+            |_| Ok("original".into()),
+            authorized,
+            Some("loa".into()),
+            Some(1234),
+        )
+        .await
+        .unwrap();
+    let code = extract_param(&location_of(&redirect), "code").unwrap();
+    let form = pairs(&[
+        ("client_id", "rp-iss"),
+        ("client_secret", "s"),
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", &request.redirect_uri),
+    ]);
+    let mut replacement = client.clone();
+    // Changing only the sector invalidates the snapshot used to choose the subject.
+    replacement.response_policy.sector_identifier_uri =
+        Some("https://other.example/sector.json".into());
+    op.clients.put(replacement).await;
+    assert_eq!(
+        op.handle_token_request(&form, None, "https://op.example.com/token", None)
+            .await
+            .unwrap_err()
+            .code,
+        grindvakt::OAuthErrorCode::InvalidGrant
+    );
+    // The mismatch was detected before the code was consumed. Restoring the
+    // original registration lets us inspect both destinations for the same grant.
+    op.clients.put(client).await;
+    let result = op
+        .handle_token_request(&form, None, "https://op.example.com/token", None)
+        .await
+        .unwrap();
+    let id_token = result.id_token.unwrap();
+    let id = grindvakt::jwt::peek_claims_unverified(&id_token).unwrap();
+    let ui = op
+        .signed_userinfo(&result.access_token, None)
+        .await
+        .unwrap();
+    let keys = op.jwks_document();
+    let verify_userinfo = |token: String| {
+        let response =
+            HttpFetchResponse::new(200, token).with_header("Content-Type", "application/jwt");
+        userinfo_signed_claims(
+            &keys,
+            &response,
+            "https://op.example.com",
+            "rp-iss",
+            "original",
+            &[JwsAlgorithm::ES256],
+            &UserinfoJwtOptions::typed("userinfo+jwt"),
+        )
+    };
+    let claims = verify_userinfo(ui).unwrap();
+    // Both tokens have the same issuer, audience and subject. The RP must
+    // reject the ID token on its header even before checking individual claims.
+    let err = verify_userinfo(id_token).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            grindvakt::Error::Jose(jose_rs::JoseError::InvalidHeader(_))
+        ),
+        "{err}"
+    );
+    assert_eq!(id.extra["id_only"], true);
+    assert_eq!(id.extra["auth_time"], 1234);
+    assert!(!id.extra.contains_key("ui_only"));
+    assert_eq!(claims["ui_only"], serde_json::json!([1, "001"]));
+    assert!(claims.get("id_only").is_none());
+    assert_eq!(claims["sub"].as_str(), id.sub.as_deref());
+}
+
+mod registered_response_encryption {
+    use super::*;
+    use grindvakt::provider::TokenResponse;
+    use jose_rs::jwk::{generate_ec, generate_rsa, Jwk, JwkSet};
+    use jose_rs::jwt::{decode_with_jwkset, Validation};
+
+    const TOKEN_ENDPOINT: &str = "https://op.example.com/token";
+
+    /// Bind a test recipient key to the algorithm and key ID its registration advertises.
+    fn recipient(mut key: Jwk, alg: &str, kid: &str) -> Jwk {
+        key.alg = Some(alg.into());
+        key.kid = Some(kid.into());
+        key.use_ = Some("enc".into());
+        key
+    }
+
+    /// Exchange the code from either a code-only or hybrid authorization response.
+    async fn exchange_code(op: &Provider, location: &str) -> Result<TokenResponse, OAuthError> {
+        let code = extract_param(location, "code").unwrap();
+        let form = pairs(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", "rp-iss"),
+            ("client_secret", "s"),
+            ("redirect_uri", "https://rp.example.com/cb"),
+            ("code", &code),
+        ]);
+        op.handle_token_request(&form, None, TOKEN_ENDPOINT, None)
+            .await
+    }
+
+    /// Check the authenticated JWE headers before handing the inner JWT to its verifier.
+    fn decrypt_response(token: &str, recipient: &Jwk, expected_enc: &str) -> String {
+        let jwe = jose_rs::jwe::compact::decrypt_with_jwk_authenticated(recipient, token).unwrap();
+        assert_eq!(Some(jwe.algorithm()), recipient.alg.as_deref());
+        assert_eq!(jwe.protected.kid, recipient.kid);
+        assert_eq!(jwe.protected.enc.as_deref(), Some(expected_enc));
+        assert_eq!(jwe.protected.cty.as_deref(), Some("JWT"));
+        String::from_utf8(jwe.value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn round_trip_uses_each_registered_policy_and_rolls_over_keys() {
+        let id_key = recipient(generate_ec("P-256").unwrap(), "ECDH-ES", "id");
+        let ui_key = recipient(generate_rsa(2048).unwrap(), "RSA-OAEP-256", "userinfo");
+        // This key passes the metadata checks, but lacks a coordinate needed for
+        // encryption. Issuance must continue to the next recipient during rollover.
+        let mut retired = id_key.to_public_jwk();
+        retired.kid = Some("retired".into());
+        retired.x = None;
+        let mut client = iss_client();
+        client.jwks = Some(JwkSet {
+            keys: vec![retired, id_key.to_public_jwk(), ui_key.to_public_jwk()],
+        });
+        client.grant_types.push("refresh_token".into());
+        client.response_policy.id_token_encrypted_response_alg = id_key.alg.clone();
+        client.response_policy.userinfo_encrypted_response_alg = ui_key.alg.clone();
+        client.response_policy.userinfo_encrypted_response_enc = Some("A256GCM".into());
+
+        // Exercise the default on each response independently. The other response
+        // uses an explicit enc so accidentally sharing either setting is observable.
+        check_round_trip(client.clone(), &id_key, "A128CBC-HS256", &ui_key, "A256GCM").await;
+        client.response_policy.id_token_encrypted_response_enc = Some("A128GCM".into());
+        client.response_policy.userinfo_encrypted_response_enc = None;
+        check_round_trip(client, &id_key, "A128GCM", &ui_key, "A128CBC-HS256").await;
+    }
+
+    /// Verify nested signatures and recipient policies through all four issuance paths.
+    async fn check_round_trip(
+        client: Client,
+        id_key: &Jwk,
+        id_enc: &str,
+        ui_key: &Jwk,
+        ui_enc: &str,
+    ) {
+        let op = provider_with(InMemoryClientStore::with_clients(vec![client]));
+        let redirect = op
+            .authorization_redirect(
+                &iss_request("code id_token"),
+                "subject",
+                &BTreeMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let location = location_of(&redirect);
+        let front_id = extract_param(&location, "id_token").unwrap();
+        let tokens = exchange_code(&op, &location).await.unwrap();
+        let refresh = pairs(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "rp-iss"),
+            ("client_secret", "s"),
+            ("refresh_token", tokens.refresh_token.as_deref().unwrap()),
+        ]);
+        let refreshed = op
+            .handle_token_request(&refresh, None, TOKEN_ENDPOINT, None)
+            .await
+            .unwrap();
+
+        let jwks = op.jwks_document();
+        let validation = Validation::new()
+            .with_issuer("https://op.example.com")
+            .with_audience("rp-iss")
+            .with_allowed_algorithms(vec![jose_rs::JwsAlgorithm::ES256]);
+        for token in [
+            &front_id,
+            tokens.id_token.as_ref().unwrap(),
+            refreshed.id_token.as_ref().unwrap(),
+        ] {
+            let inner = decrypt_response(token, id_key, id_enc);
+            let claims = decode_with_jwkset(&jwks, &inner, &validation).unwrap();
+            assert_eq!(claims.sub.as_deref(), Some("subject"));
+            assert_eq!(claims.extra["nonce"], "n-1");
+        }
+
+        let ui = op
+            .signed_userinfo(&tokens.access_token, None)
+            .await
+            .unwrap();
+        let inner = decrypt_response(&ui, ui_key, ui_enc);
+        let claims =
+            decode_with_jwkset(&jwks, &inner, &validation.with_typ("userinfo+jwt")).unwrap();
+        assert_eq!(claims.sub.as_deref(), Some("subject"));
+    }
+
+    #[tokio::test]
+    async fn invalid_policies_and_unusable_recipients_fail_issuance() {
+        let op = provider_with(InMemoryClientStore::with_clients(vec![iss_client()]));
+        // Obtain a valid access token before changing the registration so that
+        // UserInfo exercises encryption even when ID-token issuance later fails.
+        let redirect = op
+            .authorization_redirect(&iss_request("code"), "subject", &BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let access = exchange_code(&op, &location_of(&redirect))
+            .await
+            .unwrap()
+            .access_token;
+        let key = recipient(generate_ec("P-256").unwrap(), "ECDH-ES", "client").to_public_jwk();
+        let mut unusable = key.clone();
+        unusable.x = None;
+        let mut signing_only = key.clone();
+        signing_only.use_ = Some("sig".into());
+        let mut unnamed = key.clone();
+        unnamed.kid = None;
+        let mut mismatched = key.clone();
+        mismatched.alg = Some("ES256".into());
+        // This EC key can also perform the wrapped ECDH variant. Only the OP's
+        // registered algorithm allowlist should rule out that policy.
+        let mut wrapped = key.clone();
+        wrapped.alg = Some("ECDH-ES+A128KW".into());
+        let valid = Some(vec![key]);
+        let alg = Some("ECDH-ES");
+        for (case, alg, enc, keys) in [
+            ("enc without alg", None, Some("A256GCM"), valid.clone()),
+            (
+                "unsupported alg",
+                Some("ECDH-ES+A128KW"),
+                None,
+                Some(vec![wrapped]),
+            ),
+            ("unsupported enc", alg, Some("unknown"), valid),
+            ("missing JWKS", alg, None, None),
+            ("empty JWKS", alg, None, Some(vec![])),
+            (
+                "ineligible recipients",
+                alg,
+                None,
+                Some(vec![signing_only, unnamed, mismatched]),
+            ),
+            ("unusable recipient", alg, None, Some(vec![unusable])),
+        ] {
+            let mut client = iss_client();
+            client.jwks = keys.map(|keys| JwkSet { keys });
+            let policy = &mut client.response_policy;
+            policy.id_token_encrypted_response_alg = alg.map(str::to_owned);
+            policy.id_token_encrypted_response_enc = enc.map(str::to_owned);
+            policy.userinfo_encrypted_response_alg = alg.map(str::to_owned);
+            policy.userinfo_encrypted_response_enc = enc.map(str::to_owned);
+            op.clients.put(client).await;
+
+            let id_error = op
+                .authorization_redirect(
+                    &iss_request("code id_token"),
+                    "subject",
+                    &BTreeMap::new(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                id_error.code,
+                OAuthErrorCode::ServerError,
+                "ID token: {case}"
+            );
+            let ui_error = op.signed_userinfo(&access, None).await.unwrap_err();
+            assert_eq!(
+                ui_error.code,
+                OAuthErrorCode::ServerError,
+                "UserInfo: {case}"
+            );
+        }
+    }
 }

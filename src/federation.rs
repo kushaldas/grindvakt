@@ -42,9 +42,15 @@ pub struct ResolvedEntity {
     /// Federation Entity signing keys from the subject's Entity Configuration at
     /// the start of the returned trust chain.
     pub subject_jwks: JwkSet,
-    /// The resolve response's `exp` (seconds since epoch) - how long the trust
-    /// anchor vouches for the resolved metadata. Callers can use it to bound
-    /// caching.
+    /// Trust mark entries from the pinned anchor's signed resolve response.
+    /// An omitted list yields an empty vector. Callers enforce the required
+    /// mark type, subject and mark lifetime for their application. A mark
+    /// describes the entity's accreditation. The user's achieved assurance
+    /// comes from the authentication result.
+    pub trust_marks: Vec<Value>,
+    /// Cache deadline in Unix seconds, bounded by the resolve response and
+    /// the earliest expiry in its validated trust chain. `None` supplies no
+    /// usable cache deadline.
     pub exp: Option<u64>,
 }
 
@@ -196,7 +202,13 @@ pub async fn fetch_entity_configuration(
 
 /// Resolve a subject entity's metadata by delegating to each configured trust
 /// anchor's `federation_resolve_endpoint` (OpenID Federation 1.0 §10). Returns
-/// the resolved `metadata` object from the first trust anchor that succeeds.
+/// the first verified [`ResolvedEntity`], including its metadata, trust marks,
+/// subject keys and cache deadline.
+///
+/// # Errors
+///
+/// Returns an authentication error for an empty anchor set. If every anchor
+/// fails, returns the last error encountered fetching or validating a response.
 pub async fn resolve_via_trust_anchors(
     http: &Arc<dyn HttpClient>,
     sub: &str,
@@ -296,7 +308,7 @@ fn extract_resolved_entity(
         .get("trust_chain")
         .and_then(|v| v.as_array())
         .ok_or_else(|| Error::Authn("resolve response has no trust_chain".into()))?;
-    let subject_ec = validate_trust_chain(chain, sub, ta_id, ta_keys)?;
+    let (subject_ec, chain_exp) = validate_trust_chain(chain, sub, ta_id, ta_keys)?;
 
     let metadata = resolved
         .claims
@@ -309,16 +321,28 @@ fn extract_resolved_entity(
         subject: sub.to_string(),
         metadata,
         subject_jwks: subject_ec.jwks()?,
-        exp: resolved.claims.get("exp").and_then(claim_secs),
+        trust_marks: resolved
+            .claims
+            .get("trust_marks")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?
+            .unwrap_or_default(),
+        exp: resolved
+            .claims
+            .get("exp")
+            .and_then(claim_secs)
+            .map(|exp| exp.min(chain_exp)),
     })
 }
 
+/// Verify the chain from the subject to the pinned anchor and return the
+/// subject's entity configuration together with the earliest statement expiry.
 fn validate_trust_chain(
     chain: &[Value],
     sub: &str,
     ta_id: &str,
     ta_keys: &JwkSet,
-) -> Result<EntityStatement> {
+) -> Result<(EntityStatement, u64)> {
     let tokens: Vec<&str> = chain
         .iter()
         .map(|v| {
@@ -387,7 +411,14 @@ fn validate_trust_chain(
         ));
     }
 
-    Ok(subject_ec)
+    // Every statement above has passed the signature and mandatory expiry checks.
+    // A short-lived intermediate also limits how long the leaf can be trusted.
+    let chain_exp = unverified
+        .iter()
+        .filter_map(|s| s.claims.get("exp").and_then(claim_secs))
+        .min()
+        .expect("validated nonempty chain");
+    Ok((subject_ec, chain_exp))
 }
 
 fn validate_statement_claims(stmt: &EntityStatement, label: &str) -> Result<()> {

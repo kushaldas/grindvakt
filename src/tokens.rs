@@ -1,10 +1,10 @@
 //! Stateless authorization codes, access tokens, and refresh tokens.
 //!
-//! These are confidential, self-contained tokens: each a JSON payload encrypted as a
-//! JWE compact token (`dir` + `A256GCM`) under a 256-bit key derived from the
-//! OP's secret. Because they carry their own state (and expiry), neither the
-//! token endpoint nor the userinfo endpoint needs a server-side lookup — the
-//! whole OP is horizontally scalable with no shared store.
+//! Each token carries its grant and expiry in a compact JWE (`dir` + `A256GCM`)
+//! under a 256-bit key derived from the OP's secret. Replicas sharing that
+//! secret can open a token. The provider separately checks client registrations
+//! and uses a [`crate::provider::TokenUseStore`] for code redemption and refresh
+//! rotation.
 
 use crate::error::{Error, Result};
 use crate::util::now_secs;
@@ -33,6 +33,11 @@ fn derive_key(secret: &str) -> Vec<u8> {
 /// The payload sealed inside an authorization code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthCodePayload {
+    /// [`crate::Client::registration_fingerprint`] at authorization. Redemption
+    /// compares it with the authenticated client's current registration. Codes
+    /// issued before registration binding have no digest and skip this check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_digest: Option<String>,
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: String,
@@ -43,9 +48,14 @@ pub struct AuthCodePayload {
     pub code_challenge: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_challenge_method: Option<String>,
-    /// Released user claims (internal->external already applied).
+    /// Application claims authorized for the ID token.
     #[serde(default)]
     pub claims: BTreeMap<String, serde_json::Value>,
+    /// Application claims authorized for UserInfo. `Some(empty)` releases no
+    /// application claims there. `None` selects [`Self::claims`] for compatibility
+    /// with codes issued when both destinations used the same claim set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userinfo_claims: Option<BTreeMap<String, serde_json::Value>>,
     pub auth_time: u64,
     pub exp: u64,
     /// Authentication context class reference, if any.
@@ -72,12 +82,12 @@ pub struct AccessTokenPayload {
 /// The payload sealed inside a refresh token (RFC 6749 §6).
 ///
 /// It carries everything needed to re-mint an access token and id_token on
-/// refresh without a server lookup: the subject, the granted scope, the released
+/// refresh without loading the original login: the subject, the granted scope, the released
 /// claims, the original `auth_time`/`nonce`/`acr` so a refreshed id_token stays
 /// faithful to the initial authentication, and any DPoP confirmation thumbprint
-/// that sender-constrains the refresh token. Refresh tokens are rotated on each
-/// use, but — like every other token here — they are stateless, so they cannot
-/// be revoked before their own `exp` (no server-side store to consult).
+/// that sender-constrains the refresh token. The provider authenticates the
+/// current client and consumes the refresh token through its token-use store
+/// before issuing a replacement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenPayload {
     pub client_id: String,
@@ -85,8 +95,15 @@ pub struct RefreshTokenPayload {
     pub scope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
+    /// Approved ID token claims. Narrowing the grant removes standard claims
+    /// whose corresponding scope was present and is now withdrawn.
     #[serde(default)]
     pub claims: BTreeMap<String, serde_json::Value>,
+    /// UserInfo grant retained across rotations. Refresh applies the same scope
+    /// removals independently to this destination's claims. Older tokens with
+    /// `None` reuse [`Self::claims`]. An explicitly empty map stays empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userinfo_claims: Option<BTreeMap<String, serde_json::Value>>,
     pub auth_time: u64,
     pub exp: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,6 +252,7 @@ mod tests {
     fn code_roundtrip_and_expiry() {
         let codec = TokenCodec::new("op-secret");
         let payload = AuthCodePayload {
+            registration_digest: None,
             client_id: "client-1".into(),
             redirect_uri: "https://rp/cb".into(),
             scope: "openid email".into(),
@@ -243,6 +261,7 @@ mod tests {
             code_challenge: Some("ch".into()),
             code_challenge_method: Some("S256".into()),
             claims: BTreeMap::new(),
+            userinfo_claims: None,
             auth_time: now_secs(),
             exp: now_secs() + 60,
             acr: None,
@@ -286,6 +305,7 @@ mod tests {
             scope: "openid email".into(),
             nonce: Some("n".into()),
             claims,
+            userinfo_claims: None,
             auth_time: now_secs() - 30,
             exp: now_secs() + 60,
             acr: Some("urn:acr:mock".into()),
@@ -316,6 +336,7 @@ mod tests {
                 scope: "openid".into(),
                 nonce: None,
                 claims: BTreeMap::new(),
+                userinfo_claims: None,
                 auth_time: now_secs(),
                 exp: now_secs() + 60,
                 acr: None,

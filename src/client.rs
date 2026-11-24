@@ -26,7 +26,9 @@ pub struct Client {
     pub grant_types: Vec<String>,
     #[serde(default = "default_auth_method")]
     pub token_endpoint_auth_method: String,
-    /// Keys for `private_key_jwt` client auth and request-object verification.
+    /// Public keys for client assertions, signed Request Objects and response
+    /// encryption. For JWE, the provider selects a key with `use = "enc"` and
+    /// a nonempty `kid` from this set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwks: Option<JwkSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +42,47 @@ pub struct Client {
     pub subject_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
+    /// JOSE preferences and sector metadata from the client's registration.
+    /// Registrations written before this field was added use the empty policy.
+    #[serde(default, skip_serializing_if = "ResponsePolicy::is_empty")]
+    pub response_policy: ResponsePolicy,
+}
+
+/// Client metadata used for pairwise subjects, request verification and response encryption.
+///
+/// Populate these fields from a trusted registration. Each response type has its
+/// own JWE settings. Omitting both settings leaves that response signed only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResponsePolicy {
+    /// Registered URI of the redirect-URI list used to establish a pairwise sector.
+    /// The application validates this list when resolving the registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sector_identifier_uri: Option<String>,
+    /// Registered JWS algorithm for the frontend to enforce on signed authorization requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_object_signing_alg: Option<String>,
+    /// JWS algorithm for `private_key_jwt`. With a pin, the provider also requires a `kid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_signing_alg: Option<String>,
+    /// JWE key management algorithm for encrypting the signed ID token to the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token_encrypted_response_alg: Option<String>,
+    /// ID token content encryption algorithm. Defaults to `A128CBC-HS256` when
+    /// only the key management algorithm is registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token_encrypted_response_enc: Option<String>,
+    /// JWE key management algorithm for encrypting signed UserInfo to the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userinfo_encrypted_response_alg: Option<String>,
+    /// UserInfo content encryption algorithm, with the same default as for ID tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userinfo_encrypted_response_enc: Option<String>,
+}
+
+impl ResponsePolicy {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 fn default_response_types() -> Vec<String> {
@@ -56,6 +99,32 @@ fn default_subject_type() -> String {
 }
 
 impl Client {
+    /// Identify this registration snapshot by its unpadded base64url SHA-256 digest.
+    ///
+    /// A caller can carry the digest in protected transaction state and compare it
+    /// with the current registration before issuing or redeeming a code. JSON object
+    /// ordering is ignored. Array order, credentials, keys and response policy all
+    /// contribute to the digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error if the registration cannot be represented in JSON.
+    pub fn registration_fingerprint(&self) -> serde_json::Result<String> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let mut registration = self.clone();
+        // JWK extensions normally flatten into the key object. Hash them separately
+        // so an extension with a standard field's name cannot mask a key change.
+        let extensions = registration.jwks.as_mut().map(|jwks| {
+            jwks.keys
+                .iter_mut()
+                .map(|key| std::mem::take(&mut key.extra))
+                .collect::<Vec<_>>()
+        });
+        let mut value = serde_json::to_value((registration, extensions))?;
+        value.sort_all_objects();
+        Ok(URL_SAFE_NO_PAD.encode(crate::mac::sha256(&serde_json::to_vec(&value)?)))
+    }
+
     /// Whether `uri` exactly matches a registered redirect URI.
     pub fn allows_redirect(&self, uri: &str) -> bool {
         self.redirect_uris.iter().any(|u| u == uri)
@@ -160,6 +229,87 @@ impl ClientStore for InMemoryClientStore {
     }
 }
 
+/// Shares expiring federation registrations across provider replicas using Redis.
+///
+/// [`ClientStore::put`] installs a process-local registration that takes
+/// precedence on lookup. Use [`ClientStore::put_with_ttl`] for a verified
+/// dynamic registration and bound its TTL in seconds by the remaining trust
+/// lifetime. A zero TTL removes the shared entry immediately. Missing,
+/// unreadable and expired Redis values all yield a cache miss.
+#[cfg(feature = "redis")]
+pub struct RedisClientStore {
+    conn: redis::aio::ConnectionManager,
+    prefix: String,
+    local: InMemoryClientStore,
+}
+
+#[cfg(feature = "redis")]
+impl RedisClientStore {
+    /// Open a lazy Redis connection and seed the process-local store with `clients`.
+    ///
+    /// Each Redis key is `prefix` followed directly by the client ID. Replicas
+    /// of one provider should share a prefix. Give independent providers distinct
+    /// namespaces and include any desired separator in the prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Redis configuration error if the URL or connection manager is
+    /// invalid. The first Redis operation establishes server reachability.
+    pub fn new(url: &str, prefix: String, clients: Vec<Client>) -> redis::RedisResult<Self> {
+        Ok(Self {
+            conn: redis::Client::open(url)?.get_connection_manager_lazy(Default::default())?,
+            prefix,
+            local: InMemoryClientStore::with_clients(clients),
+        })
+    }
+}
+
+#[cfg(feature = "redis")]
+#[async_trait::async_trait]
+impl ClientStore for RedisClientStore {
+    async fn get(&self, id: &str) -> Option<Client> {
+        if let Some(client) = self.local.get(id).await {
+            return Some(client);
+        }
+        let blob = redis::cmd("GET")
+            .arg(format!("{}{id}", self.prefix))
+            .query_async::<Option<Vec<u8>>>(&mut self.conn.clone())
+            .await
+            .ok()??;
+        serde_json::from_slice(&blob).ok()
+    }
+    async fn put(&self, client: Client) {
+        self.local.put(client).await;
+    }
+    async fn put_with_ttl(&self, client: Client, ttl: u64) {
+        let key = format!("{}{}", self.prefix, client.client_id);
+        if ttl == 0 {
+            // Redis rejects SET with EX 0, which would leave the previous grant live.
+            if redis::cmd("DEL")
+                .arg(key)
+                .query_async::<i64>(&mut self.conn.clone())
+                .await
+                .is_err()
+            {
+                tracing::error!("could not expire verified client registration");
+            }
+            return;
+        }
+        if let Ok(bytes) = serde_json::to_vec(&client) {
+            let result = redis::cmd("SET")
+                .arg(key)
+                .arg(bytes)
+                .arg("EX")
+                .arg(ttl)
+                .query_async::<()>(&mut self.conn.clone())
+                .await;
+            if result.is_err() {
+                tracing::error!("could not store verified client registration");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +327,7 @@ mod tests {
             jwks: None,
             scope: None,
             subject_type: "public".into(),
+            response_policy: Default::default(),
             client_name: None,
         };
         store.put(client.clone()).await;
@@ -199,6 +350,7 @@ mod tests {
             jwks: None,
             scope: None,
             subject_type: "public".into(),
+            response_policy: Default::default(),
             client_name: None,
         };
         let store = InMemoryClientStore::new();

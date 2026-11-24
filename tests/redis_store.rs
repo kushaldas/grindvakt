@@ -1,6 +1,7 @@
 #![cfg(feature = "redis")]
 
-use grindvakt::{RedisStore, TokenUseStore};
+use grindvakt::client::RedisClientStore;
+use grindvakt::{Client, ClientStore, RedisStore, TokenUseStore};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,20 @@ fn cleanup(redis_url: &str, key: &str) {
         return;
     };
     let _ = redis::cmd("DEL").arg(key).query::<()>(&mut conn);
+}
+
+#[tokio::test]
+#[ignore = "requires a running Redis server; use `just redis-test`"]
+async fn zero_ttl_invalidates_a_cached_registration_across_replicas() {
+    let url = redis_url();
+    let prefix = test_prefix();
+    let writer = RedisClientStore::new(&url, prefix.clone(), Vec::new()).unwrap();
+    let reader = RedisClientStore::new(&url, prefix, Vec::new()).unwrap();
+    let client: Client = serde_json::from_value(serde_json::json!({"client_id": "rp"})).unwrap();
+    writer.put_with_ttl(client.clone(), 60).await;
+    assert!(reader.get("rp").await.is_some());
+    writer.put_with_ttl(client, 0).await;
+    assert!(reader.get("rp").await.is_none());
 }
 
 #[tokio::test]

@@ -26,6 +26,11 @@ pub enum Error {
     #[error("authentication error: {0}")]
     Authn(String),
 
+    /// The authentication result cannot satisfy a required assurance or signer constraint.
+    /// An OIDC frontend can report [`crate::OAuthErrorCode::UnmetAuthenticationRequirements`].
+    #[error("authentication requirements were not met")]
+    UnmetAuthenticationRequirements,
+
     /// State cookie could not be sealed/unsealed.
     #[error("state error: {0}")]
     State(String),
@@ -408,13 +413,12 @@ impl Error {
         }
     }
 
-    /// Whether this error is an authentication failure: [`Error::Authn`], or an
-    /// [`Error::UpstreamHttp`] from a token or UserInfo request (which 0.8
-    /// reported as `Authn`). Prefer this to matching variant identity at
-    /// re-authentication, session-teardown and alerting decision points.
+    /// Includes [`Error::Authn`], [`Error::UnmetAuthenticationRequirements`]
+    /// and upstream token or UserInfo failures. Use this classification when
+    /// deciding whether to re-authenticate or tear down a session.
     pub fn is_auth_failure(&self) -> bool {
         match self {
-            Error::Authn(_) => true,
+            Error::Authn(_) | Error::UnmetAuthenticationRequirements => true,
             Error::UpstreamHttp(e) => e.is_auth_failure(),
             _ => false,
         }
@@ -440,7 +444,7 @@ impl Error {
             Error::NoBoundEndpoint(_) => 404,
             Error::BadRequest(_) => 400,
             Error::UnknownModule(_) => 404,
-            Error::Authn(_) => 401,
+            Error::Authn(_) | Error::UnmetAuthenticationRequirements => 401,
             Error::Config(_) | Error::Crypto(_) | Error::State(_) => 500,
             _ => 500,
         }
@@ -453,6 +457,13 @@ mod tests {
 
     fn upstream(status: Option<u16>) -> UpstreamHttpError {
         UpstreamHttpError::new(status, None, None, None, "m".into(), false)
+    }
+
+    #[test]
+    fn unmet_requirements_are_an_authentication_failure() {
+        let error = Error::UnmetAuthenticationRequirements;
+        assert_eq!(error.status_hint(), 401);
+        assert!(error.is_auth_failure());
     }
 
     #[test]
